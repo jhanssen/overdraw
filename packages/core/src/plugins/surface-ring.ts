@@ -362,5 +362,3 @@ export async function awaitPresentedSlot(
   }
 }
 
-// Re-export from surface-slots for callers that import from here.
-export { SlotStates, SLOT_FREE, SLOT_PRESENTED } from "./surface-slots.js";

@@ -94,7 +94,7 @@ async function withCanvasPlugin(fn, opts = {}) {
   };
   const state = {
     bus, wm, surfaces: new Map(), compositor: sink, seat,
-    pendingWindowChanges: undefined, decorationResize: null,
+    pendingWindowChanges: undefined,
   };
   // Late-bound like main.ts: the runtime is created below the broker, and
   // measure-island only fires once both plugins are live.

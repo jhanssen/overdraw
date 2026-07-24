@@ -69,7 +69,6 @@ export type RequestHandler = (method: string, params: Json) => Json | Promise<Js
 export type EventHandler = (name: string, data: Json) => void;
 // Watchdog ping observer (core side installs this to record liveness).
 export type PongHandler = (seq: number) => void;
-type PingHandler = (seq: number) => void;
 
 interface Pending { resolve: (v: Json) => void; reject: (e: Error) => void; }
 
@@ -82,7 +81,6 @@ export class Endpoint {
   private onRequest: RequestHandler | null = null;
   private onEvent: EventHandler | null = null;
   private onPong: PongHandler | null = null;
-  private onPing: PingHandler | null = null;
   private closed = false;
 
   constructor(channel: Channel) {
@@ -97,10 +95,9 @@ export class Endpoint {
   // How many outbound requests are still awaiting a reply. Used by
   // PluginRuntime.flush() to detect a quiescent state.
   pendingCount(): number { return this.pending.size; }
-  // Core side: observe pongs (watchdog). Worker side: auto-replies to pings
-  // unless an explicit ping handler is set.
+  // Core side: observe pongs (watchdog). The worker side auto-replies to
+  // pings (see dispatch).
   handlePongs(h: PongHandler): void { this.onPong = h; }
-  handlePings(h: PingHandler): void { this.onPing = h; }
 
   // Originate a request; resolves with the peer's result or rejects with its
   // error. Rejects immediately if the endpoint is closed.
@@ -145,10 +142,7 @@ export class Endpoint {
       case "request": this.onIncomingRequest(msg); return;
       case "response": this.onIncomingResponse(msg); return;
       case "event": this.onEvent?.(msg.name, msg.data); return;
-      case "ping":
-        if (this.onPing) this.onPing(msg.seq);
-        else this.pong(msg.seq);   // default: auto-reply (worker liveness)
-        return;
+      case "ping": this.pong(msg.seq); return;   // auto-reply (worker liveness)
       case "pong": this.onPong?.(msg.seq); return;
     }
   }

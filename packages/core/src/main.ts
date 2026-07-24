@@ -26,7 +26,6 @@ import { parseConfigArg, loadConfig } from "./config/load.js";
 import { PluginRuntime } from "./plugins/index.js";
 import { createOverlayBroker, installOverlayOutputHooks } from "./overlay.js";
 import { createGpuBroker } from "./plugins/gpu-broker.js";
-import { createDecorationBroker } from "./plugins/decoration-broker.js";
 import { createWindowsBroker, NOT_HANDLED as WINDOWS_NOT_HANDLED } from "./plugins/windows-broker.js";
 import { createAnimationsBroker, NOT_HANDLED as ANIM_NOT_HANDLED } from "./plugins/animations-broker.js";
 import { createInputBroker, NOT_HANDLED as INPUT_NOT_HANDLED } from "./plugins/input-broker.js";
@@ -923,37 +922,6 @@ installOverlayOutputHooks(pluginBus, overlays);
 const [dawnNodePath] = globSync(join(__dirname, "..", "build", "3rdparty", "dawn", "Dawn-*", "dawn.node"));
 const pluginAddonPath = join(__dirname, "..", "build", "overdraw_plugin_native.node");
 
-// Decoration broker: services decoration.* requests + owns the app_id-regex
-// provider registry + the content-gating state machine. emitToPlugin lazily
-// references `runtime` (assigned below; matches fire only after a client maps).
-const decorationBroker = createDecorationBroker({
-  bus,
-  state,
-  emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
-});
-// Wire the WM's decoration-resize indirection through the broker.
-state.decorationResize = (windowId, outerRect, contentRect, insets) =>
-  decorationBroker.onDecorationResized(windowId, outerRect, contentRect, insets);
-
-// Drive the decoration registry's deferred-assignment from window.relayout
-// (plugin bus): a tentative match at window.map time is held until the WM
-// publishes a valid outer rect, so the decoration plugin's first
-// createDecoration receives a real size and avoids the placeholder
-// allocation + teardown race.
-pluginBus.subscribe(WINDOW_EVENT.relayout, (_n, payload) => {
-  if (!payload || typeof payload !== "object") return;
-  const ev = payload as { surfaceId?: unknown;
-                          newOuter?: { x?: unknown; y?: unknown;
-                                       width?: unknown; height?: unknown } };
-  const sid = ev.surfaceId;
-  const r = ev.newOuter;
-  if (typeof sid !== "number" || !r
-      || typeof r.x !== "number" || typeof r.y !== "number"
-      || typeof r.width !== "number" || typeof r.height !== "number") return;
-  decorationBroker.registry.notifyRelayout(sid,
-    { x: r.x, y: r.y, width: r.width, height: r.height });
-});
-
 // Scene registry: every SceneHandle minted by in-thread or Worker compose
 // registers here so transitions (and any other cross-SDK consumer) can
 // resolve a sceneId back to a core-side
@@ -999,8 +967,6 @@ const gpuBroker = createGpuBroker({
     flattenWindows: composeFlatteners.flattenWindows,
     outputRegion: composeFlatteners.outputRegion,
   },
-  onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
-  onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
   listOutputs: listOutputsForPlugins,
   frameTicks,
   emitToPlugin: (plugin, name, data) => { runtime?.emit(plugin, name, data); },
@@ -1042,7 +1008,7 @@ const interceptBrokerForWindows = {
   },
 };
 const windowsBroker = createWindowsBroker({
-  wm: state.wm, compositor, state, pluginBus, bus,
+  wm: state.wm, compositor, state, pluginBus,
   closingDriver, openingDriver,
   interceptBroker: interceptBrokerForWindows,
   // Late-bound: `runtime` is created after the broker. Reads the live
@@ -1114,7 +1080,7 @@ const cursorResolver = createCursorThemeResolver(addon);
 const cursorKinematics = new Kinematics();
 const cursorRuleEngine = new CursorRuleEngine();
 const cursorBroker = createCursorBroker({
-  addon, compositor, resolver: cursorResolver,
+  compositor, resolver: cursorResolver,
   kinematics: cursorKinematics, ruleEngine: cursorRuleEngine,
   cursorSizePx: Number(process.env.XCURSOR_SIZE) || 24,
 });
@@ -1611,7 +1577,6 @@ runtime = new PluginRuntime({
   // makes the successor's defineMode throw, failing its activation.
   onPluginRelease: (name) => {
     inputBroker.unregisterAllFor(name);
-    decorationBroker.unregisterPlugin(name);
   },
   // In-thread bundled plugins share core's GPUDevice. main.ts already
   // brought up the device + the overlay broker + the compositor; package
@@ -1628,11 +1593,6 @@ runtime = new PluginRuntime({
     sceneRegistry,
     ...composeFlatteners,
     interceptBroker,
-    // Same decoration-broker plumbing the GPU broker uses for Worker plugins:
-    // notify on alloc (with the `decorates` window id) and on present, so the
-    // broker's first-frame gate releases for in-thread decoration plugins too.
-    onSurfaceAllocated: (sid, win) => decorationBroker.onSurfaceAllocated(sid, win),
-    onSurfacePresented: (sid) => decorationBroker.onSurfacePresented(sid),
     listOutputs: listOutputsForPlugins,
     frameTicks,
   },
@@ -1663,9 +1623,6 @@ runtime = new PluginRuntime({
     }
   },
   onRequest: (plugin, method, params) => {
-    if (method.startsWith("decoration.")) {
-      return decorationBroker.onRequest(plugin, method, params);
-    }
     if (method.startsWith("windows.")) {
       const r = windowsBroker(plugin, method, params);
       if (r === WINDOWS_NOT_HANDLED) {

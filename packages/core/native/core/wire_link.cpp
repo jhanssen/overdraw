@@ -10,7 +10,7 @@
 
 namespace overdraw::core {
 
-WireLink::WireLink(int wireFd, int ctrlFd) : wireFd_(wireFd), ctrlFd_(ctrlFd) {
+WireLink::WireLink(int wireFd) : wireFd_(wireFd) {
     dawnProcSetProcs(&dawn::wire::client::GetProcs());
     serializer_ = new ipc::FdSerializer(wireFd_);
     reader_ = new ipc::FrameReader(wireFd_);

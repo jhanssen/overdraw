@@ -52,7 +52,7 @@ function setup({ assignments = {}, withIntercept = true } = {}) {
   });
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
-  const state = { bus, wm, surfaces: new Map(), seat: null, compositor: null, decorationResize: null };
+  const state = { bus, wm, surfaces: new Map(), seat: null, compositor: null };
   const broker = createWindowsBroker({
     wm, compositor: sink, state, pluginBus, bus,
     ...(withIntercept ? { interceptBroker: stubIntercept(assignments) } : {}),

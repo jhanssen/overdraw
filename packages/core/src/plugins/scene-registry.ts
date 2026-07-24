@@ -127,9 +127,6 @@ export interface SceneRegistry {
   // Unpin (refcount--). If this was the last pin AND unregister was
   // already called, fires onTeardown.
   unpin(id: SceneId): void;
-  // Diagnostics for tests.
-  pinnedCount(id: SceneId): number | null;
-  size(): number;
 }
 
 export function createSceneRegistry(): SceneRegistry {
@@ -203,10 +200,5 @@ export function createSceneRegistry(): SceneRegistry {
       }
       maybeFinalize(id, slot);
     },
-    pinnedCount(id) {
-      const slot = slots.get(id);
-      return slot ? slot.pinned : null;
-    },
-    size() { return slots.size; },
   };
 }

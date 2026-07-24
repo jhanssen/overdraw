@@ -367,9 +367,9 @@ nothing, with no error. Worst-first.
   inert object rather than posting an error (matches Hyprland; sway errors).
 - **`sdk.compose` window-rendering flattens subsurfaces on every production
   path, at device scale, across both transports.** Screen capture
-  (`composeOutput`/`composeRegion`), `sdk.compose.scene` (snapshot + live), and
-  `sdk.compose.windows` (snapshot) all expand window subtrees (decoration +
-  toplevel + subsurfaces, via `computeBaseStack`) and compose at device scale.
+  (`composeOutput`/`composeRegion`) and `sdk.compose.scene` (snapshot + live)
+  expand window subtrees (toplevel + subsurfaces, via `computeBaseStack`) and
+  compose at device scale.
   The flatten + output-region resolution is one shared step (`sceneDrawParams`
   in `compose-sdk.ts`, backed by `makeComposeFlatteners`), used by BOTH the
   in-thread SDK (`composeRegion`/`registerLiveScene`) and the Worker GPU broker
@@ -381,16 +381,7 @@ nothing, with no error. Worst-first.
   subsurfaces. `sdk.compose.scene` LIVE re-flattens every frame
   (`registerLiveScene` takes a `getDrawList` callback re-evaluated per frame; the
   Worker live ring re-flattens in its per-frame `onFrame`), so subsurfaces
-  committed after registration are picked up. The subsurface-dropping
-  `composeScene`/`composeWindows` primitives were deleted. One narrow residual
-  remains: `registerLiveWindows` (the in-thread `sdk.compose.windows` LIVE path)
-  still composes a fixed per-window list at logical scale; it is unused by
-  bundled plugins.
-
-- **`sdk.compose.windows` is in-thread-only.** Worker variant throws "not
-  yet implemented for Worker plugins" (loud failure, not silent).
-  Deferred until a real use case forces it. `sdk.compose.scene` works
-  for both transports.
+  committed after registration are picked up.
 
 - **Hotplug-replug does NOT restore the monitor's prior logical
   position.** The workspace plugin reclaims a returning monitor's
@@ -457,6 +448,10 @@ nothing, with no error. Worst-first.
   is a similar stub: it constructs the inner session but advertises
   zero formats + done so clients gracefully read "cursor capture not
   available."
+
+  Also: per-frame damage is ignored (`ready` always reports full-buffer
+  damage, which the spec permits) and the `paint_cursors` option does
+  not composite cursors into captured frames.
 
 - **Intercept-worker teardown is handshake-gated** (was a ~24% flake in
   `test/intercept-worker.gpu.mjs` with a GPU-process abort). Two guards:
@@ -1086,16 +1081,13 @@ live winner (replacement is a boot-time decision).
   per-surface render state (`setOpacity`/`setTransform`/`setMask`/
   `setOutputMargin`/`setTint`/`setColorMatrix`) +
   `destroyPhantom`.
-- `sdk.decorations` (register + createDecoration with content
-  gating + first-frame backstop).
 - `sdk.actions` (register/invoke/list).
 - `sdk.events` (typed bus + dynamic pattern subscribe + intercept
   with priority + per-handler timeout).
 - `sdk.animations.run`/`cancel` (tween + spring + sequence +
   parallel; ticked from `state.beforeRender`).
 - `@overdraw/sdk-anim` plugin-side spec builders.
-- `sdk.compose.scene` (snapshot + live, both transports);
-  `sdk.compose.windows` (in-thread only -- Worker throws).
+- `sdk.compose.scene` (snapshot + live, both transports).
 - `sdk.transitions.run` (six built-in kinds: crossfade, slide-
   left/right/up/down, scale; snapshot + live scene inputs;
   declarative atomic commit; in-thread + Worker).
@@ -1144,7 +1136,7 @@ serialized). GPU tests self-skip without a Wayland session
 are build-less sub-targets.
 
 Pure-unit tests cover generator + protocols, popup positioner, WM,
-layout policy, snapshot/query, config, overlays, decorations, event
+layout policy, snapshot/query, config, overlays, event
 bus, dynamic bus, namespace/action registries, plugin runtime, buffer
 lifecycle, wire barrier, scm-rights, server smokes.
 

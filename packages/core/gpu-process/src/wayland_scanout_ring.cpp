@@ -135,10 +135,6 @@ void WaylandScanoutRing::markFree(int idx) {
     slots_[idx].state = SlotState::FREE;
 }
 
-void WaylandScanoutRing::resetAllSlotsToFree() {
-    for (auto& s : slots_) s.state = SlotState::FREE;
-}
-
 int WaylandScanoutRing::slotIndexForHostBuffer(wl_buffer* b) const {
     if (!b) return -1;
     for (size_t i = 0; i < kSlotCount; ++i) {

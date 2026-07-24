@@ -422,44 +422,6 @@ export type WindowOpeningEvent = {
   title: string | null;
 };
 
-// Decoration-provider events (core -> the matched provider plugin).
-export const DECORATION_EVENT = {
-  assigned: "decoration.assigned",
-  deregistered: "decoration.deregistered",
-  resized: "decoration.resized",
-} as const;
-
-// Emitted to a decoration-provider plugin when a mapped window matches its
-// registered app_id pattern (match-once; first-registered match wins). The
-// plugin now "owns" decorating this window (requestInsets + draw). rect is
-// the window's current outer rect (output px).
-export type DecorationAssignedEvent = {
-  surfaceId: number;
-  appId: string | null;
-  title: string | null;
-  rect: WindowRect;
-};
-
-// Emitted to a provider that was permanently deregistered by the core (currently:
-// it failed to draw an assigned window's decoration within the timeout). The
-// provider receives no further assignments unless it re-registers. `windowId` is
-// the window whose first-frame deadline was missed.
-export type DecorationDeregisteredEvent = {
-  reason: string;
-  windowId: number;
-};
-
-// Emitted to a decoration-provider plugin when its assigned window's OUTER tile
-// changed (the tiling WM resized/moved the window: a sibling mapped/unmapped,
-// the insets changed, etc.). The plugin should redraw at the new outer rect
-// (destroy + recreate the ring; the ring is fixed-size at alloc).
-export type DecorationResizedEvent = {
-  windowId: number;
-  outerRect: WindowRect;
-  contentRect: WindowRect;
-  insets: { top: number; right: number; bottom: number; left: number };
-};
-
 // Compile-time assertion that the plugin-forwarded payloads stay clone-safe. If a
 // field is ever added that is not structured-clone-safe, the build fails rather
 // than silently passing a non-cloneable value over postMessage.
@@ -477,6 +439,3 @@ export type _RelayoutIsCloneable = AssignableToCloneable<WindowRelayoutEvent>;
 export type _StackRelayoutIsCloneable = AssignableToCloneable<StackRelayoutEvent>;
 export type _ClosingIsCloneable = AssignableToCloneable<WindowClosingEvent>;
 export type _OpeningIsCloneable = AssignableToCloneable<WindowOpeningEvent>;
-export type _AssignedIsCloneable = AssignableToCloneable<DecorationAssignedEvent>;
-export type _DeregisteredIsCloneable = AssignableToCloneable<DecorationDeregisteredEvent>;
-export type _ResizedIsCloneable = AssignableToCloneable<DecorationResizedEvent>;

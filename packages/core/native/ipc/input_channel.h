@@ -89,8 +89,6 @@ struct InputMessage {
     uint32_t group         = 0;  // KeyboardMods
 };
 
-constexpr uint32_t kInputProtocolVersion = 1;
-
 // Send one input event over the SEQPACKET input socket. NON-BLOCKING: input is
 // lossy by nature, and the sender (GPU process main loop) must never block on a
 // full socket buffer -- doing so stops it pumping the host display, which stops

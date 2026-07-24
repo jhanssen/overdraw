@@ -23,8 +23,9 @@ enum class Tag : uint8_t {
     Hello        = 'H',  // core -> gpu : handshake
     HelloReply   = 'h',  // gpu  -> core: handshake reply (+ window size)
     InstanceReserved = 'I',  // core -> gpu : reserved instance handle
-    DeviceReady  = 'S',  // core -> gpu : device handle + reserved surface handle
-    SurfaceReady = 'C',  // gpu  -> core: surface injected + caps + size
+    DeviceReady  = 'S',  // core -> gpu : instance + device handles
+    SurfaceReady = 'C',  // gpu  -> core: nested output up + window size (no WSI
+                         //              surface exists on either side)
     FeedbackData = 'F',  // gpu  -> core: dmabuf-feedback data (main_device dev_t +
                          //              format_table entry count); the format_table
                          //              memfd rides as SCM_RIGHTS on the same msg
@@ -167,9 +168,8 @@ struct Message {
     Tag tag;
     uint8_t _pad[3] = {0, 0, 0};
 
-    WireHandle instance;   // Hello*, InstanceReserved, DeviceReady, SurfaceReady
-    WireHandle device;     // DeviceReady, SurfaceReady
-    WireHandle surface;    // DeviceReady, SurfaceReady
+    WireHandle instance;   // Hello*, InstanceReserved, DeviceReady
+    WireHandle device;     // DeviceReady
     WireHandle texture;    // ImportClientTex, ClientTexImported, ReleaseClientTex
 
     uint32_t width = 0;        // HelloReply, SurfaceReady

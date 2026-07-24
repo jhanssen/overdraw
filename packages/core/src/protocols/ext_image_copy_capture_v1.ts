@@ -113,7 +113,6 @@ interface SessionRecord {
   // True once we've sent `stopped`. Subsequent operations are silent no-ops;
   // capture frames fail with reason=stopped.
   stopped: boolean;
-  paintCursors: boolean;
 }
 // All live sessions, indexed by their resource. Frames index back via
 // frameSession.
@@ -131,12 +130,6 @@ interface FrameRecord {
   armed: boolean;
   // Set once capture has been sent (already_captured guard).
   captured: boolean;
-  // The latest source-side damage rect we'll echo back on ready
-  // (subsequent-frame contract: compositor's reported damage covers at
-  // least the union of client's damage_buffer + actually-changed regions).
-  // We don't currently track per-buffer reuse damage; we always full-
-  // damage on ready.
-  damageX: number; damageY: number; damageW: number; damageH: number;
 }
 const frames = new Map<Resource, FrameRecord>();
 
@@ -578,8 +571,6 @@ export function makeImageCopyCaptureManager(ctx: Ctx):
           "invalid option flag");
         return;
       }
-      const paintCursors = (options & 1) !== 0;
-
       const src = sources.get(sourceRes);
       // Build the session record either way -- if the source is dead, we
       // still need to advertise some constraint set so the client doesn't
@@ -589,7 +580,7 @@ export function makeImageCopyCaptureManager(ctx: Ctx):
         resource: sessionRes, source: src ?? { kind: "output", id: -1 },
         activeFrame: null,
         bufferW: sz?.w ?? 0, bufferH: sz?.h ?? 0,
-        stopped: false, paintCursors,
+        stopped: false,
       };
       sessions.set(sessionRes, rec);
       if (!src || !sz) {
@@ -641,7 +632,6 @@ export function makeImageCopyCaptureSession(ctx: Ctx):
       const fr: FrameRecord = {
         resource: frameRes, session: s, buffer: null,
         armed: false, captured: false,
-        damageX: 0, damageY: 0, damageW: 0, damageH: 0,
       };
       frames.set(frameRes, fr);
       if (s.stopped) {
@@ -704,19 +694,8 @@ export function makeImageCopyCaptureFrame(ctx: Ctx):
           "damage_buffer with negative or non-positive dims");
         return;
       }
-      // Accumulate the LATEST rect; we use damage only for our reported-
-      // damage echo on ready (full-buffer today). Multiple damage_buffer
-      // calls coalesce into a bounding box.
-      if (f.damageW === 0 && f.damageH === 0) {
-        f.damageX = x; f.damageY = y; f.damageW = width; f.damageH = height;
-      } else {
-        const x1 = Math.min(f.damageX, x);
-        const y1 = Math.min(f.damageY, y);
-        const x2 = Math.max(f.damageX + f.damageW, x + width);
-        const y2 = Math.max(f.damageY + f.damageH, y + height);
-        f.damageX = x1; f.damageY = y1;
-        f.damageW = x2 - x1; f.damageH = y2 - y1;
-      }
+      // The rect is a client hint only: ready always reports full-buffer
+      // damage, which satisfies the spec's at-least-the-union contract.
     },
     capture(frameRes) {
       const f = frames.get(frameRes);
@@ -789,7 +768,7 @@ export function makeImageCopyCaptureCursorSession(ctx: Ctx):
         source: rec.source,
         activeFrame: null,
         bufferW: 0, bufferH: 0,
-        stopped: false, paintCursors: false,
+        stopped: false,
       };
       sessions.set(sessionRes, sRec);
       const e = ctx.events.ext_image_copy_capture_session_v1;

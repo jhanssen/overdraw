@@ -61,7 +61,7 @@ function res(id) { return { resource: { id, version: 1, destroyed: false } }; }
 function makeCoreState(wm, bus, sink, seat = null) {
   return {
     bus, wm, pendingWindowChanges: undefined, surfaces: new Map(),
-    seat, compositor: sink, decorationResize: null,
+    seat, compositor: sink,
   };
 }
 

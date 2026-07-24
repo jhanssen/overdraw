@@ -57,7 +57,7 @@ test("bundled in-thread plugin installs a mask via sdk.windows.setMask",
     const pluginBus = new DynamicBus();
     const wm = createWm(compositor, [{ id: 0, rect: { x: 0, y: 0, width: W, height: H }, scale: 1 }]);
     const state = { bus, wm, surfaces: new Map(), seat: null,
-                    compositor, decorationResize: null };
+                    compositor };
     const windowsBroker = createWindowsBroker({
       wm, compositor, state, pluginBus, bus,
     });

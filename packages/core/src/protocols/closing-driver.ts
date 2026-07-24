@@ -80,16 +80,11 @@ export function createClosingDriver(deps: ClosingDriverDeps): ClosingDriver {
       const outer = state.wm.outerRectOf(s.id);
       if (!outer || outer.width <= 0 || outer.height <= 0) return null;
 
-      // Gather the surface set: decoration (if any) at the bottom of
-      // the local z, then the toplevel, then its subsurface subtree.
+      // Gather the surface set: the toplevel, then its subsurface subtree.
       // Order matches what computeBaseStack emits for an on-screen
       // composite of this window.
-      const surfaceIds: number[] = [];
       const wmWin = state.wm.state.windows.find((w) => w.surfaceId === s.id);
-      if (wmWin?.decorationSurfaceId !== undefined) {
-        surfaceIds.push(wmWin.decorationSurfaceId);
-      }
-      surfaceIds.push(s.id);
+      const surfaceIds: number[] = [s.id];
       collectSubsurfaceIds(state, s.resource, surfaceIds);
 
       // Mint a fresh surfaceId for the phantom and snapshot.

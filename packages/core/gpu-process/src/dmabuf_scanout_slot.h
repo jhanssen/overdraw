@@ -43,14 +43,6 @@ struct DmabufScanoutSlot {
     ScanoutSlotState          state = ScanoutSlotState::FREE;
 };
 
-// One candidate (fourcc, modifier) pair the display sink can consume. Mirrors
-// the shape of both the KMS plane IN_FORMATS list and the host's linux-dmabuf
-// modifier advertisements so the ring init code does not depend on either.
-struct DmabufModifierCandidate {
-    uint32_t fourcc;
-    uint64_t modifier;
-};
-
 enum class AllocSlotResult {
     Ok,
     Failed,           // hard error; no modifier in the list was usable

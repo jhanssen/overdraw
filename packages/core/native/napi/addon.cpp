@@ -152,7 +152,6 @@ struct Addon {
                                               // latchedBufferId, retiredBufferId})
     napi_ref onScanoutClientReject = nullptr; // optional JS callback({outputId, bufferId})
     napi_ref onSeatEnabled = nullptr;  // optional JS callback() on libseat enable_seat
-    uint64_t lastNotified = 0;
 
     // Host-side reader for the GPU process's log socket. Started after
     // spawnGpuProcess returns; stops on Stop().
@@ -343,7 +342,6 @@ void runFrameIfReady() {
         notifyFrame();           // → JS dispatchFrameCallbacks + JS renderFrame + JS presentOutput
         uint64_t presentedAfter = presentedBefore;
         if (g_addon.compositor) {
-            g_addon.lastNotified = g_addon.compositor->presented();
             g_addon.compositor->renderFrame();
             presentedAfter = g_addon.compositor->presented();
         }
@@ -2315,7 +2313,6 @@ napi_value Stop(napi_env env, napi_callback_info) {
     g_addon.virtualKeymaps.clear();
     g_addon.nextKeymapId = 1;
     g_addon.activeKeymapId = 0;
-    g_addon.lastNotified = 0;
     napi_value undef; napi_get_undefined(env, &undef);
     return undef;
 }
@@ -3137,17 +3134,6 @@ napi_value ShmBufferUnref(napi_env env, napi_callback_info info) {
     return undef;
 }
 
-// commitSurfaceBuffer(surfaceId, poolId, offset, width, height, stride) -> boolean
-// Resolve the pool region and upload it to the surface's GPU texture. Requires
-// the compositor to be running. Returns false if pool/region invalid.
-// commitSurfaceDmabuf(surfaceId, fdHandle, width, height, drmFourcc,
-//                     modifierHi, modifierLo, offset, stride) -> boolean
-// Take the client dmabuf fd (a WaylandFd) and import it as a sampled texture for
-// the surface. Returns false if the import is rejected.
-// takeImportedSurfaces() -> Array<{ id, width, height }>
-// Surfaces that gained presentable content (first or later commit completed),
-// for both shm and dmabuf. JS uses this as a single map-on-first-content signal.
-// takeFreedBuffers() -> number[]  (dmabuf bufferIds whose GPU read completed)
 // injectInput(event) -> undefined
 // Synthetic input backend (test seam): build a normalized InputEvent from a plain
 // JS object and feed it through the SAME InputSink the host seat uses, so it
@@ -3339,26 +3325,6 @@ napi_value InjectHostInput(napi_env env, napi_callback_info info) {
     return t;
 }
 
-// removeSurface(surfaceId) -> undefined
-// setSurfaceLayout(surfaceId, x, y, w, h) -> undefined
-// Placement is owned by JS; this stores the surface's output-pixel rect. w/h of
-// 0 means "use the surface's content size".
-// setStack(idsArray) -> undefined. Back-to-front draw order; JS owns it.
-// surfaceReadback(surfaceId, cb) -> boolean
-// Test hook: ASYNCHRONOUSLY read the uploaded surface texture back to CPU. Kicks
-// off the copy + map and returns true if started (false if the surface is
-// unknown / has no texture). The callback `cb(px | null)` is invoked later on
-// this same Node thread when the map completes (driven by the wire pump), with a
-// Uint8Array of width*height*4 BGRA bytes on success or null on failure. The
-// swapchain uses a non-blocking present mode (Mailbox) so the GPU process's
-// command thread is not parked in a blocking Surface::GetCurrentTexture while
-// the buffer-map command waits behind it.
-// frameReadback(cb) -> boolean
-// Async readback of the COMPOSITED frame (headless: the offscreen capture
-// texture, the full placed+stacked+blended output). cb(px | null) fires on the
-// Node thread when the GPU map completes. Returns false if no capture texture
-// exists (e.g. not headless). Use this (not surfaceReadback) to verify
-// compositing correctness.
 // Resolve (and on first nested-mode call, open) the DRM fd used for syncobj
 // ioctls. In KMS mode this aliases the libseat-owned card fd; in nested mode
 // it lazily opens the /dev/dri/renderD* the GPU process picked. Returns -1

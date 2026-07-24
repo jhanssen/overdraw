@@ -15,14 +15,14 @@ function makeInstaller() {
   return {
     calls,
     last: () => last,
-    installShape(name, enlarge) {
-      calls.push({ kind: "shape", name, enlarge });
-      last = { kind: "shape", name, enlarge };
+    installShape(name) {
+      calls.push({ kind: "shape", name });
+      last = { kind: "shape", name };
       return true;
     },
-    installTexture(handle, w, h, hx, hy, enlarge) {
-      calls.push({ kind: "texture", w, h, hx, hy, enlarge });
-      last = { kind: "texture", w, h, hx, hy, enlarge };
+    installTexture(handle, w, h, hx, hy) {
+      calls.push({ kind: "texture", w, h, hx, hy });
+      last = { kind: "texture", w, h, hx, hy };
       return true;
     },
     installDefault() {
@@ -78,15 +78,6 @@ test('rule engine: accepts Infinity as upper bound', () => {
   const { e } = setupEngine();
   e.register({ when: { speedRange: [500, Infinity] }, shape: "wait" });
   assert.equal(e.ruleCount(), 1);
-});
-
-test('rule engine: rejects invalid enlarge', () => {
-  const { e } = setupEngine();
-  assert.throws(() => e.register({
-    when: { shake: true },
-    shape: "default",
-    enlarge: -1,
-  }), /enlarge/);
 });
 
 // --- match precedence + predicate semantics ----------------------------------
@@ -292,7 +283,6 @@ test('rule engine: texture outcome routes to installTexture', () => {
   e.register({
     when: { speedRange: [0, Infinity] },
     texture: { handle: { fake: 1 }, width: 32, height: 32, hotspotX: 4, hotspotY: 5 },
-    enlarge: 2.0,
   });
   const dt = 1000 / 60;
   for (let i = 0; i < 6; ++i) k.update(i * 10, 0, i * dt);
@@ -300,5 +290,4 @@ test('rule engine: texture outcome routes to installTexture', () => {
   assert.equal(inst.last().kind, "texture");
   assert.equal(inst.last().w, 32);
   assert.equal(inst.last().hx, 4);
-  assert.equal(inst.last().enlarge, 2.0);
 });

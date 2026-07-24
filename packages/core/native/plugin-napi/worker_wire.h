@@ -1,6 +1,6 @@
 // WorkerWireClient: a plugin's Dawn wire client, owned by the PLUGIN WORKER
 // isolate (architecture.md "IPC": each Worker has its own wire client talking to
-// the GPU process directly). Unlike core::PluginWireClient, this has NO
+// the GPU process directly). It has NO
 // Compositor / side-channel dependency: the CORE brokers the connection +
 // instance injection + surface allocation + fence brackets over the side channel
 // (it owns the trusted side channel), and relays results to the Worker via
@@ -17,7 +17,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <unordered_map>
 
 #include "dawn/wire/WireClient.h"
@@ -49,7 +48,6 @@ class WorkerWireClient {
     void pump();             // drive wire I/O + advance device bring-up
     bool deviceReady() const { return device_ != nullptr; }
     bool failed() const { return failed_; }
-    const std::string& error() const { return error_; }
 
     // Handles for dawn.node wrapDevice(instance, device).
     WGPUInstance instanceHandle() const { return instance_.Get(); }
@@ -162,9 +160,6 @@ class WorkerWireClient {
     void markSharedWithJs() { link_->markSharedWithExternal(); }
     void flush() { link_->flush(); }
     uint64_t wireBytesQueued() const { return link_->wireBytesQueued(); }
-    int fd() const { return fd_; }
-    bool hasPendingOut() const { return link_->hasPendingOut(); }
-    void pumpOut() { link_->pumpOut(); }
 
   private:
     int fd_;
@@ -175,7 +170,6 @@ class WorkerWireClient {
     bool adapterRequested_ = false;
     bool deviceRequested_ = false;
     bool failed_ = false;
-    std::string error_;
     std::unordered_map<uint32_t, dawn::wire::ReservedTexture> producerReservations_;
     std::unordered_map<uint32_t, dawn::wire::ReservedTexture> consumerReservations_;
 };

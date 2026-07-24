@@ -31,7 +31,7 @@ function makeBroker(invokeLayout) {
   const pluginBus = new DynamicBus();
   const state = {
     bus, wm, pendingWindowChanges: undefined, surfaces: new Map(), seat: null,
-    compositor: sink, decorationResize: null,
+    compositor: sink,
   };
   const broker = createWindowsBroker({
     wm, compositor: sink, state, pluginBus, bus,

@@ -460,12 +460,9 @@ export interface CompositorSink {
   // the subtree, so no caller enumerates subsurfaces. The accessor is the only
   // channel by which it learns the tree; reflowSubsurfaces re-derives a parent's
   // subtree when the tree changed without the parent's own rect moving (child
-  // gained content, set_position applied, sibling reorder). setDecorationFx binds
-  // a window's decoration as an fx-follower (same transform/opacity as the
-  // window; its own layout) -- decoration is not a subsurface.
+  // gained content, set_position applied, sibling reorder).
   setSubsurfaceAccessor?(accessor: import("../subsurfaces.js").SubsurfaceAccessor): void;
   reflowSubsurfaces?(parentId: number): void;
-  setDecorationFx?(windowId: number, decorationId: number | null): void;
   removeSurface(id: number): void;
   takeImportedSurfaces(): Array<{ id: number; width: number; height: number }>;
   // Re-announce an already-imported surface for the next takeImportedSurfaces
@@ -542,18 +539,12 @@ export interface CompositorSink {
   }): { texture: GPUTexture; outW: number; outH: number };
   // Live scene: re-renders every frame at device resolution; getDrawList is
   // re-evaluated each frame so subsurfaces committed after registration are
-  // picked up. registerLiveWindows still composes a fixed per-window list at
-  // logical scale (unused by bundled plugins).
+  // picked up.
   registerLiveScene?(args: {
-    outputId: number;
     getDrawList: () => number[];
     region?: { x: number; y: number; w: number; h: number };
     scale?: number;
   }): import("../gpu/compositor.js").LiveSceneHandle;
-  registerLiveWindows?(args: {
-    outputId: number;
-    windows: ReadonlyArray<{ id: number; rect?: { x: number; y: number; w: number; h: number } }>;
-  }): import("../gpu/compositor.js").LiveWindowCompHandle;
   // Async GPU->CPU readback of an arbitrary texture (compose target or
   // similar). Returns tightly-packed BGRA bytes (w*h*4). Used by the
   // ext_image_copy_capture_v1 shm destination path. Optional so non-
@@ -852,15 +843,6 @@ export interface CompositorState {
   nextSerial: number;
   serial(): number;
   wm?: Wm;
-  // Settable indirection: when the WM detects a decorated window's outer tile
-  // changed (relayout/insets), it calls this hook so the decoration broker can
-  // forward decoration.resized to the owning plugin. The WM itself doesn't know
-  // about the broker; main.ts (and the GPU tests) wires this up after creating
-  // the broker. Absent for GPU-free unit tests / when no broker is present.
-  decorationResize?: (windowId: number,
-                      outerRect: { x: number; y: number; width: number; height: number },
-                      contentRect: { x: number; y: number; width: number; height: number },
-                      insets: { top: number; right: number; bottom: number; left: number }) => void;
   seat?: SeatState;
   // The keyboard binding chain (input modes + chord trie). Constructed by
   // installProtocols when keyboard input is wired; the seat consults it on

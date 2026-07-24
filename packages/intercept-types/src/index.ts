@@ -33,11 +33,6 @@ export interface InterceptMatch {
   excludeFullscreen?: boolean;
 }
 
-// Forward-compatibility field. Recorded but not used for ordering in
-// 10a (single intercept per surface; no chain). 10b's chain dispatch
-// will consume it.
-export type ContributesCategory = "pixels" | "geometry" | "composition";
-
 // Setup-time context handed to the plugin. The device is core's device
 // for in-thread plugins (shared) and the plugin's own device for Worker
 // plugins. Either way it's the device the plugin renders against.
@@ -211,7 +206,6 @@ export interface InterceptSpec {
   // identification.
   name: string;
   match: InterceptMatch;
-  contributes?: ReadonlyArray<ContributesCategory>;
   // Lower numbers match first. Same-priority falls back to registration
   // order. Default 0. Bundled fallback intercepts (e.g. the decoration
   // plugin matching ".*") use a higher number so user-installed

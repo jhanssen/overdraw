@@ -27,7 +27,7 @@ function mockSink() {
 
 function makeState(wm, bus, sink) {
   return { bus, wm, pendingWindowChanges: undefined, surfaces: new Map(), seat: null,
-    compositor: sink, decorationResize: null };
+    compositor: sink };
 }
 
 function makeBroker() {

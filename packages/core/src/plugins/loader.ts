@@ -22,11 +22,10 @@ import type { Channel, Json } from "./protocol.js";
 import { createSdk } from "./sdk.js";
 import type { PluginSdk } from "./sdk.js";
 import { createPluginGpu } from "./gpu.js";
-import type { PluginGpu, RingMaker } from "./gpu.js";
+import type { PluginGpu } from "./gpu.js";
 import { createInThreadGpu } from "./inthread-gpu.js";
 import type { InThreadGpuDeps } from "./inthread-gpu.js";
 import { createPluginWindows } from "./windows-sdk.js";
-import { createDecorations } from "./decorations.js";
 import { createPluginEvents } from "./events.js";
 import { createNamespaceHandle } from "./namespace.js";
 import { createPluginActions } from "./actions.js";
@@ -80,7 +79,6 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   const endpoint = new Endpoint(channel);
 
   let gpu: PluginGpu | undefined;
-  let makeRingSurface: RingMaker | undefined;
   let stopGpu: () => void = () => {};
   // Worker path only: core-pushed gpu events (surface.onFrame ticks) route
   // here. The in-thread path delivers ticks by direct callback instead.
@@ -94,7 +92,6 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   if (input.inThreadGpu) {
     const g = createInThreadGpu(input.name, input.inThreadGpu);
     gpu = g.gpu;
-    makeRingSurface = g.makeRingSurface;
     stopGpu = g.stop;
     compose = createInThreadCompose(
       input.inThreadGpu.compositor,
@@ -102,7 +99,6 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
       input.inThreadGpu.sceneRegistry,
       input.inThreadGpu.flattenWindows,
       input.inThreadGpu.outputRegion,
-      input.inThreadGpu.windowRegion,
     ) ?? undefined;
     transitions = createTransitions(endpoint);
     // In-thread intercept SDK. The broker is reached
@@ -119,7 +115,6 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   } else if (input.pluginAddonPath && input.dawnPath) {
     const g = await createPluginGpu(endpoint, input.pluginAddonPath, input.dawnPath);
     gpu = g.gpu;
-    makeRingSurface = g.makeRingSurface;
     dispatchGpuEvent = g.dispatchGpuEvent;
     const t = setInterval(g.pump, 4);
     t.unref?.();
@@ -155,13 +150,12 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
   const actionsHandle = createPluginActions(endpoint);
   const windowsCtl = createPluginWindows(endpoint, eventsHandle.events);
   const animations = createPluginAnimations(endpoint);
-  const decorations = makeRingSurface ? createDecorations(endpoint, makeRingSurface) : undefined;
   const inputHandle = createPluginInput(endpoint);
   const cursorCtl = createPluginCursor(endpoint);
 
   const control = createSdk(input.name, (line) => { endpoint.emit("log", line); },
     eventsHandle.events, nsHandle.ns, actionsHandle.actions, windowsCtl.windows,
-    animations, inputHandle.input, gpu, decorations?.decorations, compose,
+    animations, inputHandle.input, gpu, compose,
     transitions, cursorCtl.cursor, intercept);
 
   endpoint.handleRequests(async (method, params): Promise<Json> => {
@@ -192,8 +186,7 @@ export async function runLoader(channel: Channel, input: LoaderInput): Promise<v
     if (dispatchGpuEvent?.(eventName, data)) return;
     if (eventsHandle.dispatcher.dispatch(eventName, data)) return;
     if (inputHandle.dispatcher.dispatch(eventName, data)) return;
-    if (dispatchInterceptEvent(eventName, data)) return;
-    decorations?.dispatch(eventName, data);
+    dispatchInterceptEvent(eventName, data);
   });
 
   try {

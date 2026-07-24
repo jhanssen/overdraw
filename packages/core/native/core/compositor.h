@@ -1,7 +1,8 @@
 // The core compositor: owns the wire link, the wgpu objects, and the
-// presentation logic. Brings up the device/surface over the wire, then renders
-// the textured-quad compositing pass per frame, sampling client-surface
-// textures uploaded via commitSurfaceShm.
+// presentation logic. Brings up the device over the wire; per-frame rendering
+// is recorded by the JS compositor (dawn.node over this same wire), with this
+// class providing the texture import/upload plumbing, scanout-ring
+// bookkeeping, and present/flip pacing.
 //
 // This class holds no libuv/N-API concerns; the addon drives renderFrame() and
 // drainWire() from libuv handles and owns the GPU-process lifecycle handoff.
@@ -148,8 +149,8 @@ class Compositor {
 
     // Import a client dmabuf as a wire texture FOR THE JS COMPOSITOR: reserve a
     // texture handle, send ImportClientTex (fd via SCM_RIGHTS), and return an
-    // importId. Unlike commitSurfaceDmabuf, this builds NO native compositing
-    // state -- on completion the injected texture's wire HANDLE is reported via
+    // importId. This builds NO native compositing state -- on completion the
+    // injected texture's wire HANDLE is reported via
     // takeCompletedJsImports() for JS to wrap (dawn.node wrapTexture). Returns 0
     // if the request could not be sent.
     uint32_t importDmabufForJs(int fd, uint32_t width, uint32_t height,
@@ -426,7 +427,6 @@ class Compositor {
         out.swap(pendingCursorPlaneStatus_);
         return out;
     }
-    bool hasCursorPlaneStatuses() const { return !pendingCursorPlaneStatus_.empty(); }
 
     // Direct scanout of client dmabufs (scanout-design.md). The present
     // names the buffer by its importId (resolved to the wire texture
@@ -812,7 +812,6 @@ class Compositor {
         bool presentedThisCycle = false;
     };
     std::unordered_map<uint32_t, ScanoutOutput> scanoutOutputs_;
-    int pendingScanoutFenceFd_ = -1;  // attached to next presentOutput, then closed
     uint32_t nextJsImportId_ = 1;
     // importId -> the injected texture's wire handle {id,generation}, kept so a
     // later releaseDmabufImport can address the GPU-side entry. Erased on release.

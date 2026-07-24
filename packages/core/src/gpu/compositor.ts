@@ -36,9 +36,9 @@
 //
 // cropUV selects a sub-rect of the surface texture to sample as the surface's
 // pixels. Identity is (0,0,1,1) -- sample the full texture (the on-screen
-// default). compose.windows uses non-identity cropUV when its caller passes
-// a source-crop rect: the crop's surface-local pixel coords are normalized
-// into UV and packed here, so the (cropped) region fills the rendered surface.
+// default). Content-crop draws pass non-identity cropUV: the crop's
+// surface-local pixel coords are normalized into UV and packed here, so the
+// (cropped) region fills the rendered surface.
 //
 // tint + colorMatrix operate on the SAMPLED premultiplied RGBA -- the bytes
 // the client commits are already premultiplied, and the existing
@@ -245,7 +245,7 @@ fn applyBufferTransform(uv : vec2f, t : f32) -> vec2f {
   // because we zero it via the inside multiplier below.
   //
   // surfUV addresses the surface's nominal [0,1] region; cropUV remaps that
-  // into the actual texture coords to sample (compose.windows uses this to
+  // into the actual texture coords to sample (content-crop draws use this to
   // render a sub-region of a surface). Default cropUV = (0,0,1,1) =
   // identity (sample the full texture).
   // Reorient the surface coordinate into buffer space (set_buffer_transform),
@@ -548,8 +548,7 @@ interface SurfaceFx {
   // content below it (compositeScene splits the pass at this surface and
   // runs the registered renderer for `kind`). null = off. Applies to every
   // scene composite (on-screen, capture, compose scenes, transition
-  // sources); content crops (composeWindows, freeze snapshots, phantoms)
-  // render without it.
+  // sources); content crops (freeze snapshots, phantoms) render without it.
   backdropEffect: SurfaceBackdropEffect | null;
 }
 
@@ -905,28 +904,8 @@ function clamp(v: number, lo: number, hi: number): number {
 interface LiveScene {
   texture: GPUTexture;
   view: GPUTextureView;
-  outputId: number;
   getDrawList: () => number[];
   ctx: OutputCtx;
-}
-
-// A live per-window compose target. Each window in the list has its own
-// texture sized to its crop rect; the compositor re-renders all of them
-// per frame from the same draw-state.
-interface LiveWindowComp {
-  outputId: number;
-  windows: Array<{
-    id: number;
-    rect: { x: number; y: number; w: number; h: number };
-    texture: GPUTexture;
-    view: GPUTextureView;
-    // surface dims at registration time (used to compute cropUV); on
-    // resize, the registration is invalidated. Mid-life surface resize for
-    // live window-comps is not handled here; the holder releases and
-    // re-registers if it needs to track resizes.
-    surfW: number;
-    surfH: number;
-  }>;
 }
 
 export interface LiveSceneHandle {
@@ -979,15 +958,6 @@ interface TransitionBracket {
   sceneId: number;
   beginRead: () => void;
   endRead: () => void;
-}
-
-export interface LiveWindowCompHandle {
-  windows: ReadonlyArray<{
-    id: number;
-    texture: GPUTexture;
-    rect: { x: number; y: number; w: number; h: number };
-  }>;
-  release(): void;
 }
 
 export interface JsCompositorOpts {
@@ -1133,25 +1103,20 @@ export class JsCompositor implements CompositorSink {
   // compositor between register/release; the holder polls it whenever they
   // need current pixels.
   //
-  // LiveScene is the unified "composed result" variant (compose.scene); the
-  // listed windows are drawn back-to-front into a single target texture at
-  // their natural layout rects, normalized to (outW,outH).
-  //
-  // LiveWindowComp is the per-window-textures variant (compose.windows);
-  // each listed window gets its own target texture sized to its crop rect,
-  // with the cropped region filling the target.
+  // LiveScene is the composed-result target (compose.scene): the listed
+  // windows are drawn back-to-front into a single target texture at their
+  // natural layout rects, normalized to (outW,outH).
   private liveScenes: LiveScene[] = [];
-  private liveWindowComps: LiveWindowComp[] = [];
   // Per-frame callbacks the broker registers for cross-device
   // dmabuf compose-live. Each callback owns its own ring + producer; the
   // compositor doesn't know the target. Invoked after the on-screen frame
-  // composite (and the existing liveScenes/liveWindowComps passes), so the
+  // composite (and the existing liveScenes passes), so the
   // producer's compose pass shares the frame's encoder + submit.
   private liveProducers: Array<() => void> = [];
 
   // Closing-animation phantoms. When a mapped toplevel
   // unmaps, the compositor composites its surface set (toplevel +
-  // decoration + subsurfaces) into a fresh core-owned texture, mints
+  // subsurfaces) into a fresh core-owned texture, mints
   // a new surfaceId for the phantom, and tracks it here. Phantoms
   // are drawn above the content stack (between content and the
   // 'above' layer) so they sit on top of the survivors reflowing
@@ -1165,10 +1130,6 @@ export class JsCompositor implements CompositorSink {
   // derives each child's absolute placement from it, and the fx setters cascade
   // over it. Null in pure structural tests -> cascade is inert.
   private subsurfaceAccessor: import("../subsurfaces.js").SubsurfaceAccessor | null = null;
-  // Non-subsurface fx-followers per window: a decorated window's decoration
-  // surface receives the window's transform/opacity/tint/color-matrix but keeps
-  // its own layout rect. Keyed by the window (content) surface id.
-  private fxFollowers = new Map<number, number[]>();
   // Texture handles for each phantom, keyed by phantom surfaceId.
   // Destroyed when destroyPhantom runs. The phantom's compositor
   // surface entry in this.surfaces sees the texture via the regular
@@ -1613,8 +1574,7 @@ export class JsCompositor implements CompositorSink {
     this.damageFull();
   }
 
-  setLayerSurfaces(layer: Layer, ids: number[]): void {
-    if (layer === "content") { this.stack = ids.slice(); this.damageFull(); return; }
+  setLayerSurfaces(layer: Exclude<Layer, "content">, ids: number[]): void {
     this.layers.set(layer, ids.slice());
     this.layerIdSet.clear();
     for (const list of this.layers.values()) {
@@ -1916,19 +1876,9 @@ export class JsCompositor implements CompositorSink {
     this.subsurfaceAccessor = accessor;
   }
 
-  // Bind (or clear) a window's decoration as an fx-follower. The decoration
-  // then receives the window's transform/opacity/tint/color-matrix via the fx
-  // cascade, keeping a decorated window visually unified during animations,
-  // while retaining its own layout rect (set separately by the WM).
-  setDecorationFx(windowId: number, decorationId: number | null): void {
-    if (decorationId === null) this.fxFollowers.delete(windowId);
-    else this.fxFollowers.set(windowId, [decorationId]);
-  }
-
-  // Every surface id the fx cascade should touch for `id`: the surface itself,
-  // its subsurface subtree (position-children also follow fx), and any
-  // non-subsurface fx-followers (the decoration). Depth-first; deduped by the
-  // tree structure (a surface has one parent).
+  // Every surface id the fx cascade should touch for `id`: the surface itself
+  // and its subsurface subtree (position-children also follow fx). Depth-first;
+  // deduped by the tree structure (a surface has one parent).
   private fxCascadeTargets(id: number): number[] {
     const out: number[] = [id];
     const acc = this.subsurfaceAccessor;
@@ -1938,8 +1888,6 @@ export class JsCompositor implements CompositorSink {
       };
       walk(id);
     }
-    const followers = this.fxFollowers.get(id);
-    if (followers) out.push(...followers);
     return out;
   }
 
@@ -2371,7 +2319,6 @@ export class JsCompositor implements CompositorSink {
     // rule A; the disconnect sweep in src/protocols/index.ts is what
     // guarantees no client-disconnect leak.
     this.dispatch(this.lifecycle.step({ kind: "surfaceRemoved", surfaceId: id }));
-    this.fxFollowers.delete(id);
     this.setShmSource(id, null);
     const bq = this.backdropQuads.get(id);
     if (bq) { bq.uniformBuf?.destroy(); this.backdropQuads.delete(id); }
@@ -3300,10 +3247,10 @@ export class JsCompositor implements CompositorSink {
   //
   // overrides (optional, compose-only): when present, the surface's nominal
   // placement (xywh) and/or sampled crop region (UV) are replaced by the
-  // caller-supplied values for this draw only. compose.windows uses both:
-  // placement = {0,0,outW,outH} so the cropped region fills the per-window
-  // texture; cropUV = normalized source-crop pixel coords. compose.scene
-  // passes neither, falling through to the on-screen behavior.
+  // caller-supplied values for this draw only. Content-crop callers use
+  // both: placement = {0,0,outW,outH} so the cropped region fills the
+  // target texture; cropUV = normalized source-crop pixel coords.
+  // compose.scene passes neither, falling through to the on-screen behavior.
   private updateUniforms(
     s: Surface, surfaceId: number, ow: number, oh: number,
     overrides?: {
@@ -3500,7 +3447,7 @@ export class JsCompositor implements CompositorSink {
   // frameSampled event. The on-screen renderFrame wraps these calls in a
   // matching frameStart/submitted pair, so the lifecycle's begin/end
   // alternation is intact. Snapshot callers (composeSnapshot via
-  // composeScene/composeWindows, capture frames) do NOT run inside a
+  // composeOutput/composeRegion, capture frames) do NOT run inside a
   // lifecycle frame; the comment above composeSnapshot explicitly says
   // the lifecycle state machine is not driven by snapshots, so they pass
   // false to skip the lifecycle dispatch. The WIRE-level Begin/End is
@@ -3886,8 +3833,8 @@ export class JsCompositor implements CompositorSink {
   // effects defaults ON; it requires `output` (the placement math the
   // effect quad mirrors) and is skipped under per-surface placement
   // overrides (a content crop has no meaningful backdrop). Callers that
-  // capture a window's own pixels (composeWindows, freeze snapshots,
-  // phantoms) pass effects: false explicitly.
+  // capture a window's own pixels (freeze snapshots, phantoms) pass
+  // effects: false explicitly.
   private compositeScene(args: {
     encoder: GPUCommandEncoder;
     targetView: GPUTextureView;
@@ -4040,8 +3987,7 @@ export class JsCompositor implements CompositorSink {
       // Empty in steady state, so the common idle path falls through to the
       // per-output dirty gate below.
       const liveActive = this.liveProducers.length > 0
-        || this.liveScenes.length > 0
-        || this.liveWindowComps.length > 0;
+        || this.liveScenes.length > 0;
       const outs = [...this.outputsGeom.values()].sort((a, b) => a.id - b.id);
       for (const o of outs) {
         // Per-output render gate. Skip this output if nothing changed on it
@@ -4175,9 +4121,6 @@ export class JsCompositor implements CompositorSink {
       }
       const liveSceneLists = this.liveScenes.map((ls) => ls.getDrawList());
       for (const list of liveSceneLists) this.openImportBrackets(list, bracketed);
-      for (const lw of this.liveWindowComps) {
-        this.openImportBrackets(lw.windows.map((w) => w.id), bracketed);
-      }
 
       // On-screen pass: each output is either a transition pass or a normal
       // per-surface composite, decided per output. Each output is its OWN
@@ -4223,29 +4166,6 @@ export class JsCompositor implements CompositorSink {
           output: ls.ctx,
         });
         this.device.queue.submit([enc.finish()]);
-      }
-      for (const lw of this.liveWindowComps) {
-        for (const w of lw.windows) {
-          // Same per-window crop / placement-override pattern as
-          // composeWindows: render the surface filling the target,
-          // sampling only the crop region.
-          const placements = new Map([[w.id, { x: 0, y: 0, w: w.rect.w, h: w.rect.h }]]);
-          const cropUV = w.surfW > 0 && w.surfH > 0
-            ? new Map([[w.id, {
-                u0: w.rect.x / w.surfW, v0: w.rect.y / w.surfH,
-                u1: (w.rect.x + w.rect.w) / w.surfW,
-                v1: (w.rect.y + w.rect.h) / w.surfH,
-              }]])
-            : undefined;
-          const enc = this.device.createCommandEncoder();
-          this.compositeScene({
-            encoder: enc, targetView: w.view, drawList: [w.id],
-            outW: w.rect.w, outH: w.rect.h,
-            placements, cropUV,
-            effects: false,  // content crop: a lone window has no backdrop
-          });
-          this.device.queue.submit([enc.finish()]);
-        }
       }
 
       // Tag the submit; on GPU completion advance completedSerial and emit
@@ -4350,7 +4270,7 @@ export class JsCompositor implements CompositorSink {
     });
   }
 
-  // Snapshot compose primitive shared by composeScene and composeWindows.
+  // Snapshot compose primitive shared by composeOutput and composeRegion.
   // Runs one composite pass into `targetView` with its own dmabuf bracket
   // open/close pair. Synchronous wrt the on-screen frame loop: the JS
   // event loop is single-threaded, so a snapshot returns before the next
@@ -4431,7 +4351,7 @@ export class JsCompositor implements CompositorSink {
     scale: number;
     // Backdrop effects default ON (a region compose of a scene must match
     // what the screen shows there); single-window content-crop callers
-    // (compose.windows, toplevel capture) pass false.
+    // (toplevel capture) pass false.
     effects?: boolean;
   }): { texture: GPUTexture; outW: number; outH: number } {
     const scale = args.scale > 0 ? args.scale : 1;
@@ -5748,7 +5668,6 @@ export class JsCompositor implements CompositorSink {
   // output at its scale). Holder polls the returned texture between frames;
   // release() removes the registration and destroys the texture.
   registerLiveScene(args: {
-    outputId: number;
     getDrawList: () => number[];
     region?: { x: number; y: number; w: number; h: number };
     scale?: number;
@@ -5767,7 +5686,7 @@ export class JsCompositor implements CompositorSink {
     };
     const entry: LiveScene = {
       texture, view: texture.createView(),
-      outputId: args.outputId, getDrawList: args.getDrawList, ctx,
+      getDrawList: args.getDrawList, ctx,
     };
     this.liveScenes.push(entry);
     let released = false;
@@ -5779,47 +5698,6 @@ export class JsCompositor implements CompositorSink {
         const i = this.liveScenes.indexOf(entry);
         if (i >= 0) this.liveScenes.splice(i, 1);
         texture.destroy();
-      },
-    };
-  }
-
-  // Register a live compose-windows target. Each listed window gets its
-  // own texture sized to its crop rect (or the full surface if no rect),
-  // re-rendered on every on-screen renderFrame(). The set of windows
-  // and their crop rects is fixed at registration; releasing and
-  // re-registering is how the holder changes the list.
-  registerLiveWindows(args: {
-    outputId: number;
-    windows: ReadonlyArray<{
-      id: number;
-      rect?: { x: number; y: number; w: number; h: number };
-    }>;
-  }): LiveWindowCompHandle {
-    const windows: LiveWindowComp["windows"] = [];
-    for (const w of args.windows) {
-      const s = this.surfaces.get(w.id);
-      if (!s) continue;  // unknown window: skip
-      const surfW = s.width || s.layoutW || 0;
-      const surfH = s.height || s.layoutH || 0;
-      const rect = w.rect ?? { x: 0, y: 0, w: surfW, h: surfH };
-      if (rect.w <= 0 || rect.h <= 0) continue;
-      const texture = this.allocComposeTexture(rect.w, rect.h);
-      windows.push({
-        id: w.id, rect, texture, view: texture.createView(),
-        surfW, surfH,
-      });
-    }
-    const entry: LiveWindowComp = { outputId: args.outputId, windows };
-    this.liveWindowComps.push(entry);
-    let released = false;
-    return {
-      windows: windows.map((w) => ({ id: w.id, texture: w.texture, rect: w.rect })),
-      release: () => {
-        if (released) return;
-        released = true;
-        const i = this.liveWindowComps.indexOf(entry);
-        if (i >= 0) this.liveWindowComps.splice(i, 1);
-        for (const w of windows) w.texture.destroy();
       },
     };
   }

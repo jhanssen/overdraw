@@ -63,8 +63,8 @@ export interface RuntimeOptions {
   // Called whenever a plugin is torn down (graceful stop, crash, init
   // failure, reload), after its namespace claims and actions are dropped.
   // main.ts wires core-side brokers that hold per-plugin state the runtime
-  // doesn't know about (input binds/modes, decoration providers) so a
-  // same-named successor never collides with its predecessor's leftovers.
+  // doesn't know about (input binds/modes) so a same-named successor never
+  // collides with its predecessor's leftovers.
   onPluginRelease?: (pluginName: string) => void;
   // Override the bootstrap entry (tests point at a fixture-aware bootstrap if needed).
   bootstrapPath?: string;
@@ -561,8 +561,8 @@ export class PluginRuntime implements PluginController {
   }
 
   // Push a one-way event to one plugin by name (core -> plugin). No-op if no such
-  // plugin or it is not `live`. Used by point-to-point flows like decoration
-  // assignment; broad event delivery goes through the dynamic bus instead.
+  // plugin or it is not `live`. Used by point-to-point flows like surface
+  // frame ticks; broad event delivery goes through the dynamic bus instead.
   emit(pluginName: string, name: string, data: Json): void {
     for (const p of this.plugins) {
       if (p.cfg.name === pluginName) { p.emit(name, data); return; }

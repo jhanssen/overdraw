@@ -521,7 +521,7 @@ export async function setupCompositor(opts = {}) {
     const kine = new Kinematics();
     const eng = new CursorRuleEngine();
     cursorBroker = cb.createCursorBroker({
-      addon, compositor: jsCompositor, resolver,
+      compositor: jsCompositor, resolver,
       kinematics: kine, ruleEngine: eng,
       cursorSizePx: Number(process.env.XCURSOR_SIZE) || 24,
     });
@@ -921,10 +921,6 @@ export function pointerButton(addon, button, pressed, { serial = 1, time = 0 } =
 // skip. Used to cover the path the manual input-smoke test exercised.
 export function pointerMotionHost(addon, x, y, time = 0) {
   addon.injectHostInput({ type: "pointerMotion", x, y, time });
-  addon.injectHostInput({ type: "pointerFrame", time });
-}
-export function pointerButtonHost(addon, button, pressed, { serial = 1, time = 0 } = {}) {
-  addon.injectHostInput({ type: "pointerButton", button, pressed, serial, time });
   addon.injectHostInput({ type: "pointerFrame", time });
 }
 export function keyHost(addon, key, pressed, { serial = 1, time = 0 } = {}) {

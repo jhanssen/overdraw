@@ -924,7 +924,6 @@ export function startSelectionBridge(
       const out = findOutgoingTransferByRequestor(window);
       if (out && ev.atom === out.t.property) {
         onRequestorPropertyDelete(out.t);
-      } else {
       }
     }
   }

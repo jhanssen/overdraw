@@ -137,7 +137,7 @@ test("compose.scene live reflects per-surface state changes", { skip }, async ()
     const bgra = argbToBgra(color);
 
     const handle = c.jsCompositor.registerLiveScene({
-      outputId: 0, getDrawList: () => [w.surfaceId],
+      getDrawList: () => [w.surfaceId],
     });
     try {
       // First read: live texture should match the current state.
@@ -194,7 +194,7 @@ test("compose.scene live re-evaluates getDrawList every frame", { skip }, async 
     // (a list captured once at registration could not follow this).
     let include = false;
     const handle = c.jsCompositor.registerLiveScene({
-      outputId: 0, getDrawList: () => (include ? [w.surfaceId] : []),
+      getDrawList: () => (include ? [w.surfaceId] : []),
     });
     try {
       // Empty list -> opaque-black background.
@@ -290,7 +290,7 @@ test("compose.scene release destroys the texture and removes the live registrati
     const handles = [];
     for (let i = 0; i < 5; i++) {
       handles.push(c.jsCompositor.registerLiveScene({
-        outputId: 0, getDrawList: () => [w.surfaceId],
+        getDrawList: () => [w.surfaceId],
       }));
     }
     assert.equal(c.jsCompositor.liveScenes.length, 5);
@@ -327,7 +327,7 @@ test("createInThreadCompose wraps the compositor compose methods", { skip }, asy
     const fl = makeComposeFlatteners(c.state);
     const sdkCompose = createInThreadCompose(
       c.jsCompositor, (id) => id === 0, undefined,
-      fl.flattenWindows, fl.outputRegion, fl.windowRegion);
+      fl.flattenWindows, fl.outputRegion);
     assert.ok(sdkCompose, "createInThreadCompose returns non-null when compositor exposes the methods");
 
     // snapshot

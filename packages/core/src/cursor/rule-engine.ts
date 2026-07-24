@@ -32,12 +32,12 @@ export interface RuleInstaller {
   // Install a named shape (theme resolver lookup). The installer is
   // expected to handle "not found" by leaving the previous cursor in
   // place; this method returns true if the install succeeded.
-  installShape(name: string, enlarge: number): boolean;
+  installShape(name: string): boolean;
   // Install a plugin-supplied texture. The installer handles cross-
   // transport differences (in-thread = direct GPUTexture; Worker not
   // supported in v1).
   installTexture(textureHandle: unknown, width: number, height: number,
-                 hotspotX: number, hotspotY: number, enlarge: number): boolean;
+                 hotspotX: number, hotspotY: number): boolean;
   // Restore the compositor default (built-in / setDefault). Called when
   // no rule matches and no explicit override is active.
   installDefault(): void;
@@ -171,14 +171,13 @@ export class CursorRuleEngine {
   private applyOutcome(rule: InternalRule): void {
     const inst = this.installer;
     if (!inst) return;
-    const enlarge = rule.spec.enlarge ?? 1.0;
     if (rule.spec.shape !== undefined) {
-      inst.installShape(rule.spec.shape, enlarge);
+      inst.installShape(rule.spec.shape);
       return;
     }
     if (rule.spec.texture !== undefined) {
       const t = rule.spec.texture;
-      inst.installTexture(t.handle, t.width, t.height, t.hotspotX, t.hotspotY, enlarge);
+      inst.installTexture(t.handle, t.width, t.height, t.hotspotX, t.hotspotY);
       return;
     }
     // Shouldn't reach here: validateSpec rejected this case at registration.
@@ -231,9 +230,5 @@ function validateSpec(spec: CursorRuleSpec): void {
   }
   if (w.shake !== undefined && typeof w.shake !== "boolean") {
     throw new Error("cursor rule: when.shake must be a boolean");
-  }
-  if (spec.enlarge !== undefined &&
-      (typeof spec.enlarge !== "number" || spec.enlarge <= 0)) {
-    throw new Error("cursor rule: enlarge must be a positive number");
   }
 }

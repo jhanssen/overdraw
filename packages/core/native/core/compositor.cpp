@@ -21,7 +21,7 @@ namespace overdraw::core {
 Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
                        bool headless, uint32_t headlessW, uint32_t headlessH,
                        bool kms)
-    : link_(std::make_unique<WireLink>(wireFd, ctrlFd)),
+    : link_(std::make_unique<WireLink>(wireFd)),
       gpuPid_(gpuPid), wireFd_(wireFd), ctrlFd_(ctrlFd) {
     headless_ = headless;
     kmsMode_ = kms && !headless;  // headless wins; kms ignored in headless tests
@@ -365,9 +365,8 @@ bool Compositor::bringUp() {
     //   kms     -> wait for OutputDescriptor (+ FeedbackData), then run
     //              the scanout-ring bring-up.
     //   headless-> wait for FeedbackData only (no surface).
-    // DeviceReady's surface handle is always zero: no wgpu::Surface lives
-    // on either side (KMS has none; nested does not create one -- see the
-    // bringUp comment in the wantSurface branch below).
+    // No wgpu::Surface lives on either side (KMS has none; nested does not
+    // create one -- see the bringUp comment in the wantSurface branch below).
     const bool wantSurface = !headless_ && !kmsMode_;
     {
         ipc::Message m{};
@@ -375,7 +374,6 @@ bool Compositor::bringUp() {
         m.instance = {ri.handle.id, ri.handle.generation};
         auto dh = link_->client().GetWireHandle(device_.Get());
         m.device = {dh.id, dh.generation};
-        m.surface = {0, 0};
         ipc::sendMessage(ctrlFd_, m);
     }
 
@@ -1494,10 +1492,6 @@ void Compositor::pauseOutput() {
         (void)id;
         for (int i = 0; i < 3; ++i) o.slots[i].state = ScanoutSlotState::FREE;
         o.currentSlot = -1;
-    }
-    if (pendingScanoutFenceFd_ >= 0) {
-        ::close(pendingScanoutFenceFd_);
-        pendingScanoutFenceFd_ = -1;
     }
     if (ctrlSender_) {
         ipc::Message m{};

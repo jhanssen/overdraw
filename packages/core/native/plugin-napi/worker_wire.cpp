@@ -12,10 +12,9 @@ namespace overdraw::plugin {
 
 WorkerWireClient::WorkerWireClient(int fd) : fd_(fd) {
     ipc::setNonBlocking(fd_);
-    // WireLink owns the wire client over this fd. ctrlFd is unused here (the core
-    // owns the side channel); pass -1. WireLink sets the process-global wire-client
-    // proc table (idempotent if already set in this isolate).
-    link_ = std::make_unique<core::WireLink>(fd_, -1);
+    // WireLink owns the wire client over this fd and sets the process-global
+    // wire-client proc table (idempotent if already set in this isolate).
+    link_ = std::make_unique<core::WireLink>(fd_);
 }
 
 WorkerWireClient::~WorkerWireClient() {
@@ -40,7 +39,7 @@ void WorkerWireClient::startDevice() {
     instance_.RequestAdapter(&ao, wgpu::CallbackMode::AllowProcessEvents,
         [this](wgpu::RequestAdapterStatus s, wgpu::Adapter a, wgpu::StringView) {
             if (s == wgpu::RequestAdapterStatus::Success) adapter_ = std::move(a);
-            else { failed_ = true; error_ = "plugin: no adapter over wire"; }
+            else { failed_ = true; LOG_ERR(Plugin, "plugin: no adapter over wire"); }
         });
     link_->flush();
 }
@@ -67,7 +66,7 @@ void WorkerWireClient::pump() {
         adapter_.RequestDevice(&dd, wgpu::CallbackMode::AllowProcessEvents,
             [this](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView) {
                 if (s == wgpu::RequestDeviceStatus::Success) device_ = std::move(d);
-                else { failed_ = true; error_ = "plugin: no device over wire"; }
+                else { failed_ = true; LOG_ERR(Plugin, "plugin: no device over wire"); }
             });
         link_->flush();
     }

@@ -83,17 +83,12 @@ export interface Window {
   // Decoration insets reserved inside the outer tile. Absent = none (content ==
   // outer).
   insets?: Insets;
-  // The window-bound decoration surface id, if a decoration was created for this
-  // window. computeBaseStack splices it directly BELOW this window's content id,
-  // so each decoration is z-bound to its own window. Absent = none.
-  decorationSurfaceId?: number;
   // Content gating: the window is held out of the draw stack as long as
   // this set is non-empty. Multiple owners can engage independently
-  // (decoration broker waits for first decoration frame; opening driver
-  // waits for the opening-animation plugin to release after setting
-  // initial transform/opacity). Each owner uses a distinct string key
-  // and is responsible for its own release; the gate clears only when
-  // every owner has released.
+  // (e.g. the opening driver waits for the opening-animation plugin to
+  // release after setting initial transform/opacity). Each owner uses a
+  // distinct string key and is responsible for its own release; the gate
+  // clears only when every owner has released.
   contentGateOwners?: Set<string>;
   // True once the client has committed presentable content (the map-on-first-
   // content signal). A window is in the layout (and configured) from addWindow,
@@ -233,10 +228,6 @@ export interface ConfigureSink {
   configure: ConfigureFn;
   configureMove: ConfigureMoveFn;
 }
-
-// Decoration-resize sink: fired when a decorated window's OUTER tile changes
-// (move and/or size).
-export type DecorationResizeSink = (windowId: number, outerRect: Rect, contentRect: Rect, insets: Insets) => void;
 
 // What setInsets grants back: the (possibly clamped) insets, the outer rect (the
 // decoration's region = content rect grown by the insets), and the content rect
@@ -399,7 +390,6 @@ export interface Wm {
   releaseContentGate(surfaceId: number, owner: string): void;
   // True iff at least one owner is currently holding the gate.
   isContentGated(surfaceId: number): boolean;
-  setDecorationSurface(windowId: number, decoSurfaceId: number | null): void;
 
   // Raise a window to the top of its z-bucket. If the target is a
   // modal dialog (windowState.parent != null), the raise redirects up
@@ -499,7 +489,6 @@ export interface WindowSnapshot {
   rect: Rect;
   outer: Rect;
   insets?: Insets;
-  decorationSurfaceId?: number;
   hasContent: boolean;
   contentGated: boolean;
   windowState: WindowState;
@@ -758,7 +747,6 @@ function resolveDecisions(
 export interface WmOptions {
   rebuild?: () => void;
   configure?: ConfigureSink;
-  decorationResize?: DecorationResizeSink;
   layoutDriverFactory?: (target: LayoutApplyTarget, snapshot: () => LayoutSnapshot) => LayoutDriver;
   // Plugin-visible event bus. When set:
   //   - applyLayout emits 'window.relayout' per affected window before
@@ -887,7 +875,6 @@ export function createWm(
         configureMove: rawConfigure.configureMove,
       }
     : undefined;
-  const decorationResize = opts?.decorationResize;
   const layoutDriverFactory = opts?.layoutDriverFactory;
   const pluginBus = opts?.pluginBus;
   const outputContent = opts?.outputContent;
@@ -1192,10 +1179,7 @@ export function createWm(
       .filter((w) => !isGated(w) && w.hasContent && w.windowState.visible)
       .sort((a, b) => effectiveStackZ(a) - effectiveStackZ(b));
     const ids: number[] = [];
-    for (const w of ordered) {
-      if (w.decorationSurfaceId !== undefined) ids.push(w.decorationSurfaceId);
-      ids.push(w.surfaceId);
-    }
+    for (const w of ordered) ids.push(w.surfaceId);
     compositor.setStack(ids);
   }
 
@@ -1325,24 +1309,14 @@ export function createWm(
     return null;
   }
 
-  // Push one window's held geometry to the compositor: content layout, the
-  // decoration's outer layout, and the decoration-resize hook. Mirrors the
+  // Push one window's held geometry to the compositor. Mirrors the
   // immediate apply path in applyLayout.
   function pushGeometry(win: Window, outer: Rect, content: Rect): void {
-    const prevOuter = win.outer;
     const prevContent = { ...win.rect };
     win.outer = outer;
     win.rect = content;
     if (win.hasContent) {
       compositor.setSurfaceLayout(win.surfaceId, content.x, content.y, content.width, content.height);
-    }
-    const outerMoved = prevOuter.x !== outer.x || prevOuter.y !== outer.y
-                    || prevOuter.width !== outer.width || prevOuter.height !== outer.height;
-    if (win.decorationSurfaceId !== undefined && outerMoved) {
-      compositor.setSurfaceLayout(win.decorationSurfaceId, outer.x, outer.y, outer.width, outer.height);
-      if (decorationResize && win.insets) {
-        decorationResize(win.surfaceId, { ...outer }, { ...content }, { ...win.insets });
-      }
     }
     // Pure-move: position changed but size didn't. xwayland clients need a
     // ConfigureNotify with the new root coords (xdg-shell clients hide
@@ -1663,15 +1637,6 @@ export function createWm(
         // the move-only sink so xwayland clients get a ConfigureNotify and
         // xdg clients see a no-op.
         configure.configureMove(win.surfaceId, content.x, content.y, content.width, content.height);
-      }
-      const outerMoved = prevOuter.x !== win.outer.x || prevOuter.y !== win.outer.y
-                      || prevOuter.width !== win.outer.width || prevOuter.height !== win.outer.height;
-      if (win.decorationSurfaceId !== undefined && outerMoved) {
-        compositor.setSurfaceLayout(win.decorationSurfaceId,
-          win.outer.x, win.outer.y, win.outer.width, win.outer.height);
-        if (decorationResize && win.insets) {
-          decorationResize(win.surfaceId, { ...win.outer }, { ...content }, { ...win.insets });
-        }
       }
     }
 
@@ -2180,23 +2145,6 @@ export function createWm(
     isContentGated(surfaceId) {
       const win = windows.find((w) => w.surfaceId === surfaceId);
       return win?.contentGateOwners !== undefined && win.contentGateOwners.size > 0;
-    },
-
-    setDecorationSurface(windowId, decoSurfaceId) {
-      const win = windows.find((w) => w.surfaceId === windowId);
-      if (!win) return;
-      const next = decoSurfaceId === null ? undefined : decoSurfaceId;
-      if (win.decorationSurfaceId === next) return;
-      win.decorationSurfaceId = next;
-      // Bind the decoration as an fx-follower so a window transform/opacity
-      // reaches it (the compositor cascades over the group). It keeps its own
-      // outer-rect layout, set below.
-      compositor.setDecorationFx?.(windowId, next ?? null);
-      if (next !== undefined && win.outer.width > 0 && win.outer.height > 0) {
-        compositor.setSurfaceLayout(next, win.outer.x, win.outer.y,
-                                    win.outer.width, win.outer.height);
-      }
-      pushStack();
     },
 
     raiseWindow(surfaceId) {
@@ -2868,6 +2816,5 @@ function snapshotOf(win: Window): WindowSnapshot {
     state,
   };
   if (win.insets) snap.insets = { ...win.insets };
-  if (win.decorationSurfaceId !== undefined) snap.decorationSurfaceId = win.decorationSurfaceId;
   return snap;
 }

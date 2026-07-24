@@ -13,21 +13,19 @@
 
 import type { Resource } from "./types.js";
 import type { CompositorState, SubsurfaceRecord, SurfaceRecord } from "./protocols/ctx.js";
-import { primaryOutputOfSurface } from "./protocols/output-resolve.js";
 
 // Region (global-logical rect + scale) for device-resolution compose.
 export interface ComposeRegion { x: number; y: number; w: number; h: number; scale: number }
 
 // The state-backed helpers sdk.compose needs to render windows WITH their
 // subsurfaces at device resolution: flatten a window set into its full draw
-// list, and resolve an output's / a window's region + scale. The compositor
-// has no subsurface tree, so these live here (where state does) and are
-// threaded into the in-thread compose SDK. Used by both main.ts and the test
-// harness so production and tests share one definition.
+// list, and resolve an output's region + scale. The compositor has no
+// subsurface tree, so these live here (where state does) and are threaded
+// into the in-thread compose SDK. Used by both main.ts and the test harness
+// so production and tests share one definition.
 export function makeComposeFlatteners(state: CompositorState): {
   flattenWindows: (surfaceIds: ReadonlyArray<number>) => number[];
   outputRegion: (outputId: number) => ComposeRegion | null;
-  windowRegion: (surfaceId: number) => ComposeRegion | null;
 } {
   return {
     flattenWindows: (surfaceIds) => {
@@ -46,14 +44,6 @@ export function makeComposeFlatteners(state: CompositorState): {
         w: o.logicalSize.width, h: o.logicalSize.height,
         scale: o.scale > 0 ? o.scale : 1,
       };
-    },
-    windowRegion: (surfaceId) => {
-      const rect = state.wm?.outerRectOf(surfaceId);
-      if (!rect) return null;
-      const sRec = state.surfacesById?.get(surfaceId);
-      const outId = sRec ? primaryOutputOfSurface(state, sRec.resource) : -1;
-      const sc = state.outputs?.get(outId)?.scale ?? 1;
-      return { x: rect.x, y: rect.y, w: rect.width, h: rect.height, scale: sc > 0 ? sc : 1 };
     },
   };
 }
@@ -282,12 +272,6 @@ export function computeBaseStack(
     // owner) are held out of the draw stack so the window enters
     // visibly intact.
     if (win.contentGateOwners !== undefined && win.contentGateOwners.size > 0) continue;
-    // The window's decoration (if any) draws directly BELOW its own content, so the
-    // decoration is z-bound to the window: a window stacked above occludes it just
-    // as it occludes the window below. (A flat decoration layer would put ALL
-    // decorations behind ALL content, so an upper window's content would draw over
-    // a lower window's decoration.)
-    if (win.decorationSurfaceId !== undefined) stack.push(win.decorationSurfaceId);
     stack.push(win.surfaceId);
     emitSubtreeStack(state, win.surfaceRec.resource, stack);
   }
@@ -305,7 +289,6 @@ export interface WmWindowLike {
   // Set of owners currently holding this window's content gate. The
   // window is held out of the draw stack iff non-empty.
   contentGateOwners?: ReadonlySet<string>;
-  decorationSurfaceId?: number;
   z?: number;
   // WM-stamped stacking tier (see the WM's updateStackTiers): +1
   // output-active sizeMode window, -1 non-active non-tile-member

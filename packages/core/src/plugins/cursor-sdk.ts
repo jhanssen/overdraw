@@ -151,6 +151,5 @@ function serializeRule(spec: CursorRuleSpec): Record<string, unknown> {
       hotspotY: spec.texture.hotspotY,
     };
   }
-  if (spec.enlarge !== undefined) out.enlarge = spec.enlarge;
   return out;
 }

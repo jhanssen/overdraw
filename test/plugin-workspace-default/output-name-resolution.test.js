@@ -54,7 +54,7 @@ async function withTwoOutputs(outputsDecl, fn) {
   };
   const state = {
     bus, wm, surfaces: new Map(), compositor: sink, seat,
-    pendingWindowChanges: undefined, decorationResize: null,
+    pendingWindowChanges: undefined,
   };
   const broker = createWindowsBroker({ wm, compositor: sink, state, pluginBus, bus });
   bus.on(WINDOW_EVENT.map, (ev) => pluginBus.emit(WINDOW_EVENT.map, ev));

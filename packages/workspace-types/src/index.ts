@@ -175,18 +175,8 @@ export interface WorkspaceAPI {
    * value is a no-op (no event emitted). Becomes-shown auto-clears urgent;
    * callers don't have to clear it themselves on focus.
    *
-   * Emits 'workspace.urgency-changed' (see WorkspaceUrgencyChangedPayload)
-   * on the plugin bus when the flag actually changes.
+   * Emits 'workspace.urgency-changed' on the plugin bus when the flag
+   * actually changes.
    */
   setUrgent(index: WorkspaceIndex, urgent: boolean, outputId?: number): Promise<void>;
-}
-
-// Payload of the 'workspace.urgency-changed' plugin-bus event. Emitted by
-// the workspace plugin when a workspace's urgent flag transitions (either
-// direction). Carries the durable WorkspaceHandle so subscribers caching
-// ids don't break across destroys of other workspaces.
-export interface WorkspaceUrgencyChangedPayload {
-  workspaceId: WorkspaceHandle;
-  urgent: boolean;
-  outputId: number;
 }

@@ -14,9 +14,6 @@
 //   - sdk.gpu.device  -- the core's GPUDevice handed in by main.ts
 //   - sdk.gpu.createOverlay({layer, anchor, w, h})  -- a Surface ring of
 //     core-device GPUTextures + the rect on screen
-//   - the RingMaker used by sdk.decorations.createDecoration (same contract
-//     as the Worker path; same `allocExtra` tags drive the geometry decision
-//     in the overlay broker)
 //
 // Why no slot-state SAB / atomics: only one thread is producing OR consuming
 // (it's the same thread). Submit ordering on the core device's queue
@@ -27,7 +24,7 @@
 
 import type { CompositorSink } from "../protocols/ctx.js";
 import type {
-  CreateOverlayOpts, OutputInfo, PluginGpu, RingMaker, Surface,
+  CreateOverlayOpts, OutputInfo, PluginGpu, Surface,
 } from "./gpu.js";
 import type { OverlayBroker, OverlayLayer } from "../overlay.js";
 import type { OverlayAnchor } from "../overlay-position.js";
@@ -88,25 +85,12 @@ export interface InThreadGpuDeps {
   // The output's GLOBAL-logical rect + scale, for device-resolution compose.
   outputRegion?: (outputId: number) =>
     { x: number; y: number; w: number; h: number; scale: number } | null;
-  // A window's GLOBAL-logical outer rect + its output scale, for per-window
-  // (sdk.compose.windows) device-resolution compose.
-  windowRegion?: (surfaceId: number) =>
-    { x: number; y: number; w: number; h: number; scale: number } | null;
   // Intercept: the broker the in-thread sdk.intercept SDK
   // talks to directly. Optional: when absent, sdk.intercept.register
   // will reject (the bundled-plugin path either has it or doesn't,
   // mirroring how sdk.transitions only works when sceneRegistry is
   // wired).
   interceptBroker?: import("../intercept/broker.js").InterceptBroker;
-  // Generic ring-surface lifecycle hooks the decoration broker reads.
-  // The Worker GPU broker calls equivalents on surface.alloc /
-  // surface.present; the in-thread path mirrors them here so the broker's
-  // first-frame gate releases regardless of which transport the decoration
-  // plugin uses. onSurfaceAllocated fires with the `decorates` tag's window
-  // id (only present for the decoration path). onSurfacePresented fires
-  // on every present (the broker filters its own).
-  onSurfaceAllocated?: (surfaceId: number, decoratesWindowId: number) => void;
-  onSurfacePresented?: (surfaceId: number) => void;
   // Live output enumeration for gpu.listOutputs; mirrors the Worker GPU
   // broker's dep. Absent in harnesses -> no outputs reported.
   listOutputs?: () => OutputInfo[];
@@ -123,9 +107,8 @@ export interface InThreadGpuDeps {
 // stop() until the plugin's own onShutdown cleans them up.)
 export function createInThreadGpu(
   pluginName: string, deps: InThreadGpuDeps,
-): { gpu: PluginGpu; makeRingSurface: RingMaker; stop: () => void } {
-  const { coreDevice, globals, overlays, compositor,
-          onSurfaceAllocated, onSurfacePresented } = deps;
+): { gpu: PluginGpu; stop: () => void } {
+  const { coreDevice, globals, overlays, compositor } = deps;
   installWebGPUGlobalsOnce(globals);
   let stopped = false;
 
@@ -147,34 +130,18 @@ export function createInThreadGpu(
   }
 
   // Build a Surface for a ring at the broker-decided rect. `allocExtra`
-  // carries either anchor params (overlay path) or an explicit rect with a
-  // `decorates` tag (decoration path); the overlay broker interprets them
+  // carries the overlay anchor params; the overlay broker interprets them
   // the same way as the Worker path's surface.alloc.
   function makeRingSurface(
     width: number, height: number, allocExtra: Record<string, Json>,
   ): Promise<Surface> {
-    const explicitRect = allocExtra.rect as
-      { x: number; y: number; width: number; height: number } | undefined;
-    const decorates = allocExtra.decorates as number | undefined;
-    const handle = typeof decorates === "number" && explicitRect
-      ? overlays.createWindowBound(pluginName, explicitRect)
-      : explicitRect
-        ? overlays.createAt(pluginName,
-            (allocExtra.layer as OverlayLayer) ?? "above", explicitRect)
-        : overlays.create(pluginName, {
-            layer: (allocExtra.layer as OverlayLayer) ?? "overlay",
-            anchor: (allocExtra.anchor as OverlayAnchor) ?? "center",
-            width, height,
-            margin: allocExtra.margin as number | undefined,
-            output: allocExtra.output as number | undefined,
-          });
-    // Fire the decoration-broker alloc hook for decoration surfaces. The
-    // Worker GPU broker does the equivalent for surface.alloc; we mirror it
-    // here so the broker's first-frame gate releases for in-thread bundled
-    // decoration plugins too.
-    if (typeof decorates === "number") {
-      onSurfaceAllocated?.(handle.surfaceId, decorates);
-    }
+    const handle = overlays.create(pluginName, {
+      layer: (allocExtra.layer as OverlayLayer) ?? "overlay",
+      anchor: (allocExtra.anchor as OverlayAnchor) ?? "center",
+      width, height,
+      margin: allocExtra.margin as number | undefined,
+      output: allocExtra.output as number | undefined,
+    });
 
     const slots = allocSlots(width, height);
     // -1 = no slot held; otherwise the index getCurrentTexture last handed
@@ -236,9 +203,6 @@ export function createInThreadGpu(
         // ordering carries the plugin's writes into the compositor's read.
         compositor.setSurfaceTexture?.(handle.surfaceId,
           slots[justPresented], width, height);
-        // Mirror the Worker path's surface.present hook so the decoration
-        // broker's first-present gate releases for in-thread plugins too.
-        onSurfacePresented?.(handle.surfaceId);
 
         // Demote the previously presented slot to DRAINING + free it once
         // the compositor's last-sampling submit completes. Same-device
@@ -329,7 +293,6 @@ export function createInThreadGpu(
 
   return {
     gpu,
-    makeRingSurface,
     stop(): void {
       stopped = true;
       // Outstanding Surfaces are owned by the plugin; their destroy() runs

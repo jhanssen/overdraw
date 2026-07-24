@@ -44,7 +44,6 @@ interface PluginAddon {
   reserveConsumerTexture(clientId: number, surfaceBufId: number, w: number, h: number):
     { texture: { id: number; generation: number }; device: { id: number; generation: number }; wireSerial: bigint };
   consumerTexture(clientId: number, surfaceBufId: number): bigint;
-  forgetConsumerReservation(clientId: number, resKey: number): void;
   flush(clientId: number): void;
   // In-band producer Begin/End on the plugin wire. The
   // Worker writes Begin as it claims a slot (kind=1, FIFO-ordered before its
@@ -147,14 +146,11 @@ export interface Surface {
   // The compositor's surface id this ring is wired into. Stable for the
   // surface's lifetime; useful for callers that want to apply a per-surface
   // primitive that the SDK exposes only by surface id (sdk.windows.setShape /
-  // setMask / setTint / etc.). Hidden by the core for non-decorator overlays
-  // would be a separate capability gate; not enforced today.
+  // setMask / setTint / etc.).
   readonly surfaceId: number;
-  // The output an anchored overlay was placed on (null for decoration/
-  // explicit-rect surfaces, whose geometry is caller-owned). Fixed at
-  // creation; when this output is removed the core drops the overlay from
-  // compositing and the plugin (watching output.* events) should destroy()
-  // the surface.
+  // The output an anchored overlay was placed on. Fixed at creation; when
+  // this output is removed the core drops the overlay from compositing and
+  // the plugin (watching output.* events) should destroy() the surface.
   readonly outputId: number | null;
   // Acquire the GPUTexture to render into this frame (dmabuf-backed, BGRA8). ASYNC:
   // a swapchain-style acquire -- it claims a FREE ring slot, awaiting one if every
@@ -198,13 +194,6 @@ export interface PluginGpu {
   unregisterBackdropEffect(kind: string): Promise<void>;
 }
 
-// Internal producer/consumer ring allocator (NOT plugin-facing). `allocExtra`
-// carries the geometry source + any tags (anchor for overlays; an explicit rect +
-// `decorates` window id for decorations). createDecoration (decorations.ts) uses
-// this to place a ring at the inset outer rect; there is no public explicit-rect
-// surface API yet (add one when a concrete use case defines the args).
-export type RingMaker = (width: number, height: number, allocExtra: Record<string, Json>) => Promise<Surface>;
-
 // Bring up the Worker's GPU (device over its own wire) + return the SDK gpu
 // object. `endpoint` brokers side-channel control through the core. `deviceBin`
 // /`dawnPath` are absolute paths to the two native modules.
@@ -221,7 +210,7 @@ export interface WorkerGpuInternals {
 }
 export async function createPluginGpu(
   endpoint: Endpoint, pluginAddonPath: string, dawnPath: string,
-): Promise<{ gpu: PluginGpu; pump: () => void; makeRingSurface: RingMaker;
+): Promise<{ gpu: PluginGpu; pump: () => void;
             stop: () => void; internals: WorkerGpuInternals;
             dispatchGpuEvent: (name: string, data: unknown) => boolean }> {
   const require = createRequire(import.meta.url);
@@ -274,10 +263,8 @@ export async function createPluginGpu(
   // any number of queued callbacks; the whole list flushes on the tick event.
   const surfaceFrameCbs = new Map<number, Array<(timeMs: number) => void>>();
 
-  // Shared producer/consumer ring setup. `allocExtra` carries the geometry source
-  // (anchor params for overlays, an explicit rect for decorations); the core's
-  // surface.alloc returns the surfaceId + the decided rect. Both surface kinds use
-  // the identical slot-bind + present machinery.
+  // Producer/consumer ring setup. `allocExtra` carries the overlay anchor
+  // params; the core's surface.alloc returns the surfaceId + the decided rect.
   async function makeRingSurface(
     width: number, height: number,
     allocExtra: Record<string, Json>,
@@ -450,5 +437,5 @@ export async function createPluginGpu(
     return true;
   };
 
-  return { gpu, pump, makeRingSurface, stop, internals, dispatchGpuEvent };
+  return { gpu, pump, stop, internals, dispatchGpuEvent };
 }

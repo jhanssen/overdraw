@@ -755,22 +755,6 @@ class FrameReader {
         return true;
     }
 
-    // Compat overload for readers that only ever receive Dawn (kind=0) frames
-    // (e.g. the core's inbound GPU->core wire). A non-zero kind here is a
-    // protocol bug -- the peer wrote a control frame on a direction that has no
-    // dispatcher for it -- so surface it loudly rather than mis-handing the
-    // payload to the wire decoder, which would manifest as Dawn parsing garbage.
-    bool nextFrame(std::vector<uint8_t>& out) {
-        FrameKind kind;
-        if (!nextFrame(kind, out)) return false;
-        if (kind != FrameKind::WireBytes) {
-            LOG_CRIT(Ipc, "FrameReader: unexpected non-Dawn frame kind={} on a "
-                     "wire-bytes-only direction", static_cast<unsigned>(kind));
-            std::abort();
-        }
-        return true;
-    }
-
     // Cumulative framed bytes yielded via nextFrame (header + payload). The
     // peer's FdSerializer counts the same units (kFrameHeaderBytes), so comparing
     // this against a wireSerial sent over the side channel tells us whether all

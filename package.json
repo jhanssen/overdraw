@@ -8,7 +8,6 @@
     "packages/*"
   ],
   "scripts": {
-    "start": "npm run build:js && node packages/core/dist/index.js",
     "compositor": "npm run build:js && node packages/core/dist/main.js",
     "gen-protocols": "npm run gen-protocols -w overdraw",
     "lint": "eslint 'packages/*/src/**/*.ts'",

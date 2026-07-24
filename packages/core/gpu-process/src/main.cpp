@@ -332,9 +332,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     WGPUDevice nativeDev = server.GetDevice(ready.device.id, ready.device.generation);
     if (!nativeDev) { LOG_ERR(Dawn, "GetDevice null"); return 1; }
     tickDev = nativeDev;  // pump now ticks the device queue (map/work-done)
-    LOG_INFO(Dawn, "client device {{{},{}}} resolved; surface {{{},{}}}",
-             ready.device.id, ready.device.generation,
-             ready.surface.id, ready.surface.generation);
+    LOG_INFO(Dawn, "client device {{{},{}}} resolved",
+             ready.device.id, ready.device.generation);
 
     // 6) Native adapter (needed for the dmabuf modifier probe AND, in nested
     //    mode, for surface caps). In headless mode there is no surface.
@@ -464,20 +463,18 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
     }
 
-    // Nested bring-up: SurfaceReady (size + zero surface handle, no WSI) +
-    // OutputDescriptor. Headless / KMS skip this entirely.
+    // Nested bring-up: SurfaceReady (window size, no WSI) + OutputDescriptor.
+    // Headless / KMS skip this entirely.
     if (!headless && !outputKms) {
     // Nested bring-up.
-    // SurfaceReady: tell the core the surface is "ready" with the window's
-    // logical size. The surface handle is zero (no wgpu::Surface created;
-    // see above); the core's bringUp skips WSI configuration once it sees
-    // a zero handle. (The wp_linux_drm_syncobj_v1 dance Mesa would have
-    // set up if we'd created the WSI surface is also skipped, which is
-    // the point.)
+    // SurfaceReady: tell the core the nested output is up, carrying the
+    // window's logical size. No wgpu::Surface is created (see above), so
+    // the core's bringUp does no WSI configuration -- and the
+    // wp_linux_drm_syncobj_v1 dance Mesa would set up for a WSI surface
+    // never happens, which is the point.
     {
         ipc::Message m{};
         m.tag = ipc::Tag::SurfaceReady;
-        m.surface = {0, 0};  // no WSI surface
         m.width = outW();
         m.height = outH();
         ipc::sendMessage(ctrlFd, m);
@@ -1118,12 +1115,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         output->armFrameCallback();
     }
 
-    // B3: persistent dmabuf-backed texture injected at the client's reserved
-    // handle. Allocated + imported on demand when the core sends ReserveTex.
-    gpu::DmabufBuffer dmaBuf{};
-    wgpu::SharedTextureMemory dmaMem;
-    wgpu::Texture dmaTex;
-
     // Client dmabuf imports (linux-dmabuf-v1). Keyed by the reserved texture
     // handle id. Each holds the imported STM + texture + the owning dmabuf fd;
     // Per-frame BeginAccess/EndAccess bracket lives on the core's compositor
@@ -1189,12 +1180,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     };
     std::unordered_map<uint32_t, ShmTex> shmTextures;
 
-    // Cross-channel barrier on the CORE wire reader. Used by ReleaseClientTex
-    // (ctrl, with a wire-byte serial sampled at release time): the erase must
-    // wait until the wire reader has consumed past every in-band BeginAccess /
-    // EndAccess frame already queued ahead of the release, otherwise a pending
-    // Begin would find the texture gone. ImportClientTex rides in-band as
-    // kind=3 on the wire, so it is naturally FIFO-ordered and needs no barrier.
+    // Cross-channel barrier on the CORE wire reader. Its users are the
+    // AllocSurfaceBuf / AllocComposeBuf inject callbacks: each core-side
+    // InjectTexture is deferred until the core wire reader has consumed past
+    // the serial sampled when the core reserved the texture handle, so the
+    // inject cannot race wire traffic that still references an older object
+    // at the same handle.
     ipc::WireBarrier coreWireBarrier;
 
     // 9) Service Dawn + the host window until the core requests shutdown or the
@@ -3221,9 +3212,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (ct.fd >= 0) ::close(ct.fd);
     }
     clientTextures.clear();
-    // Discard any deferred ctrl ops on the core barrier (their wire serial may
-    // never arrive). Action captures own no fds we need to close; ReleaseClientTex
-    // (the only barrier user now) captures no fds.
+    // Discard any deferred ops on the core barrier (their wire serial may
+    // never arrive). The Alloc*Buf inject callbacks are the only users and
+    // capture no fds we need to close.
     coreWireBarrier.takePending();
     for (auto& [id, sb] : surfaceBufs) {
         sb.producerTex = nullptr; sb.producerMem = nullptr;
@@ -3239,9 +3230,6 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (pc->fd >= 0) ::close(pc->fd);
     }
     pluginConns.clear();
-    dmaTex = nullptr;
-    dmaMem = nullptr;
-    alloc.release(dmaBuf);
     LOG_INFO(Gpu, "shutting down (shutdown={} outputClosed={})",
              static_cast<int>(shutdown),
              static_cast<int>(output ? output->shouldClose() : 0));

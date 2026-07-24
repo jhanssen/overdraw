@@ -84,14 +84,6 @@ export interface GpuBrokerDeps {
   // when absent, it falls back to the raw window list at logical scale (older
   // test rigs that don't exercise subsurfaces).
   sceneFlatten?: SceneFlattenDeps;
-  // Generic hooks the broker fires WITHOUT understanding what they mean (it stays
-  // surface-agnostic). The decoration layer uses these to learn its surface ids
-  // and first-present timing; default no-ops.
-  //  - onSurfaceAllocated: a surface.alloc carried a `decorates` tag (the window id
-  //    it decorates); links the new surface id to that window.
-  //  - onSurfacePresented: a surface received a frame (called every present).
-  onSurfaceAllocated?: (surfaceId: number, decoratesWindowId: number) => void;
-  onSurfacePresented?: (surfaceId: number) => void;
   // Live output enumeration for gpu.listOutputs (id + global logical rect +
   // scale + name). Injected by main.ts from state.outputs; harnesses that
   // don't wire it report no outputs.
@@ -132,8 +124,6 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
   // the harness construct; tests that only exercise overlays leave it
   // unset and never look at the returned sceneIds.
   const sceneRegistry = deps.sceneRegistry ?? createSceneRegistry();
-  const onSurfaceAllocated = deps.onSurfaceAllocated ?? (() => {});
-  const onSurfacePresented = deps.onSurfacePresented ?? (() => {});
   const connByPlugin = new Map<string, number>();
   // overlay surfaceId -> geometry pending until its slots are bound.
   const pendingAlloc = new Map<number, { width: number; height: number; overlaySurfaceId: number }>();
@@ -175,33 +165,21 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
       case "gpu.listOutputs":
         return deps.listOutputs?.() ?? [];
       case "surface.alloc": {
-        // Core decides the rect + layer (overlay broker) and assigns the surface
-        // id. Two geometry sources: an EXPLICIT rect (decorations -- the core
-        // already decided it via the inset reservation) or anchor params
-        // (overlays). The ring's slots are allocated per-slot at bindProducer.
+        // Core decides the rect + layer (overlay broker) from the anchor
+        // params and assigns the surface id. The ring's slots are allocated
+        // per-slot at bindProducer.
         const width = p.width as number, height = p.height as number;
         const slots = (p.slots as number) ?? 2;
-        const explicitRect = p.rect as { x: number; y: number; width: number; height: number } | undefined;
-        const decorates = p.decorates as number | undefined;
-        // A decoration is WINDOW-BOUND: it draws directly below its window's content
-        // (z-bound to the window, via the WM stack), not on a flat layer. An overlay
-        // with an explicit rect goes on its requested flat layer; an anchored overlay
-        // is placed + clamped.
-        const handle = typeof decorates === "number" && explicitRect
-          ? overlays.createWindowBound(pluginName, explicitRect)
-          : explicitRect
-            ? overlays.createAt(pluginName, (p.layer as OverlayLayer) ?? "above", explicitRect)
-            : overlays.create(pluginName, {
-                layer: (p.layer as OverlayLayer) ?? "overlay",
-                anchor: (p.anchor as OverlayAnchor) ?? "center", width, height, margin: p.margin as number,
-                output: p.output as number | undefined,
-              });
+        const handle = overlays.create(pluginName, {
+          layer: (p.layer as OverlayLayer) ?? "overlay",
+          anchor: (p.anchor as OverlayAnchor) ?? "center", width, height, margin: p.margin as number,
+          output: p.output as number | undefined,
+        });
         // Shared slot-ownership state (SAB) for this surface's ring. Shared to the
         // Worker in the response; both sides agree on FREE/ACQUIRED/PRESENTED/
         // DRAINING via atomics (surface-slots.ts).
-        const { sab, states } = createSlotStates(slots);
+        const { sab } = createSlotStates(slots);
         const slotStates = new SlotStates(sab);
-        void states;
         // Forward declaration so the consumer's afterReadDone can refer to it
         // and call into compositor + addon without circular issues.
         const slotBufIds: number[] = [];
@@ -237,9 +215,6 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
         };
         surfaces.set(handle.surfaceId, surf);
         pendingAlloc.set(handle.surfaceId, { width, height, overlaySurfaceId: handle.surfaceId });
-        // If this surface decorates a window, tell the decoration layer the link
-        // (generic tag; the broker does not interpret it).
-        if (typeof decorates === "number") onSurfaceAllocated(handle.surfaceId, decorates);
         return { overlayId: handle.surfaceId, rect: handle.rect, outputId: handle.outputId, slotsSab: sab };
       }
       case "surface.bindProducer": {
@@ -281,10 +256,6 @@ export function createGpuBroker(deps: GpuBrokerDeps): GpuBroker {
         // race the just-issued GPU read.
         const tex = surf.consumer.swapToLatest(slotIdx);
         compositor.setSurfaceTexture?.(surf.surfaceId, tex, surf.width, surf.height);
-        // A frame is now installed for this surface; notify the decoration layer
-        // (it filters for its own surfaces) so a first decoration frame can release
-        // the gated content. Generic; the broker does not interpret it.
-        onSurfacePresented(surf.surfaceId);
         return null;
       }
       case "compose.snapshot": {

@@ -117,12 +117,10 @@ function effectiveRectExcluding(state: CompositorState, exclude: LayerSurfaceRec
 // ---- per-record apply ----------------------------------------------------
 
 // Merge pending into applied, compute the new rect, update the reserved-zone
-// registry, send a configure if size changed, push the compositor layout, and
-// reflow other layer surfaces. Returns true when something changed worth
-// triggering a WM relayout.
-function applyLayerSurface(ctx: Ctx, rec: LayerSurfaceRecord, opts: { firstConfigure: boolean }): boolean {
+// registry, send a configure if size changed, and push the compositor layout.
+function applyLayerSurface(ctx: Ctx, rec: LayerSurfaceRecord, opts: { firstConfigure: boolean }): void {
   const state = ctx.state;
-  if (rec.destroyed) return false;
+  if (rec.destroyed) return;
 
   // Merge pending into applied. undefined = not set this cycle.
   const p = rec.pending;
@@ -185,8 +183,6 @@ function applyLayerSurface(ctx: Ctx, rec: LayerSurfaceRecord, opts: { firstConfi
   if (opts.firstConfigure || sizeChanged) {
     sendConfigure(ctx, rec, placement.rect.width, placement.rect.height);
   }
-
-  return true;
 }
 
 // Compute the reservation thickness + edge from the applied state and update

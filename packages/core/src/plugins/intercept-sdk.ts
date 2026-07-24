@@ -13,7 +13,7 @@
 // + per-frame Worker dispatch lands as a separate commit.
 
 import type {
-  InterceptAPI, InterceptSpec, InterceptRegistration, InterceptSetupCtx,
+  InterceptAPI, InterceptSpec, InterceptRegistration,
   InterceptHandlers,
 } from "@overdraw/intercept-types";
 
@@ -617,8 +617,3 @@ function validateSpec(spec: InterceptSpec): void {
     throw new TypeError("intercept.register: spec.priority must be a finite number");
   }
 }
-
-// Re-export the setup-ctx and handlers types for plugin authors who
-// want to type their setup/render bodies without importing from
-// @overdraw/intercept-types directly.
-export type { InterceptSetupCtx, InterceptHandlers, InterceptSpec };

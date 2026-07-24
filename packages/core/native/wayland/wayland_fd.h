@@ -28,7 +28,8 @@ napi_value makeWaylandFd(napi_env env, int fd);
 // Pull the raw fd out of a WaylandFd object, transferring ownership to the
 // caller (who must close it) and marking the wrapper taken. Returns -1 if the
 // value is not a WaylandFd or was already taken/closed. Used by native
-// consumers (e.g. commitSurfaceDmabuf, shmCreatePool).
+// consumers (e.g. shmCreatePool, syncobjImportTimeline, fd request args in
+// the trampoline).
 int takeWaylandFd(napi_env env, napi_value obj);
 
 // Return a dup of the WaylandFd's fd WITHOUT consuming the wrapper (it stays

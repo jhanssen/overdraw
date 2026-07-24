@@ -93,11 +93,9 @@ class KmsScanoutRing {
     // be acquired again. Called by KmsOutputBackend::pause(). Idempotent.
     void resetAllSlotsToFree();
 
-    SlotState state(int idx) const { return slots_[idx].state; }
     const Slot& slot(int idx) const { return slots_[idx]; }
     uint32_t width()  const { return width_; }
     uint32_t height() const { return height_; }
-    uint32_t fourcc() const { return fourcc_; }
 
   private:
     int drmFd_ = -1;

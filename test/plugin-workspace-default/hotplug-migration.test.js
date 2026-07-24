@@ -47,7 +47,7 @@ function harness(initialOutputs, bootKey = 'DP-1') {
       dispatchFocusEvent() {},
       repickPointer() {},
     },
-    pendingWindowChanges: undefined, decorationResize: null,
+    pendingWindowChanges: undefined,
   };
   const broker = createWindowsBroker({ wm, compositor: sink, state, pluginBus, bus });
   const wsEvents = [];

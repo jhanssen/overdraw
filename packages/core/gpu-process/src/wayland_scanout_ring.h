@@ -85,16 +85,8 @@ class WaylandScanoutRing {
     // wl_buffer the host released. Idempotent.
     void markFree(int idx);
 
-    // Force every slot back to FREE. Used on resize before a clear() +
-    // re-init (the prior ring's buffers are about to be destroyed).
-    void resetAllSlotsToFree();
-
-    SlotState state(int idx) const { return slots_[idx].state; }
     const Slot& slot(int idx) const { return slots_[idx]; }
     Slot& slot(int idx) { return slots_[idx]; }
-    uint32_t width()  const { return width_; }
-    uint32_t height() const { return height_; }
-    uint32_t fourcc() const { return fourcc_; }
 
     // Map a host wl_buffer back to its slot index. Used by the
     // wl_buffer.release listener trampoline to drive onFlipComplete.

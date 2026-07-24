@@ -275,7 +275,7 @@ core runs the `dawn::wire::WireClient`, brings up adapter + device + surface
 over the wire, hosts the JS protocol/WM/compositing/plugin layers, and is the
 Wayland server for overdraw's own clients.
 
-The core is C++ + Node: `packages/core/src/index.js`/`packages/core/src/main.ts` load `overdraw_native.node`;
+The core is C++ + Node: `packages/core/src/main.ts` loads `overdraw_native.node`;
 native core in `native/core/` (`gpu_process`, `wire_link`, `compositor`). Node owns
 `main()` and the libuv loop. The N-API addon uses the raw `node_api.h` C API (not
 node-addon-api, to avoid exception/RTTI dependence under `-fno-rtti`).

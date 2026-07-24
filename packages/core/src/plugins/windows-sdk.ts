@@ -152,7 +152,6 @@ export interface WindowSnapshot {
   rect: { x: number; y: number; width: number; height: number };
   outer: { x: number; y: number; width: number; height: number };
   insets?: { top: number; right: number; bottom: number; left: number };
-  decorationSurfaceId?: number;
   hasContent: boolean;
   contentGated: boolean;
   windowState: WindowState;
@@ -333,7 +332,7 @@ export interface PluginWindows extends PluginWindowObserver {
   // The window's shape (setShape) clips the effect too, so rounded corners
   // hold. Applies wherever a scene is composited (on-screen, screen
   // capture, compose scenes, transition frames); per-window content crops
-  // (compose.windows) capture the window's own pixels without it.
+  // capture the window's own pixels without it.
   setBackdropEffect(id: number, e: SurfaceBackdropEffect | null): Promise<void>;
 
   // Destroy a phantom surface (created by core in response to
@@ -367,13 +366,6 @@ export interface PluginWindows extends PluginWindowObserver {
   // a non-gated window).
   releaseOpeningGate(id: number): Promise<void>;
 }
-
-// The id of the primary output (kept in sync with OUTPUT_DEFAULT in
-// protocols/ctx.ts). Re-exported for plugin authors so they don't import
-// from internal core paths.
-export const OUTPUT_DEFAULT = 0;
-
-
 
 export interface WindowsControl {
   windows: PluginWindows;

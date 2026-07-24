@@ -10,7 +10,6 @@ export type ShutdownCallback = () => void | Promise<void>;
 
 import type { PluginGpu } from "./gpu.js";
 import type { PluginWindows } from "./windows-sdk.js";
-import type { PluginDecorations } from "./decorations.js";
 import type { PluginEvents } from "./events.js";
 import type {
   PluginNamespace, InitFn, RegisterOptions, RegistrationHandle, RegisteredApi,
@@ -80,11 +79,6 @@ export interface PluginSdk {
   // through the chain before forwarding to the focused client. Always
   // present.
   input: PluginInput;
-  // Decoration provider: register an app_id pattern + observe assigned windows.
-  // No capability gate yet (this tier is meant to be gated like tier 3 -- it sees
-  // every matched window's app_id/state -- but the capability system is unbuilt;
-  // flagged). Always present in the current runtime.
-  decorations?: PluginDecorations;
   // Scene compose primitive (core-plugin-api.md §6): render a window subset
   // into a fresh texture. Present iff the plugin runs in-thread (it returns
   // GPUTexture handles that only cross the boundary for in-thread plugins
@@ -126,7 +120,6 @@ export function createSdk(name: string, emitLog: (line: string) => void,
                           animations: PluginAnimations,
                           input: PluginInput,
                           gpu?: PluginGpu,
-                          decorations?: PluginDecorations,
                           compose?: PluginCompose,
                           transitions?: PluginTransitions,
                           cursor?: CursorAPI,
@@ -151,7 +144,6 @@ export function createSdk(name: string, emitLog: (line: string) => void,
     animations,
     input,
     ...(gpu ? { gpu } : {}),
-    ...(decorations ? { decorations } : {}),
     ...(compose ? { compose } : {}),
     ...(transitions ? { transitions } : {}),
     ...(cursor ? { cursor } : {}),

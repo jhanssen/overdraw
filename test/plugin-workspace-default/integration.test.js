@@ -56,7 +56,7 @@ async function withWorkspacePlugin(fn) {
   };
   const state = {
     bus, wm, surfaces: new Map(), compositor: sink, seat,
-    pendingWindowChanges: undefined, decorationResize: null,
+    pendingWindowChanges: undefined,
   };
   const broker = createWindowsBroker({ wm, compositor: sink, state, pluginBus, bus });
   // Re-publish window.map/unmap from the core bus to the plugin bus (main.ts

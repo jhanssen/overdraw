@@ -17,9 +17,9 @@ namespace overdraw::core {
 
 class WireLink {
   public:
-    // Takes the core-side wire + side-channel fds (ownership stays with the
-    // caller / Compositor; WireLink does not close them).
-    WireLink(int wireFd, int ctrlFd);
+    // Takes the wire socket fd (ownership stays with the caller; WireLink does
+    // not close it).
+    explicit WireLink(int wireFd);
     ~WireLink();
 
     WireLink(const WireLink&) = delete;
@@ -27,7 +27,6 @@ class WireLink {
 
     dawn::wire::WireClient& client() { return *client_; }
     int wireFd() const { return wireFd_; }
-    int ctrlFd() const { return ctrlFd_; }
 
     // Mark the wire client as shared with an external JS WebGPU binding
     // (dawn.node) that holds wgpu objects routed through this client. Those
@@ -106,7 +105,6 @@ class WireLink {
 
   private:
     int wireFd_;
-    int ctrlFd_;
     ipc::FdSerializer* serializer_ = nullptr;
     ipc::FrameReader* reader_ = nullptr;
     dawn::wire::WireClient* client_ = nullptr;

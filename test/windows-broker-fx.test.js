@@ -49,8 +49,7 @@ function makeBroker(sinkOverride) {
   const wm = createWm(sink, [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
   const bus = createCompositorBus();
   const pluginBus = new DynamicBus();
-  const state = { bus, wm, surfaces: new Map(), seat: null, compositor: null,
-                  decorationResize: null };
+  const state = { bus, wm, surfaces: new Map(), seat: null, compositor: null };
   const broker = createWindowsBroker({ wm, compositor: sink, state, pluginBus, bus });
   return { broker, sink };
 }

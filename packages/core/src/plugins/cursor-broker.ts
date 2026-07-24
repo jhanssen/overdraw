@@ -18,7 +18,6 @@
 //     rule + no client cursor.
 //   - per-plugin rule registrations (so a plugin teardown can drop them).
 
-import type { Addon } from "../types.js";
 import type { CompositorSink } from "../protocols/ctx.js";
 import type { CursorThemeResolver } from "../cursor/theme-resolver.js";
 import type { Kinematics } from "../cursor/kinematics.js";
@@ -26,7 +25,6 @@ import { CursorRuleEngine, type RuleInstaller } from "../cursor/rule-engine.js";
 import type { CursorRuleSpec } from "@overdraw/cursor-types";
 
 export interface CursorBrokerDeps {
-  addon: Pick<Addon, "resolveCursorShape">;
   compositor: CompositorSink;
   resolver: CursorThemeResolver;
   kinematics: Kinematics;
@@ -54,18 +52,13 @@ export function createCursorBroker(deps: CursorBrokerDeps): CursorBroker & {
   setDefaultShape(name: string | null): void;
   applyDefault(): void;
 } {
-  const { addon, compositor, resolver, ruleEngine, cursorSizePx } = deps;
+  const { compositor, resolver, ruleEngine, cursorSizePx } = deps;
 
   // Rule engine's installer adapter: knows how to install a named shape
   // (via resolver + setCursorPixels) or a plugin-supplied texture (via
   // setCursorTexture).
   const installer: RuleInstaller = {
-    installShape(name: string, _enlarge: number): boolean {
-      // enlarge ignored in v1: would need a scale uniform path (the
-      // cursor texture is already in core's GPU device; a render-into-
-      // scaled-cursor would be the cleanest fix when continuous transforms
-      // land). Static enlarge could be done by uploading a larger
-      // pre-scaled image -- punt.
+    installShape(name: string): boolean {
       const ok = compositor.setCursorShape?.(
         (sizeDev) => resolver.resolveShape(name, sizeDev, 1), cursorSizePx) ?? true;
       if (!ok) return false;
@@ -73,7 +66,7 @@ export function createCursorBroker(deps: CursorBrokerDeps): CursorBroker & {
       return true;
     },
     installTexture(handle: unknown, width: number, height: number,
-                   hotspotX: number, hotspotY: number, _enlarge: number): boolean {
+                   hotspotX: number, hotspotY: number): boolean {
       // In-thread bundled plugins pass a GPUTexture directly. The
       // compositor adapter does the install.
       const tex = handle as GPUTexture;
@@ -236,7 +229,6 @@ export function createCursorBroker(deps: CursorBrokerDeps): CursorBroker & {
     setDefaultShape(name: string | null): void { defaultShape = name; },
     applyDefault(): void { installer.installDefault(); },
   });
-  void addon;  // referenced in type but used via resolver.
 }
 
 // --- payload typeguards ----------------------------------------------------

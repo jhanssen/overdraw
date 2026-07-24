@@ -1,17 +1,16 @@
 // sdk.compose -- scene-compose primitive (core-plugin-api.md §6).
 //
-// Two methods: scene() returns one composed texture; windows() returns one
-// texture per window. Each takes a mode -- 'snapshot' (one-shot at call
-// time, frozen thereafter) or 'live' (texture kept in sync with what the
-// compositor would draw for that window list, re-rendered on every
-// on-screen frame).
+// scene() returns one composed texture for a window list, in one of two
+// modes -- 'snapshot' (one-shot at call time, frozen thereafter) or 'live'
+// (texture kept in sync with what the compositor would draw for that
+// window list, re-rendered on every on-screen frame).
 //
 // In-thread bundled plugins pass GPUTexture handles across the boundary
 // by reference because the plugin shares core's device. Worker plugins
 // use a dmabuf-import transport onto the plugin's own device.
 
 import type {
-  LiveSceneHandle, LiveWindowCompHandle,
+  LiveSceneHandle,
 } from "../gpu/compositor.js";
 import type { CompositorSink } from "../protocols/ctx.js";
 import type { Endpoint } from "./protocol.js";
@@ -21,13 +20,6 @@ import { SlotStates } from "./surface-slots.js";
 import { SurfaceConsumer, awaitPresentedSlot } from "./surface-ring.js";
 
 export type ComposeMode = "snapshot" | "live";
-
-export interface Rect {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
 
 export interface SceneHandle {
   // The composed texture. Owned by core; the caller must NOT .destroy() it.
@@ -54,15 +46,6 @@ export interface SceneHandle {
   release(): Promise<void>;
 }
 
-export interface WindowComposition {
-  windows: ReadonlyArray<{
-    id: number;
-    texture: GPUTexture;
-    rect: Rect;
-  }>;
-  release(): Promise<void>;
-}
-
 export interface PluginCompose {
   scene(args: {
     outputId: number;
@@ -71,12 +54,6 @@ export interface PluginCompose {
     outW?: number;
     outH?: number;
   }): Promise<SceneHandle>;
-
-  windows(args: {
-    outputId: number;
-    windows: ReadonlyArray<{ id: number; rect?: Rect }>;
-    mode: ComposeMode;
-  }): Promise<WindowComposition>;
 }
 
 // The scene-flattening + region-resolution step, shared by the in-thread SDK
@@ -137,22 +114,18 @@ export function createInThreadCompose(
   // The output's global-logical rect + scale, for device-resolution compose.
   outputRegion?: (outputId: number) =>
     { x: number; y: number; w: number; h: number; scale: number } | null,
-  // A window's global-logical outer rect + scale, for per-window compose.
-  windowRegion?: (surfaceId: number) =>
-    { x: number; y: number; w: number; h: number; scale: number } | null,
 ): PluginCompose | null {
   // The subsurface-correct path needs composeRegion + the state-backed
   // flatteners. Without them (a host that didn't wire flattening), in-thread
   // compose is unavailable rather than silently subsurface-dropping.
-  if (!compositor.composeRegion || !flattenWindows || !outputRegion || !windowRegion
-      || !compositor.registerLiveScene || !compositor.registerLiveWindows) {
+  if (!compositor.composeRegion || !flattenWindows || !outputRegion
+      || !compositor.registerLiveScene) {
     return null;
   }
   // Locals to satisfy the type checker that these are defined after the
   // guard above (the methods are optional on the interface).
   const composeRegion = compositor.composeRegion.bind(compositor);
   const registerLiveScene = compositor.registerLiveScene.bind(compositor);
-  const registerLiveWindows = compositor.registerLiveWindows.bind(compositor);
   // When the caller hasn't passed a shared registry, fall back to a
   // local one. SceneHandles still get a unique .id within this SDK
   // instance, but transitions.run on the same plugin won't find them
@@ -199,7 +172,6 @@ export function createInThreadCompose(
       // (subsurfaces committed mid-life are picked up) and composes at the
       // output's region + scale (device resolution).
       const h: LiveSceneHandle = registerLiveScene({
-        outputId: args.outputId,
         getDrawList: sp.flatten,
         region,
         scale: sp.scale,
@@ -215,47 +187,6 @@ export function createInThreadCompose(
           return await cb(tex);
         },
         async release(): Promise<void> { registry.unregister(sceneId); },
-      };
-    },
-
-    async windows(args): Promise<WindowComposition> {
-      checkOutput(args.outputId);
-      if (args.mode === "snapshot") {
-        // Compose each window's full subtree (subsurfaces included) over its
-        // outer rect at device scale. The crop rect (unused by bundled plugins)
-        // is not honored on this path.
-        const results: Array<{ id: number; texture: GPUTexture;
-                               rect: { x: number; y: number; w: number; h: number } }> = [];
-        for (const w of args.windows) {
-          const reg = windowRegion(w.id);
-          if (!reg) continue;
-          const rect = { x: reg.x, y: reg.y, w: reg.w, h: reg.h };
-          // effects: false -- a per-window crop captures the window's own
-          // pixels; backdrop effects belong to scene composes.
-          const cr = composeRegion({ drawList: flattenWindows([w.id]),
-            region: rect, scale: reg.scale, effects: false });
-          results.push({ id: w.id, texture: cr.texture, rect });
-        }
-        let releasedR = false;
-        return {
-          windows: results,
-          async release(): Promise<void> {
-            if (releasedR) return;
-            releasedR = true;
-            for (const w of results) w.texture.destroy();
-          },
-        };
-      }
-      // mode === 'live'
-      const h: LiveWindowCompHandle = registerLiveWindows({
-        outputId: args.outputId,
-        windows: args.windows,
-      });
-      return {
-        windows: h.windows,
-        async release(): Promise<void> {
-          h.release();
-        },
       };
     },
   };
@@ -301,8 +232,7 @@ export interface WorkerComposeDeps {
   hasOutput: (outputId: number) => boolean;
 }
 
-// Construct sdk.compose for a Worker plugin. Snapshot mode only;
-// live mode raises if requested.
+// Construct sdk.compose for a Worker plugin.
 export function createWorkerCompose(deps: WorkerComposeDeps): PluginCompose {
   const { hasOutput } = deps;
   const checkOutput = makeCheckOutput(hasOutput);
@@ -319,10 +249,6 @@ export function createWorkerCompose(deps: WorkerComposeDeps): PluginCompose {
         return makeWorkerSnapshot(deps, [...args.windows], outW, outH);
       }
       return makeWorkerLive(deps, [...args.windows], outW, outH);
-    },
-
-    async windows(_args): Promise<WindowComposition> {
-      throw new Error("sdk.compose.windows: not implemented for Worker plugins");
     },
   };
 }

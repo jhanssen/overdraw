@@ -23,13 +23,12 @@ export interface CursorRuleWhen {
 
 // Outcome of a rule match: a named shape (resolved by the theme resolver)
 // or arbitrary plugin-supplied texture. Exactly one of `shape` | `texture`
-// must be set. `enlarge` scales the rendered size; default 1.0.
+// must be set.
 export interface CursorRuleOutcome {
   shape?: string;
   // Plugin-supplied texture (in-thread plugins only; Worker plugins throw
   // a "not yet implemented" error).
   texture?: CursorTexture;
-  enlarge?: number;
 }
 
 export interface CursorTexture {

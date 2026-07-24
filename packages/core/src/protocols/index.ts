@@ -452,14 +452,9 @@ export async function installProtocols(
         (x - cam.x) * n, (y - cam.y) * n, w * n, h * n);
     },
   };
-  // The WM delegates its stack push to the full rebuild (windows interleaved with
-  // their decorations + subsurfaces + popups via computeBaseStack), keeping
+  // The WM delegates its stack push to the full rebuild (windows interleaved
+  // with subsurfaces + popups via computeBaseStack), keeping
   // rebuildStackWithPopups the single owner of the content stack order.
-  // DecorationResize sink: indirect to state.decorationResize so the WM stays
-  // unaware of the broker. main.ts sets state.decorationResize after creating
-  // the broker (using broker.onDecorationResized). When unset (GPU-free tests
-  // / pre-broker bring-up), the WM still updates the decoration's compositor
-  // layout directly -- only the plugin-side redraw is skipped.
   // Seed the WM's primary output from the same dims used for state.outputs's
   // OUTPUT_DEFAULT entry. main.ts's setOnOutputDescriptor updates both maps
   // when the GPU process sends real geometry, including any extra connectors.
@@ -492,9 +487,6 @@ export async function installProtocols(
     {
       rebuild: () => rebuildStackWithPopups(state),
       configure: configureSink,
-      decorationResize: (windowId, outerRect, contentRect, insets) => {
-        state.decorationResize?.(windowId, outerRect, contentRect, insets);
-      },
       layoutDriverFactory: opts.layoutDriverFactory,
       pluginBus: opts.pluginBus,
       surfaceTx,

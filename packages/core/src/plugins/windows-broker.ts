@@ -6,7 +6,6 @@
 // Routed from main.ts's onRequest chain. Pure JS broker; no GPU.
 
 import type { Wm, WindowStateProposal } from "../wm/index.js";
-import type { CompositorBus } from "../events/window-bus.js";
 import type { DynamicBus } from "../events/dynamic-bus.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import type {
@@ -37,9 +36,6 @@ export interface WindowsBrokerDeps {
   // 'window.state-changed' here (not through markWindowChanged: state-bag
   // changes are high-cardinality and not coalesced).
   pluginBus: DynamicBus;
-  // The core typed bus -- markWindowChanged consults state.bus, but the broker
-  // does not emit directly through it. Kept here for symmetry/extension.
-  bus: CompositorBus;
   // Closing driver. The destroy-phantom path needs to cancel
   // the driver's backstop timer in addition to calling
   // compositor.destroyClosingPhantom. Optional: when absent (a
