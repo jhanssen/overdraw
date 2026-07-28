@@ -140,3 +140,61 @@ test('destroy reverts the hint to vsync on the next commit', () => {
   mgr.get_tearing_control(null, tc2, surf);
   assert.equal(rec.hasTearingControl, true);
 });
+
+// Synchronized-subsurface cache paths: a hint set while the subsurface is
+// sync is cached on commit and must survive both cache exits -- the
+// parent-commit cascade and the sync->desync flush.
+
+function setupTree(ctx, surfaces) {
+  const parentRes = { id: 10 };
+  const childRes = { id: 11 };
+  const parent = addSurface(surfaces, parentRes, 100);
+  const child = addSurface(surfaces, childRes, 200);
+  const subRes = { id: 12 };
+  const sub = {
+    resource: subRes, surface: childRes, parent: parentRes,
+    sync: true, x: 0, y: 0, pendingX: 0, pendingY: 0,
+  };
+  ctx.state.subsurfaces.set(subRes, sub);
+  return { parent, child, sub, parentRes, childRes };
+}
+
+test('sync subsurface commit caches the hint; parent cascade applies it', () => {
+  const { ctx, tearCalls, surfaces } = makeCtx();
+  const sh = makeSurface(ctx);
+  const mgr = makeTearingControlManager(ctx);
+  const th = makeTearingControl(ctx);
+  const { child, childRes, parentRes } = setupTree(ctx, surfaces);
+  const tc = { id: 2 };
+  mgr.get_tearing_control(null, tc, childRes);
+
+  th.set_presentation_hint(tc, HINT_ASYNC);
+  sh.commit(childRes);
+  assert.equal(child.cached.tearingHint, HINT_ASYNC, 'hint cached, not applied');
+  assert.equal(tearCalls.length, 0, 'no push while cached');
+
+  sh.commit(parentRes);
+  assert.equal(child.tearingHint, HINT_ASYNC);
+  assert.deepEqual(tearCalls.at(-1), [200, true], 'cascade pushes the cached hint');
+});
+
+test('sync->desync flush carries the cached hint (not dropped)', () => {
+  const { ctx, tearCalls, surfaces } = makeCtx();
+  const sh = makeSurface(ctx);
+  const mgr = makeTearingControlManager(ctx);
+  const th = makeTearingControl(ctx);
+  const { child, childRes, sub } = setupTree(ctx, surfaces);
+  const tc = { id: 2 };
+  mgr.get_tearing_control(null, tc, childRes);
+
+  th.set_presentation_hint(tc, HINT_ASYNC);
+  sh.commit(childRes);
+  assert.equal(child.cached.tearingHint, HINT_ASYNC);
+
+  // set_desync is effective immediately; the next commit flushes the cache.
+  sub.sync = false;
+  sh.commit(childRes);
+  assert.equal(child.cached, undefined);
+  assert.equal(child.tearingHint, HINT_ASYNC, 'cached hint survives the flush');
+  assert.deepEqual(tearCalls.at(-1), [200, true], 'flush pushes the hint');
+});

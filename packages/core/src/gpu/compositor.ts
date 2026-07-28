@@ -1951,8 +1951,17 @@ export class JsCompositor implements CompositorSink {
     if (!s || s.frozen || !s.present || !s.bindGroup || s.currentBufferId === 0) return;
     const imp = this.dmabufImports.get(s.currentBufferId);
     if (!imp) return;
-    const w = Math.max(1, Math.round(s.layoutW * this.scale));
-    const h = Math.max(1, Math.round(s.layoutH * this.scale));
+    // Snapshot at the highest scale among the outputs the surface resides
+    // on, so the frozen image stays sharp wherever it is drawn (a surface
+    // on a 2x output must not be snapshotted at a 1x primary's scale).
+    let scale = 0;
+    for (const oid of this.surfaceOutputs(id)) {
+      const o = this.outputsGeom.get(oid);
+      if (o && o.scale > scale) scale = o.scale;
+    }
+    if (scale <= 0) scale = this.scale;
+    const w = Math.max(1, Math.round(s.layoutW * scale));
+    const h = Math.max(1, Math.round(s.layoutH * scale));
     const snap = this.acquireSnapTex(w, h);
     // Standalone bracketed submit: open the client import's access bracket,
     // render the surface filling the snapshot (its crop/transform apply), close

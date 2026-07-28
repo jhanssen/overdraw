@@ -253,6 +253,17 @@ function appendOverrideRedirects(state: CompositorState, stack: number[]): void 
   }
 }
 
+// Append the active DnD drag-icon surface (state.dragIconId, owned by
+// wl_data_device_manager) above everything else. Skipped when the surface
+// record no longer exists (icon destroyed mid-drag before the owner
+// cleared the id).
+function appendDragIcon(state: CompositorState, stack: number[]): void {
+  const id = state.dragIconId;
+  if (id === undefined || id === null) return;
+  if (state.surfacesById && !state.surfacesById.has(id)) return;
+  stack.push(id);
+}
+
 // Append the popup chain to `stack`, in parent-before-child order, setting each
 // popup's output-space layout rect. `includePopup` filters which popups draw
 // (per-output expansion uses the filter; global pass returns true for all).
@@ -314,6 +325,7 @@ export function rebuildStackWithPopups(state: CompositorState): void {
   const globalStack: number[] = computeBaseStack(state, wm.state.windows);
   appendPopups(state, globalStack, () => true);
   appendOverrideRedirects(state, globalStack);
+  appendDragIcon(state, globalStack);
   state.compositor.setStack(globalStack);
 
   // --- Per-output filtered stacks. Each filter is a toplevel-id order; expand
@@ -344,6 +356,9 @@ export function rebuildStackWithPopups(state: CompositorState): void {
     // global pass: they appear on every output's stack. (X menus have no
     // workspace concept; the X client positions them in absolute coords.)
     appendOverrideRedirects(state, stack);
+    // The drag icon is glass (output-anchored, rides the pointer), so it
+    // tops every output's stack like the global pass.
+    appendDragIcon(state, stack);
     computed.set(outputId, stack);
   }
 

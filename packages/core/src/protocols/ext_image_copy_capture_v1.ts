@@ -46,7 +46,7 @@ import type { Ctx } from "./ctx.js";
 import { surfaceIdForHandle } from "./ext_foreign_toplevel_list_v1.js";
 import { outputIdForWlOutput } from "./wl_output.js";
 import { computeBaseStack } from "../subsurfaces.js";
-import { primaryOutputOfSurface } from "./output-resolve.js";
+import { primaryOutputId, primaryOutputOfSurface } from "./output-resolve.js";
 import { WINDOW_EVENT } from "../events/types.js";
 import { OUTPUT_FALLBACK } from "./ctx.js";
 import type { Resource } from "../types.js";
@@ -136,7 +136,7 @@ const frames = new Map<Resource, FrameRecord>();
 // Per-output: the set of armed frames waiting for a flip on that output.
 // Populated by frame.capture(); drained by dispatchCaptureForOutput.
 // Built lazily.
-function collectArmedFramesForOutput(outputId: number): FrameRecord[] {
+function collectArmedFramesForOutput(ctx: Ctx, outputId: number): FrameRecord[] {
   const out: FrameRecord[] = [];
   for (const f of frames.values()) {
     if (!f.armed) continue;
@@ -145,14 +145,27 @@ function collectArmedFramesForOutput(outputId: number): FrameRecord[] {
     if (s.source.kind === "output") {
       if (s.source.id === outputId) out.push(f);
     } else {
-      // toplevel source: pick whichever output the surface most overlaps.
-      // For the test path this is the single output the headless harness
-      // exposes; for multi-output, we just use the first output the surface
-      // resides on.
-      out.push(f);
+      // toplevel source: capture on the flip of the surface's own primary
+      // output, so the stream runs at that output's cadence rather than
+      // whichever output happens to flip first.
+      if (toplevelOutputId(ctx, s.source.id) === outputId) out.push(f);
     }
   }
   return out;
+}
+
+// The output whose flips pace a toplevel capture: the lowest output the
+// surface is resident on (mirrors primaryOutputOfSurface's determinism
+// rule), falling back to the compositor's primary when residency is not
+// yet computed.
+function toplevelOutputId(ctx: Ctx, surfaceId: number): number {
+  const rec = ctx.state.surfacesById?.get(surfaceId);
+  if (rec?.enteredOutputs && rec.enteredOutputs.size > 0) {
+    let lo = Infinity;
+    for (const id of rec.enteredOutputs) if (id < lo) lo = id;
+    if (Number.isFinite(lo)) return lo;
+  }
+  return primaryOutputId(ctx.state);
 }
 
 // Advertise the session's buffer constraints. The spec ordering: shm_format /
@@ -241,7 +254,7 @@ export function dispatchCaptureForOutput(
       || !ctx.state.compositor.composeRegion) {
     return;  // no JS compositor wired (GPU-free harness)
   }
-  const armed = collectArmedFramesForOutput(outputId);
+  const armed = collectArmedFramesForOutput(ctx, outputId);
   for (const f of armed) {
     f.armed = false;
     if (f.resource.destroyed || !f.buffer || f.buffer.destroyed) continue;
@@ -724,12 +737,12 @@ export function makeImageCopyCaptureFrame(ctx: Ctx):
       // force it to present so a flip-complete actually fires and drains this
       // frame (otherwise an idle desktop never flips and the capture hangs
       // until an unrelated repaint). Output source: that output; toplevel
-      // source: any output's flip drains it, so nudge them all. Then wake so
-      // the frame loop runs the forced present now.
+      // source: the surface's own output (the one whose flips pace the
+      // capture). Then wake so the frame loop runs the forced present now.
       f.armed = true;
       const src = f.session.source;
       ctx.state.compositor?.requestOutputPresent?.(
-        src.kind === "output" ? src.id : null);
+        src.kind === "output" ? src.id : toplevelOutputId(ctx, src.id));
       ctx.addon.wake();
     },
   };

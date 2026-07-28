@@ -654,6 +654,9 @@ function commitNow(ctx: Ctx, s: SurfaceRecord): void {
       if (s.cached.viewportDst !== undefined) {
         s.pending.viewportDst = s.cached.viewportDst;
       }
+      if (s.cached.tearingHint !== undefined) {
+        s.pending.tearingHint = s.cached.tearingHint;
+      }
       // Flushed cached syncobj points alongside the buffer.
       const cachedAcq = s.cached.syncobjAcquire;
       const cachedRel = s.cached.syncobjRelease;

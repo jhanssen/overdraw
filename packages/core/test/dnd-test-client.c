@@ -4,10 +4,14 @@
 //       dnd action copy; on the first pointer BUTTON PRESS over its surface, call
 //       wl_data_device.start_drag. Serves TEXT on data_source.send. Prints
 //       "[dnd-client] drag-started". Exits on SIGTERM.
+//       With --icon, start_drag carries a 40x40 opaque magenta drag-icon
+//       surface (committed right after start_drag).
 //
 //   --target MIME : map a window; on data_device.enter, accept(MIME) +
 //       set_actions(copy); on drop, receive(MIME, pipe) + read + finish(); print
 //       "[dnd-client] dropped: <text>" and exit 0.
+//       With --sub, the window carries a 30x30 opaque blue subsurface at
+//       (10,10) so the harness can verify subsurfaces survive drag stacking.
 //
 // The harness drives the pointer (injectInput): move over the source, press
 // (source starts the drag), move over the target, release (drop).
@@ -43,10 +47,15 @@ static const char* g_mime = NULL;
 static const char* g_text = NULL;
 static int is_source = 0;
 
+static int want_stay = 0;
+
 // source: pending drag start on first button press.
 static struct wl_data_source* g_src = NULL;
 static uint32_t last_enter_serial = 0;
 static int drag_started = 0;
+static int want_icon = 0;
+static int want_sub = 0;
+static struct wl_subcompositor* subcomp = NULL;
 
 // target: drop bookkeeping.
 static struct wl_data_offer* cur_offer = NULL;
@@ -75,10 +84,25 @@ static void srcSend(void* d, struct wl_data_source* s, const char* mime, int32_t
 }
 static void srcCancelled(void* d, struct wl_data_source* s) { (void)d;(void)s; }
 static void srcDndDrop(void* d, struct wl_data_source* s) { (void)d;(void)s; }
-static void srcDndFinished(void* d, struct wl_data_source* s) { (void)d;(void)s; running = 0; }
+static void srcDndFinished(void* d, struct wl_data_source* s) { (void)d;(void)s; if (!want_stay) running = 0; }
 static void srcAction(void* d, struct wl_data_source* s, uint32_t a) { (void)d;(void)s;(void)a; }
 static const struct wl_data_source_listener srcListener = {
     srcTarget, srcSend, srcCancelled, srcDndDrop, srcDndFinished, srcAction };
+
+static struct wl_buffer* makeShmBuffer(int W, int H, uint32_t color) {
+    const int stride = W * 4;
+    int fd = memfd_create("dnd-buf", 0);
+    if (fd < 0 || ftruncate(fd, (off_t)stride * H) != 0) return NULL;
+    uint32_t* px = mmap(NULL, (size_t)stride * H, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) { close(fd); return NULL; }
+    for (int i = 0; i < W * H; ++i) px[i] = color;
+    munmap(px, (size_t)stride * H);
+    struct wl_shm_pool* pool = wl_shm_create_pool(shm, fd, stride * H);
+    struct wl_buffer* buf = wl_shm_pool_create_buffer(pool, 0, W, H, stride, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    return buf;
+}
 
 // --- pointer (source): start a drag on the first button press. ---
 static void ptrEnter(void* d, struct wl_pointer* p, uint32_t serial, struct wl_surface* s, wl_fixed_t x, wl_fixed_t y) {
@@ -89,7 +113,14 @@ static void ptrMotion(void* d, struct wl_pointer* p, uint32_t t, wl_fixed_t x, w
 static void ptrButton(void* d, struct wl_pointer* p, uint32_t serial, uint32_t t, uint32_t button, uint32_t state) {
     (void)d;(void)p;(void)t;(void)button;
     if (is_source && state == 1 && !drag_started && g_src) {
-        wl_data_device_start_drag(data_device, g_src, surface, NULL, serial);
+        struct wl_surface* icon = want_icon ? wl_compositor_create_surface(compositor) : NULL;
+        wl_data_device_start_drag(data_device, g_src, surface, icon, serial);
+        if (icon) {
+            struct wl_buffer* ib = makeShmBuffer(40, 40, 0xFFFF00FFu);
+            wl_surface_attach(icon, ib, 0, 0);
+            wl_surface_damage(icon, 0, 0, 40, 40);
+            wl_surface_commit(icon);
+        }
         drag_started = 1;
         printf("[dnd-client] drag-started\n"); fflush(stdout);
     }
@@ -154,6 +185,7 @@ static void regGlobal(void* data, struct wl_registry* reg, uint32_t name, const 
     else if (strcmp(iface, "wl_seat") == 0 && !seat) seat = wl_registry_bind(reg, name, &wl_seat_interface, version < 5 ? version : 5);
     else if (strcmp(iface, "wl_data_device_manager") == 0) ddm = wl_registry_bind(reg, name, &wl_data_device_manager_interface, version < 3 ? version : 3);
     else if (strcmp(iface, "xdg_wm_base") == 0) { wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, version < 5 ? version : 5); xdg_wm_base_add_listener(wm_base, &wmListener, NULL); }
+    else if (strcmp(iface, "wl_subcompositor") == 0) subcomp = wl_registry_bind(reg, name, &wl_subcompositor_interface, 1);
 }
 static void regRemove(void* data, struct wl_registry* reg, uint32_t name) { (void)data;(void)reg;(void)name; }
 static const struct wl_registry_listener regListener = { regGlobal, regRemove };
@@ -178,6 +210,16 @@ static void mapWindow(struct wl_display* display, uint32_t color) {
     wl_display_roundtrip(display);
     wl_surface_attach(surface, buf, 0, 0);
     wl_surface_damage(surface, 0, 0, W, H);
+    if (want_sub && subcomp) {
+        // Sync-mode child: its state latches on the parent commit below.
+        struct wl_surface* child = wl_compositor_create_surface(compositor);
+        struct wl_subsurface* sub = wl_subcompositor_get_subsurface(subcomp, child, surface);
+        wl_subsurface_set_position(sub, 10, 10);
+        struct wl_buffer* cb = makeShmBuffer(30, 30, 0xFF2020E0u);
+        wl_surface_attach(child, cb, 0, 0);
+        wl_surface_damage(child, 0, 0, 30, 30);
+        wl_surface_commit(child);
+    }
     wl_surface_commit(surface);
     wl_display_roundtrip(display);
     wl_display_roundtrip(display);
@@ -189,6 +231,9 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) socket = argv[++i];
         else if (strcmp(argv[i], "--source") == 0 && i + 2 < argc) { is_source = 1; g_mime = argv[++i]; g_text = argv[++i]; }
         else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) { is_source = 0; g_mime = argv[++i]; }
+        else if (strcmp(argv[i], "--icon") == 0) want_icon = 1;
+        else if (strcmp(argv[i], "--sub") == 0) want_sub = 1;
+        else if (strcmp(argv[i], "--stay") == 0) want_stay = 1;
     }
     if (!socket || !g_mime) { fprintf(stderr, "usage: %s --socket NAME (--source MIME TEXT | --target MIME)\n", argv[0]); return 2; }
 
@@ -237,8 +282,12 @@ int main(int argc, char** argv) {
                     fflush(stdout);
                     close(g_drop_readfd); g_drop_readfd = -1;
                     wl_display_roundtrip(display);
-                    wl_display_disconnect(display);
-                    return 0;
+                    if (!want_stay) {
+                        wl_display_disconnect(display);
+                        return 0;
+                    }
+                    // --stay: keep the window mapped (until SIGTERM) so the
+                    // harness can inspect post-drop compositing.
                 }
             }
         }

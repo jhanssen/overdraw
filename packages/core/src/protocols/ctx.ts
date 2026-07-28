@@ -925,6 +925,12 @@ export interface CompositorState {
   // surface's new geometry. See xdg_popup.ts:rebuildStackWithPopups for
   // why we defer.
   deferredOutputStacks?: Map<number, number[]>;
+  // Active DnD drag-icon surface id, or null/absent when no drag icon is
+  // showing. Owned by wl_data_device_manager (set on the first icon
+  // placement, cleared when the icon hides); rebuildStackWithPopups
+  // appends it above everything so the icon rides on top of the full
+  // stack without the DnD code writing setStack itself.
+  dragIconId?: number | null;
   // Shm fast-path deferred releases: when commitSurfaceBufferShm returns a
   // non-zero uploadSeq, the protocol layer parks the wl_buffer resource here
   // keyed by seq. dispatchFrameCallbacks drains compositor.takeShmUploadAcks()

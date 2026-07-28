@@ -978,18 +978,19 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         dispatchCoreControlFrame = nullptr;
 
         // Wire the host's wl_buffer.release event to a ScanoutFlipComplete
-        // ctrl message. This is the nested equivalent of KMS's
-        // ScanoutFlipComplete: the slot just released is now FREE on our
-        // side, the core advances its slot state machine, and the addon's
-        // wake state machine drives the next render. surfaceBufId carries
-        // the SLOT INDEX (matching the KMS encoding the core's drainCtrl
-        // already handles).
-        hb->setBufferReleaseListener([ctrlFd](int retiredSlotIdx) {
+        // ctrl message: the slot just released is now FREE on our side, the
+        // core advances its slot state machine, and the addon's wake state
+        // machine drives the next render. surfaceBufId carries the SLOT
+        // INDEX in the nested semantics (the retired/FREE slot; see
+        // side_channel.h -- KMS sends the newly-SCANOUT slot instead).
+        // Steady-state sender: buffered ctrlSender, never the blocking
+        // sendMessage (transport.h contract).
+        hb->setBufferReleaseListener([&ctrlSender](int retiredSlotIdx) {
             ipc::Message m{};
             m.tag = ipc::Tag::ScanoutFlipComplete;
             m.outputId = 0;
             m.surfaceBufId = static_cast<uint32_t>(retiredSlotIdx);
-            ipc::sendMessage(ctrlFd, m);
+            ctrlSender.send(m);
         });
     }
 
@@ -1015,7 +1016,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         auto* hb = static_cast<gpu::HostWindowOutputBackend*>(output.get());
         constexpr uint32_t kScanoutFourcc = 0x34325241u;  // DRM_FORMAT_ARGB8888
         output->setResizeListener(
-            [&output, &serializer, hb, &alloc, &coreDevice, ctrlFd]
+            [&output, &serializer, hb, &alloc, &coreDevice, &ctrlSender]
             (uint32_t newW, uint32_t newH) {
                 // Rebuild the ring at the new dimensions. initScanout()
                 // internally clear()s the old ring -- destroying its
@@ -1062,7 +1063,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 m.tag = ipc::Tag::OutputDescriptor;
                 // outputId 0: the nested backend drives one output.
                 fillOutputMsgFromInfo(0, info, m);
-                ipc::sendMessage(ctrlFd, m);
+                ctrlSender.send(m);
                 LOG_INFO(Gpu, "resize -> {}x{}; rebuilt scanout ring; sent ScanoutRebuild + OutputDescriptor",
                          newW, newH);
                 // Resize-deadlock break: after a rebuild the host won't
@@ -1077,7 +1078,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 // chain.
                 ipc::Message kick{};
                 kick.tag = ipc::Tag::FrameComplete;
-                ipc::sendMessage(ctrlFd, kick);
+                ctrlSender.send(kick);
             });
     }
 
@@ -1101,7 +1102,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     // after the first present; without (b) a slot stays PENDING forever
     // and acquireOutputTextureHandle eventually returns null.
     if (!headless && !outputKms) {
-        output->setFrameDoneListener([ctrlFd](uint64_t tvSec, uint32_t tvNsec) {
+        output->setFrameDoneListener([&ctrlSender](uint64_t tvSec, uint32_t tvNsec) {
             ipc::Message m{};
             m.tag = ipc::Tag::FrameComplete;
             // Host wl_surface.frame timestamp -- forwarded for
@@ -1110,7 +1111,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             m.tvSec  = tvSec;
             m.tvNsec = tvNsec;
             m.seq    = 0;
-            ipc::sendMessage(ctrlFd, m);
+            ctrlSender.send(m);
         });
         output->armFrameCallback();
     }
@@ -2972,7 +2973,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     });
     const int outputFd = output ? output->eventFd() : -1;
     if (outputFd >= 0)
-        loop->add(outputFd, gpu::EventLoop::kRead, [&](uint32_t) { output->pump(); });
+        loop->add(outputFd, gpu::EventLoop::kRead, [&](uint32_t) {
+            output->pump();
+            // Backend listeners (flip-complete, buffer-release, frame-done,
+            // resize) queue ctrl messages via ctrlSender; re-arm so a
+            // send that hit EAGAIN drains on EPOLLOUT instead of sitting
+            // until unrelated ctrl traffic.
+            armCtrl();
+        });
 
 #if OVERDRAW_KMS
     // Page-flip → ScanoutFlipComplete: when KMS flips to a new slot, the
@@ -3195,6 +3203,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         if (output) output->pump();    // service output backend events
         serializer.drainNow();          // flush the turn's batched wire output once
         armWire();
+        armCtrl();  // backend listeners may have queued ctrl output this turn
         for (auto& pc : pluginConns) armPluginConn(pc.get());
     }
 

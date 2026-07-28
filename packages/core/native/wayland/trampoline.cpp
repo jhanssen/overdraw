@@ -436,9 +436,19 @@ bool Trampoline::postEvent(napi_value resourceHandle, uint32_t opcode, napi_valu
                 if (isTyped) {
                     napi_typedarray_type tt; size_t len; void* data; napi_value ab; size_t off;
                     napi_get_typedarray_info(env, v, &tt, &len, &data, &ab, &off);
+                    // len is the ELEMENT count; wl_array.size is bytes.
+                    size_t elem = 1;
+                    switch (tt) {
+                        case napi_int16_array: case napi_uint16_array: elem = 2; break;
+                        case napi_int32_array: case napi_uint32_array:
+                        case napi_float32_array: elem = 4; break;
+                        case napi_float64_array: case napi_bigint64_array:
+                        case napi_biguint64_array: elem = 8; break;
+                        default: break;
+                    }
                     a.data = data;
-                    a.size = len;  // element size 1 for uint8; bytes for others handled by len*?
-                    a.alloc = len;
+                    a.size = len * elem;
+                    a.alloc = a.size;
                 } else {
                     bool isAb = false; napi_is_arraybuffer(env, v, &isAb);
                     if (isAb) {

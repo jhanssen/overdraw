@@ -103,12 +103,19 @@ enum class Tag : uint8_t {
     // producer EndAccess (whose exported sync_file becomes the KMS commit's
     // IN_FENCE_FD). Retired ctrl letter (do not reuse): 'z'.
     // See architecture.md "Why wire, not ctrl".
-    ScanoutFlipComplete = 'Y',  // gpu -> core: a page-flip retired a slot. The
-                                //   `surfaceBufId` field carries the slot index
-                                //   that just exited SCANOUT (now FREE). The core
-                                //   advances its slot state machine off this.
-                                //   Also doubles as the KMS frame-complete signal
-                                //   for the wake/render state machine.
+    ScanoutFlipComplete = 'Y',  // gpu -> core: a slot's scanout state advanced.
+                                //   `surfaceBufId` carries a slot index whose
+                                //   meaning is per-mode (the core branches on
+                                //   kmsMode_ in drainCtrl):
+                                //     KMS:    the slot that just became SCANOUT;
+                                //             the core derives the prior SCANOUT
+                                //             slot -> FREE. Also the per-output
+                                //             vblank edge for the wake/render
+                                //             state machine.
+                                //     nested: the slot the host's
+                                //             wl_buffer.release just retired
+                                //             (now FREE). NOT a vblank edge --
+                                //             that is Tag::FrameComplete.
                                 //   Safe on ctrl (no wire dependency): it only
                                 //   touches the core's own slot bookkeeping and
                                 //   names a slot the core itself created; the

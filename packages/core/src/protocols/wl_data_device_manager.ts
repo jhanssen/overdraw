@@ -6,9 +6,9 @@
 // fresh data_offer per enter); accept/set_actions negotiate the action
 // (negotiateDndAction); a button release over an accepting target sends drop and
 // the same receive->send fd transfer as clipboard, then finish -> dnd_finished.
-// A drag-icon surface (if given) is composited following the pointer.
-// FLAGGED: the drag-icon path is implemented but not yet covered by a test (the
-// DnD test uses a NULL icon); everything else is verified by test/dnd.gpu.mjs.
+// A drag-icon surface (if given) is composited following the pointer, on top
+// of the full draw stack (state.dragIconId, appended by
+// rebuildStackWithPopups). Verified by test/dnd.gpu.mjs.
 //
 // Selection flow (copy/paste):
 //   source client: create_data_source -> offer(mime)... -> set_selection(src)
@@ -28,6 +28,7 @@ import type { ZwpPrimarySelectionSourceV1Handler } from "#protocols-gen/zwp_prim
 import type { ZwpPrimarySelectionOfferV1Handler } from "#protocols-gen/zwp_primary_selection_offer_v1.js";
 import type { Ctx } from "./ctx.js";
 import { seatViewToWorldX, seatViewToWorldY } from "./ctx.js";
+import { rebuildStackWithPopups } from "./xdg_popup.js";
 import type { Resource, WaylandFd } from "../types.js";
 import { KEYBOARD_EVENT, SELECTION_EVENT } from "../events/window-bus.js";
 
@@ -252,19 +253,19 @@ function updateDragIcon(d: DragSession, x: number, y: number): void {
   // cursor). Draws on top via the stack rebuild.
   d.ctx.state.compositor.setSurfaceLayout(
     rec.id, Math.round(x + (rec.offsetDx ?? 0)), Math.round(y + (rec.offsetDy ?? 0)), 0, 0);
-  pushDragIconStack(d, rec.id);
-}
-function pushDragIconStack(d: DragSession, iconId: number): void {
-  // Append the icon id above the current WM/subsurface stack so it draws last.
-  // applySubsurfaces rebuilds the base stack; we add the icon on top here.
-  const wm = d.ctx.state.wm;
-  if (!wm) return;
-  const base: number[] = [];
-  for (const win of wm.state.windows) base.push(win.surfaceId);
-  base.push(iconId);
-  d.ctx.state.compositor.setStack(base);
+  // Stack membership goes through the single stack owner
+  // (rebuildStackWithPopups appends state.dragIconId on top); only the
+  // first placement changes membership, motion is layout-only.
+  if (d.ctx.state.dragIconId !== rec.id) {
+    d.ctx.state.dragIconId = rec.id;
+    rebuildStackWithPopups(d.ctx.state);
+  }
 }
 function hideDragIcon(d: DragSession): void {
+  if (d.ctx.state.dragIconId != null) {
+    d.ctx.state.dragIconId = null;
+    rebuildStackWithPopups(d.ctx.state);
+  }
   if (!d.icon) return;
   const rec = d.ctx.state.surfaces.get(d.icon);
   if (rec) d.ctx.state.compositor.removeSurface(rec.id);
