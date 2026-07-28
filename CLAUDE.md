@@ -251,10 +251,14 @@ ordering between them; a recipient draining wire before ctrl finds a
 wire frame that references a resource the ctrl message hadn't
 introduced yet, then aborts.
 
-The repo is mid-migration; a handful of older tags (output lifecycle,
-surface-buffer alloc/release, `ReleaseClientTex`) still live on ctrl
-for historical reasons. **Do not add to that list.** When you need a
-new core↔gpu message:
+The migration is complete: surface-buffer alloc/release,
+`ImportClientTex`/`ReleaseClientTex`, and output add/remove all ride the
+wire as FrameKinds. What remains on ctrl is the carve-out set (Hello /
+HelloReply, `SetDrmFd` / `AddWireConn` + the plugin-instance handshake,
+`Shutdown` / `OutputPause` / `OutputResume`) plus three messages that
+satisfy (b) with no wire dependency: `OutputDescriptor` (re-emit),
+`ScanoutFlipComplete`, and `FrameComplete`. **Do not grow that list.**
+When you need a new core↔gpu message:
 
 - Define a `FrameKind::Foo = N` in `transport.h`.
 - Define a `FooPayload` with `encode`/`decode` helpers in
