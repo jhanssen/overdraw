@@ -11,6 +11,7 @@
 #ifndef OVERDRAW_IPC_SIDE_CHANNEL_H_
 #define OVERDRAW_IPC_SIDE_CHANNEL_H_
 
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -309,15 +310,68 @@ inline int32_t getI32LE(const uint8_t* p) {
     return static_cast<int32_t>(getU32LE(p));
 }
 
+// Sequential little-endian cursors over a byte buffer. The encode/decode
+// pairs below name each field once, in layout order; the offset advances
+// automatically so the layout is stated exactly once per direction. The
+// per-payload kSize static_asserts (and the encodedSize() asserts in the
+// variable-length payloads) pin the resulting byte counts.
+class ByteWriter {
+public:
+    explicit ByteWriter(uint8_t* p) : p_(p) {}
+    void u8(uint8_t v) { p_[off_++] = v; }
+    void u16(uint16_t v) {
+        p_[off_++] = static_cast<uint8_t>(v);
+        p_[off_++] = static_cast<uint8_t>(v >> 8);
+    }
+    void u32(uint32_t v) { putU32LE(p_ + off_, v); off_ += 4; }
+    void i32(int32_t v)  { putI32LE(p_ + off_, v); off_ += 4; }
+    void u64(uint64_t v) { putU64LE(p_ + off_, v); off_ += 8; }
+    void bytes(const void* src, size_t n) {
+        std::memcpy(p_ + off_, src, n);
+        off_ += n;
+    }
+    size_t offset() const { return off_; }
+
+private:
+    uint8_t* p_;
+    size_t off_ = 0;
+};
+
+class ByteReader {
+public:
+    explicit ByteReader(const uint8_t* p) : p_(p) {}
+    uint8_t u8() { return p_[off_++]; }
+    uint16_t u16() {
+        const uint16_t v = static_cast<uint16_t>(
+            p_[off_] | (p_[off_ + 1] << 8));
+        off_ += 2;
+        return v;
+    }
+    uint32_t u32() { const uint32_t v = getU32LE(p_ + off_); off_ += 4; return v; }
+    int32_t  i32() { const int32_t v = getI32LE(p_ + off_); off_ += 4; return v; }
+    uint64_t u64() { const uint64_t v = getU64LE(p_ + off_); off_ += 8; return v; }
+    void bytes(void* dst, size_t n) {
+        std::memcpy(dst, p_ + off_, n);
+        off_ += n;
+    }
+    void skip(size_t n) { off_ += n; }
+    size_t offset() const { return off_; }
+
+private:
+    const uint8_t* p_;
+    size_t off_ = 0;
+};
+
 // Client-texture Begin/End payload: variant + (id, generation). 9 bytes.
 struct ClientTexAccessPayload {
     uint32_t textureId;
     uint32_t textureGeneration;
     static constexpr size_t kSize = 1 + 4 + 4;
     void encode(uint8_t* out) const {
-        out[0] = static_cast<uint8_t>(AccessVariant::ClientTex);
-        putU32LE(out + 1, textureId);
-        putU32LE(out + 5, textureGeneration);
+        ByteWriter w(out);
+        w.u8(static_cast<uint8_t>(AccessVariant::ClientTex));
+        w.u32(textureId);
+        w.u32(textureGeneration);
     }
 };
 
@@ -329,9 +383,10 @@ struct SurfaceAccessPayload {
     bool producer;
     static constexpr size_t kSize = 1 + 4 + 1;
     void encode(uint8_t* out) const {
-        out[0] = static_cast<uint8_t>(AccessVariant::Surface);
-        putU32LE(out + 1, surfaceBufId);
-        out[5] = producer ? 1 : 0;
+        ByteWriter w(out);
+        w.u8(static_cast<uint8_t>(AccessVariant::Surface));
+        w.u32(surfaceBufId);
+        w.u8(producer ? 1 : 0);
     }
 };
 
@@ -356,37 +411,36 @@ struct ImportClientTexPayload {
     uint32_t planeStride;
     static constexpr size_t kSize = 9 * 4 + 8;  // 9 u32 + 1 u64 = 44 bytes
     void encode(uint8_t* out) const {
-        putU32LE(out +  0, textureId);
-        putU32LE(out +  4, textureGeneration);
-        putU32LE(out +  8, deviceId);
-        putU32LE(out + 12, deviceGeneration);
-        putU32LE(out + 16, width);
-        putU32LE(out + 20, height);
-        putU32LE(out + 24, drmFourcc);
-        // u64 LE: low then high
-        putU32LE(out + 28, static_cast<uint32_t>(modifier));
-        putU32LE(out + 32, static_cast<uint32_t>(modifier >> 32));
-        putU32LE(out + 36, planeOffset);
-        putU32LE(out + 40, planeStride);
+        ByteWriter w(out);
+        w.u32(textureId);
+        w.u32(textureGeneration);
+        w.u32(deviceId);
+        w.u32(deviceGeneration);
+        w.u32(width);
+        w.u32(height);
+        w.u32(drmFourcc);
+        w.u64(modifier);
+        w.u32(planeOffset);
+        w.u32(planeStride);
     }
     static ImportClientTexPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         ImportClientTexPayload r{};
-        r.textureId         = getU32LE(p +  0);
-        r.textureGeneration = getU32LE(p +  4);
-        r.deviceId          = getU32LE(p +  8);
-        r.deviceGeneration  = getU32LE(p + 12);
-        r.width             = getU32LE(p + 16);
-        r.height            = getU32LE(p + 20);
-        r.drmFourcc         = getU32LE(p + 24);
-        r.modifier          = static_cast<uint64_t>(getU32LE(p + 28)) |
-                              (static_cast<uint64_t>(getU32LE(p + 32)) << 32);
-        r.planeOffset       = getU32LE(p + 36);
-        r.planeStride       = getU32LE(p + 40);
+        r.textureId         = rd.u32();
+        r.textureGeneration = rd.u32();
+        r.deviceId          = rd.u32();
+        r.deviceGeneration  = rd.u32();
+        r.width             = rd.u32();
+        r.height            = rd.u32();
+        r.drmFourcc         = rd.u32();
+        r.modifier          = rd.u64();
+        r.planeOffset       = rd.u32();
+        r.planeStride       = rd.u32();
         return r;
     }
 };
 static_assert(ImportClientTexPayload::kSize == 44,
-              "ImportClientTexPayload size mismatch with hand-counted layout");
+              "ImportClientTexPayload kSize does not match its encoded layout");
 
 // ClientTexImported payload (no fd): echo the texture handle and the
 // import-ok flag. The core matches replies to its pendingJsImports list by
@@ -397,20 +451,22 @@ struct ClientTexImportedPayload {
     uint8_t  importOk;
     static constexpr size_t kSize = 4 + 4 + 1;  // 9 bytes
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, textureId);
-        putU32LE(out + 4, textureGeneration);
-        out[8] = importOk;
+        ByteWriter w(out);
+        w.u32(textureId);
+        w.u32(textureGeneration);
+        w.u8(importOk);
     }
     static ClientTexImportedPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         ClientTexImportedPayload r{};
-        r.textureId         = getU32LE(p + 0);
-        r.textureGeneration = getU32LE(p + 4);
-        r.importOk          = p[8];
+        r.textureId         = rd.u32();
+        r.textureGeneration = rd.u32();
+        r.importOk          = rd.u8();
         return r;
     }
 };
 static_assert(ClientTexImportedPayload::kSize == 9,
-              "ClientTexImportedPayload size mismatch with hand-counted layout");
+              "ClientTexImportedPayload kSize does not match its encoded layout");
 
 // ---------------------------------------------------------------------------
 // In-band ScanoutReserve (kind=6, core -> gpu) and ScanoutReady (kind=7,
@@ -439,30 +495,32 @@ struct ScanoutReservePayload {
     Slot slots[3];
     static constexpr size_t kSize = 4 + 4 + 4 + 3 * (4 + 4 + 4);  // 48
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  outputId);
-        putU32LE(out + 4,  width);
-        putU32LE(out + 8,  height);
-        for (int i = 0; i < 3; ++i) {
-            putU32LE(out + 12 + i * 12 + 0, slots[i].handleId);
-            putU32LE(out + 12 + i * 12 + 4, slots[i].handleGeneration);
-            putU32LE(out + 12 + i * 12 + 8, slots[i].surfaceBufId);
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(width);
+        w.u32(height);
+        for (const Slot& s : slots) {
+            w.u32(s.handleId);
+            w.u32(s.handleGeneration);
+            w.u32(s.surfaceBufId);
         }
     }
     static ScanoutReservePayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         ScanoutReservePayload r{};
-        r.outputId = getU32LE(p + 0);
-        r.width    = getU32LE(p + 4);
-        r.height   = getU32LE(p + 8);
-        for (int i = 0; i < 3; ++i) {
-            r.slots[i].handleId         = getU32LE(p + 12 + i * 12 + 0);
-            r.slots[i].handleGeneration = getU32LE(p + 12 + i * 12 + 4);
-            r.slots[i].surfaceBufId     = getU32LE(p + 12 + i * 12 + 8);
+        r.outputId = rd.u32();
+        r.width    = rd.u32();
+        r.height   = rd.u32();
+        for (Slot& s : r.slots) {
+            s.handleId         = rd.u32();
+            s.handleGeneration = rd.u32();
+            s.surfaceBufId     = rd.u32();
         }
         return r;
     }
 };
 static_assert(ScanoutReservePayload::kSize == 48,
-              "ScanoutReservePayload size mismatch with hand-counted layout");
+              "ScanoutReservePayload kSize does not match its encoded layout");
 
 // SwitchMode payload (core -> gpu, FrameKind::SwitchMode): swap the
 // named output to a new mode. Width/height are in device pixels; refreshMhz
@@ -479,22 +537,24 @@ struct SwitchModePayload {
     uint32_t refreshMhz;
     static constexpr size_t kSize = 4 * 4;  // 16
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  outputId);
-        putU32LE(out + 4,  width);
-        putU32LE(out + 8,  height);
-        putU32LE(out + 12, refreshMhz);
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(width);
+        w.u32(height);
+        w.u32(refreshMhz);
     }
     static SwitchModePayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         SwitchModePayload r{};
-        r.outputId   = getU32LE(p + 0);
-        r.width      = getU32LE(p + 4);
-        r.height     = getU32LE(p + 8);
-        r.refreshMhz = getU32LE(p + 12);
+        r.outputId   = rd.u32();
+        r.width      = rd.u32();
+        r.height     = rd.u32();
+        r.refreshMhz = rd.u32();
         return r;
     }
 };
 static_assert(SwitchModePayload::kSize == 16,
-              "SwitchModePayload size mismatch with hand-counted layout");
+              "SwitchModePayload kSize does not match its encoded layout");
 
 // ScanoutPresent payload (core -> gpu, FrameKind::ScanoutPresent): flip
 // the scanout slot holding `surfaceBufId` on `outputId`. No fence rides
@@ -507,18 +567,20 @@ struct ScanoutPresentPayload {
     uint32_t surfaceBufId;
     static constexpr size_t kSize = 2 * 4;  // 8
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, outputId);
-        putU32LE(out + 4, surfaceBufId);
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(surfaceBufId);
     }
     static ScanoutPresentPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         ScanoutPresentPayload r{};
-        r.outputId     = getU32LE(p + 0);
-        r.surfaceBufId = getU32LE(p + 4);
+        r.outputId     = rd.u32();
+        r.surfaceBufId = rd.u32();
         return r;
     }
 };
 static_assert(ScanoutPresentPayload::kSize == 8,
-              "ScanoutPresentPayload size mismatch with hand-counted layout");
+              "ScanoutPresentPayload kSize does not match its encoded layout");
 
 // ScanoutRebuild payload (gpu -> core, FrameKind::ScanoutRebuild): the
 // GPU has torn down the named output's ring and the new dims are
@@ -534,20 +596,22 @@ struct ScanoutRebuildPayload {
     uint32_t height;
     static constexpr size_t kSize = 3 * 4;  // 12
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, outputId);
-        putU32LE(out + 4, width);
-        putU32LE(out + 8, height);
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(width);
+        w.u32(height);
     }
     static ScanoutRebuildPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         ScanoutRebuildPayload r{};
-        r.outputId = getU32LE(p + 0);
-        r.width    = getU32LE(p + 4);
-        r.height   = getU32LE(p + 8);
+        r.outputId = rd.u32();
+        r.width    = rd.u32();
+        r.height   = rd.u32();
         return r;
     }
 };
 static_assert(ScanoutRebuildPayload::kSize == 12,
-              "ScanoutRebuildPayload size mismatch with hand-counted layout");
+              "ScanoutRebuildPayload kSize does not match its encoded layout");
 
 // ScanoutReady payload: outputId + ok. The GPU process emits this AFTER
 // InjectTexture'ing all three slots for the named outputId; ok=0 signals a
@@ -559,18 +623,20 @@ struct ScanoutReadyPayload {
     uint8_t  ok;
     static constexpr size_t kSize = 4 + 1;  // 5 bytes
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, outputId);
-        out[4] = ok;
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u8(ok);
     }
     static ScanoutReadyPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         ScanoutReadyPayload r{};
-        r.outputId = getU32LE(p + 0);
-        r.ok       = p[4];
+        r.outputId = rd.u32();
+        r.ok       = rd.u8();
         return r;
     }
 };
 static_assert(ScanoutReadyPayload::kSize == 5,
-              "ScanoutReadyPayload size mismatch with hand-counted layout");
+              "ScanoutReadyPayload kSize does not match its encoded layout");
 
 // AllocSurfaceBufPayload (core -> gpu; FrameKind::AllocSurfaceBuf or
 // FrameKind::AllocComposeBuf -- the FrameKind discriminates which side
@@ -609,42 +675,44 @@ struct AllocSurfaceBufPayload {
     uint64_t wireSerial;
     static constexpr size_t kSize = 4 * 4 + 4 * 8 + 2 * 8;  // 64
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  surfaceBufId);
-        putU32LE(out + 4,  connId);
-        putU32LE(out + 8,  width);
-        putU32LE(out + 12, height);
-        putU32LE(out + 16, pluginDevice.id);
-        putU32LE(out + 20, pluginDevice.generation);
-        putU32LE(out + 24, pluginTexture.id);
-        putU32LE(out + 28, pluginTexture.generation);
-        putU32LE(out + 32, coreDevice.id);
-        putU32LE(out + 36, coreDevice.generation);
-        putU32LE(out + 40, coreTexture.id);
-        putU32LE(out + 44, coreTexture.generation);
-        putU64LE(out + 48, reservePointSerial);
-        putU64LE(out + 56, wireSerial);
+        ByteWriter w(out);
+        w.u32(surfaceBufId);
+        w.u32(connId);
+        w.u32(width);
+        w.u32(height);
+        w.u32(pluginDevice.id);
+        w.u32(pluginDevice.generation);
+        w.u32(pluginTexture.id);
+        w.u32(pluginTexture.generation);
+        w.u32(coreDevice.id);
+        w.u32(coreDevice.generation);
+        w.u32(coreTexture.id);
+        w.u32(coreTexture.generation);
+        w.u64(reservePointSerial);
+        w.u64(wireSerial);
     }
     static AllocSurfaceBufPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         AllocSurfaceBufPayload r{};
-        r.surfaceBufId            = getU32LE(p + 0);
-        r.connId                  = getU32LE(p + 4);
-        r.width                   = getU32LE(p + 8);
-        r.height                  = getU32LE(p + 12);
-        r.pluginDevice.id         = getU32LE(p + 16);
-        r.pluginDevice.generation = getU32LE(p + 20);
-        r.pluginTexture.id        = getU32LE(p + 24);
-        r.pluginTexture.generation = getU32LE(p + 28);
-        r.coreDevice.id           = getU32LE(p + 32);
-        r.coreDevice.generation   = getU32LE(p + 36);
-        r.coreTexture.id          = getU32LE(p + 40);
-        r.coreTexture.generation  = getU32LE(p + 44);
-        r.reservePointSerial      = getU64LE(p + 48);
-        r.wireSerial              = getU64LE(p + 56);
+        r.surfaceBufId             = rd.u32();
+        r.connId                   = rd.u32();
+        r.width                    = rd.u32();
+        r.height                   = rd.u32();
+        r.pluginDevice.id          = rd.u32();
+        r.pluginDevice.generation  = rd.u32();
+        r.pluginTexture.id         = rd.u32();
+        r.pluginTexture.generation = rd.u32();
+        r.coreDevice.id            = rd.u32();
+        r.coreDevice.generation    = rd.u32();
+        r.coreTexture.id           = rd.u32();
+        r.coreTexture.generation   = rd.u32();
+        r.reservePointSerial       = rd.u64();
+        r.wireSerial               = rd.u64();
         return r;
     }
 };
 static_assert(AllocSurfaceBufPayload::kSize == 64,
-              "AllocSurfaceBufPayload size mismatch with hand-counted layout");
+              "AllocSurfaceBufPayload kSize does not match its encoded layout");
 
 // SurfaceBufAllocatedPayload (gpu -> core; FrameKind::SurfaceBufAllocated):
 // the alloc + inject sequence on both sides completed (ok=1) or failed
@@ -658,20 +726,22 @@ struct SurfaceBufAllocatedPayload {
     uint8_t  ok;
     static constexpr size_t kSize = 4 + 4 + 1;  // 9
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, surfaceBufId);
-        putU32LE(out + 4, connId);
-        out[8] = ok;
+        ByteWriter w(out);
+        w.u32(surfaceBufId);
+        w.u32(connId);
+        w.u8(ok);
     }
     static SurfaceBufAllocatedPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         SurfaceBufAllocatedPayload r{};
-        r.surfaceBufId = getU32LE(p + 0);
-        r.connId       = getU32LE(p + 4);
-        r.ok           = p[8];
+        r.surfaceBufId = rd.u32();
+        r.connId       = rd.u32();
+        r.ok           = rd.u8();
         return r;
     }
 };
 static_assert(SurfaceBufAllocatedPayload::kSize == 9,
-              "SurfaceBufAllocatedPayload size mismatch with hand-counted layout");
+              "SurfaceBufAllocatedPayload kSize does not match its encoded layout");
 
 // ReleaseSurfaceBufPayload (core -> gpu; FrameKind::ReleaseSurfaceBuf):
 // destroy a surfaceBuf. Wire-FIFO ordering means any still-pending
@@ -687,7 +757,7 @@ struct ReleaseSurfaceBufPayload {
     }
 };
 static_assert(ReleaseSurfaceBufPayload::kSize == 4,
-              "ReleaseSurfaceBufPayload size mismatch with hand-counted layout");
+              "ReleaseSurfaceBufPayload kSize does not match its encoded layout");
 
 // OutputDescriptorPayload (gpu -> core; FrameKind::OutputAdded).
 // Carries one output's full identity + geometry. Layout (little-endian):
@@ -733,46 +803,44 @@ struct OutputDescriptorPayload {
     }
 
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  outputId);
-        putU32LE(out + 4,  width);
-        putU32LE(out + 8,  height);
-        putU32LE(out + 12, refreshMhz);
-        putU32LE(out + 16, scale);
-        putU32LE(out + 20, transform);
-        putU32LE(out + 24, physicalWidthMm);
-        putU32LE(out + 28, physicalHeightMm);
-        size_t off = 32;
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(width);
+        w.u32(height);
+        w.u32(refreshMhz);
+        w.u32(scale);
+        w.u32(transform);
+        w.u32(physicalWidthMm);
+        w.u32(physicalHeightMm);
         for (const std::string* s : { &name, &make, &model, &edidId }) {
-            putU32LE(out + off, static_cast<uint32_t>(s->size()));
-            off += 4;
-            std::memcpy(out + off, s->data(), s->size());
-            off += s->size();
+            w.u32(static_cast<uint32_t>(s->size()));
+            w.bytes(s->data(), s->size());
         }
+        assert(w.offset() == encodedSize());
     }
 
     // Decode from a payload of `len` bytes. Returns true on success;
     // returns false (output untouched) on truncated / malformed input.
     static bool decode(const uint8_t* p, size_t len, OutputDescriptorPayload& out) {
         if (len < 8 * 4) return false;
-        out.outputId         = getU32LE(p + 0);
-        out.width            = getU32LE(p + 4);
-        out.height           = getU32LE(p + 8);
-        out.refreshMhz       = getU32LE(p + 12);
-        out.scale            = getU32LE(p + 16);
-        out.transform        = getU32LE(p + 20);
-        out.physicalWidthMm  = getU32LE(p + 24);
-        out.physicalHeightMm = getU32LE(p + 28);
-        size_t off = 32;
+        ByteReader rd(p);
+        out.outputId         = rd.u32();
+        out.width            = rd.u32();
+        out.height           = rd.u32();
+        out.refreshMhz       = rd.u32();
+        out.scale            = rd.u32();
+        out.transform        = rd.u32();
+        out.physicalWidthMm  = rd.u32();
+        out.physicalHeightMm = rd.u32();
         std::string* fields[] = { &out.name, &out.make, &out.model, &out.edidId };
         for (std::string* s : fields) {
-            if (off + 4 > len) return false;
-            const uint32_t slen = getU32LE(p + off);
-            off += 4;
-            if (off + slen > len) return false;
-            s->assign(reinterpret_cast<const char*>(p + off), slen);
-            off += slen;
+            if (rd.offset() + 4 > len) return false;
+            const uint32_t slen = rd.u32();
+            if (rd.offset() + slen > len) return false;
+            s->resize(slen);
+            rd.bytes(s->data(), slen);
         }
-        return off == len;
+        return rd.offset() == len;
     }
 };
 
@@ -786,7 +854,7 @@ struct ModeRecord {
     static constexpr size_t kSize = 4 * 4;  // 16
 };
 static_assert(ModeRecord::kSize == 16,
-              "ModeRecord size mismatch with hand-counted layout");
+              "ModeRecord kSize does not match its encoded layout");
 
 // Flag bits for ModeRecord::flags.
 inline constexpr uint32_t kModeFlagPreferred = 1u << 0;
@@ -804,34 +872,33 @@ struct OutputModesPayload {
         return 8 + modes.size() * ModeRecord::kSize;
     }
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, outputId);
-        putU32LE(out + 4, static_cast<uint32_t>(modes.size()));
-        size_t off = 8;
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(static_cast<uint32_t>(modes.size()));
         for (const ModeRecord& m : modes) {
-            putU32LE(out + off + 0,  m.width);
-            putU32LE(out + off + 4,  m.height);
-            putU32LE(out + off + 8,  m.refreshMhz);
-            putU32LE(out + off + 12, m.flags);
-            off += ModeRecord::kSize;
+            w.u32(m.width);
+            w.u32(m.height);
+            w.u32(m.refreshMhz);
+            w.u32(m.flags);
         }
+        assert(w.offset() == encodedSize());
     }
     static bool decode(const uint8_t* p, size_t len, OutputModesPayload& out) {
         if (len < 8) return false;
-        out.outputId = getU32LE(p + 0);
-        const uint32_t count = getU32LE(p + 4);
+        ByteReader rd(p);
+        out.outputId = rd.u32();
+        const uint32_t count = rd.u32();
         if (count > kMaxModesPerOutput) return false;
         if (len != 8 + count * ModeRecord::kSize) return false;
         out.modes.clear();
         out.modes.reserve(count);
-        size_t off = 8;
         for (uint32_t i = 0; i < count; ++i) {
             ModeRecord r{};
-            r.width      = getU32LE(p + off + 0);
-            r.height     = getU32LE(p + off + 4);
-            r.refreshMhz = getU32LE(p + off + 8);
-            r.flags      = getU32LE(p + off + 12);
+            r.width      = rd.u32();
+            r.height     = rd.u32();
+            r.refreshMhz = rd.u32();
+            r.flags      = rd.u32();
             out.modes.push_back(r);
-            off += ModeRecord::kSize;
         }
         return true;
     }
@@ -848,7 +915,7 @@ struct OutputRemovedPayload {
     }
 };
 static_assert(OutputRemovedPayload::kSize == 4,
-              "OutputRemovedPayload size mismatch with hand-counted layout");
+              "OutputRemovedPayload kSize does not match its encoded layout");
 
 // ReleaseClientTexPayload (core -> gpu; FrameKind::ReleaseClientTex):
 // release a JS-compositor dmabuf import. FIFO-ordered with the
@@ -859,39 +926,51 @@ struct ReleaseClientTexPayload {
     WireHandle texture;
     static constexpr size_t kSize = 8;
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, texture.id);
-        putU32LE(out + 4, texture.generation);
+        ByteWriter w(out);
+        w.u32(texture.id);
+        w.u32(texture.generation);
     }
     static ReleaseClientTexPayload decode(const uint8_t* p) {
-        return { { getU32LE(p + 0), getU32LE(p + 4) } };
+        ByteReader rd(p);
+        const uint32_t id = rd.u32();
+        const uint32_t generation = rd.u32();
+        return { { id, generation } };
     }
 };
 static_assert(ReleaseClientTexPayload::kSize == 8,
-              "ReleaseClientTexPayload size mismatch with hand-counted layout");
+              "ReleaseClientTexPayload kSize does not match its encoded layout");
 
-// RegisterShmPoolPayload (core -> gpu; FrameKind::RegisterShmPool):
-// the client created a wl_shm pool. The memfd rides as exactly ONE
-// SCM_RIGHTS fd on the sendmsg carrying this frame. The GPU process
-// mmap's the fd and stashes (poolId -> {ptr, size, fd}).
-struct RegisterShmPoolPayload {
+// Shared poolId + size payload for the wl_shm pool lifecycle frames.
+// RegisterShmPool (core -> gpu): the client created a wl_shm pool; the
+// memfd rides as exactly ONE SCM_RIGHTS fd on the sendmsg carrying the
+// frame, and the GPU process mmap's it and stashes
+// (poolId -> {ptr, size, fd}). ResizeShmPool (core -> gpu): the client
+// grew the pool via wl_shm_pool.resize (pools only grow); the GPU
+// process mremap's its cached mapping to the new size.
+struct ShmPoolSizePayload {
     uint32_t poolId;
     uint32_t _pad;   // explicit align: size is u64, layout is u32/u32/u64
     uint64_t size;
     static constexpr size_t kSize = 16;
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, poolId);
-        putU32LE(out + 4, 0);
-        putU64LE(out + 8, size);
+        ByteWriter w(out);
+        w.u32(poolId);
+        w.u32(0);
+        w.u64(size);
     }
-    static RegisterShmPoolPayload decode(const uint8_t* p) {
-        RegisterShmPoolPayload r{};
-        r.poolId = getU32LE(p + 0);
-        r.size   = getU64LE(p + 8);
+    static ShmPoolSizePayload decode(const uint8_t* p) {
+        ByteReader rd(p);
+        ShmPoolSizePayload r{};
+        r.poolId = rd.u32();
+        rd.skip(4);
+        r.size   = rd.u64();
         return r;
     }
 };
-static_assert(RegisterShmPoolPayload::kSize == 16,
-              "RegisterShmPoolPayload size mismatch with hand-counted layout");
+static_assert(ShmPoolSizePayload::kSize == 16,
+              "ShmPoolSizePayload kSize does not match its encoded layout");
+using RegisterShmPoolPayload = ShmPoolSizePayload;
+using ResizeShmPoolPayload = ShmPoolSizePayload;
 
 // UnregisterShmPoolPayload (core -> gpu; FrameKind::UnregisterShmPool):
 // the wl_shm pool was destroyed (or its last buffer-ref dropped). The
@@ -899,38 +978,13 @@ static_assert(RegisterShmPoolPayload::kSize == 16,
 struct UnregisterShmPoolPayload {
     uint32_t poolId;
     static constexpr size_t kSize = 4;
-    void encode(uint8_t* out) const {
-        putU32LE(out + 0, poolId);
-    }
+    void encode(uint8_t* out) const { putU32LE(out, poolId); }
     static UnregisterShmPoolPayload decode(const uint8_t* p) {
-        return { getU32LE(p + 0) };
+        return { getU32LE(p) };
     }
 };
 static_assert(UnregisterShmPoolPayload::kSize == 4,
-              "UnregisterShmPoolPayload size mismatch with hand-counted layout");
-
-// ResizeShmPoolPayload (core -> gpu; FrameKind::ResizeShmPool): the client
-// grew the pool via wl_shm_pool.resize (pools only grow). The GPU process
-// mremap's its cached mapping to the new size.
-struct ResizeShmPoolPayload {
-    uint32_t poolId;
-    uint32_t _pad;   // explicit align: size is u64, layout is u32/u32/u64
-    uint64_t size;
-    static constexpr size_t kSize = 16;
-    void encode(uint8_t* out) const {
-        putU32LE(out + 0, poolId);
-        putU32LE(out + 4, 0);
-        putU64LE(out + 8, size);
-    }
-    static ResizeShmPoolPayload decode(const uint8_t* p) {
-        ResizeShmPoolPayload r{};
-        r.poolId = getU32LE(p + 0);
-        r.size   = getU64LE(p + 8);
-        return r;
-    }
-};
-static_assert(ResizeShmPoolPayload::kSize == 16,
-              "ResizeShmPoolPayload size mismatch with hand-counted layout");
+              "UnregisterShmPoolPayload kSize does not match its encoded layout");
 
 // CursorImagePayload (core -> gpu; FrameKind::CursorImage): fixed header,
 // followed inline by srcWidth*srcHeight*4 bytes of premultiplied BGRA
@@ -947,24 +1001,26 @@ struct CursorImagePayload {
     uint32_t dstHeight;
     static constexpr size_t kSize = 5 * 4;  // 20 (header only; pixels follow)
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  outputId);
-        putU32LE(out + 4,  srcWidth);
-        putU32LE(out + 8,  srcHeight);
-        putU32LE(out + 12, dstWidth);
-        putU32LE(out + 16, dstHeight);
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(srcWidth);
+        w.u32(srcHeight);
+        w.u32(dstWidth);
+        w.u32(dstHeight);
     }
     static CursorImagePayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         CursorImagePayload r{};
-        r.outputId  = getU32LE(p + 0);
-        r.srcWidth  = getU32LE(p + 4);
-        r.srcHeight = getU32LE(p + 8);
-        r.dstWidth  = getU32LE(p + 12);
-        r.dstHeight = getU32LE(p + 16);
+        r.outputId  = rd.u32();
+        r.srcWidth  = rd.u32();
+        r.srcHeight = rd.u32();
+        r.dstWidth  = rd.u32();
+        r.dstHeight = rd.u32();
         return r;
     }
 };
 static_assert(CursorImagePayload::kSize == 20,
-              "CursorImagePayload size mismatch with hand-counted layout");
+              "CursorImagePayload kSize does not match its encoded layout");
 
 // CursorImageShmPayload (core -> gpu; FrameKind::CursorImageShm): the
 // cursor pixels live at poolId/offset in an shm pool the GPU process has
@@ -982,30 +1038,32 @@ struct CursorImageShmPayload {
     uint32_t dstHeight;
     static constexpr size_t kSize = 8 * 4;  // 32
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  outputId);
-        putU32LE(out + 4,  poolId);
-        putU32LE(out + 8,  offset);
-        putU32LE(out + 12, stride);
-        putU32LE(out + 16, srcWidth);
-        putU32LE(out + 20, srcHeight);
-        putU32LE(out + 24, dstWidth);
-        putU32LE(out + 28, dstHeight);
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(poolId);
+        w.u32(offset);
+        w.u32(stride);
+        w.u32(srcWidth);
+        w.u32(srcHeight);
+        w.u32(dstWidth);
+        w.u32(dstHeight);
     }
     static CursorImageShmPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         CursorImageShmPayload r{};
-        r.outputId  = getU32LE(p + 0);
-        r.poolId    = getU32LE(p + 4);
-        r.offset    = getU32LE(p + 8);
-        r.stride    = getU32LE(p + 12);
-        r.srcWidth  = getU32LE(p + 16);
-        r.srcHeight = getU32LE(p + 20);
-        r.dstWidth  = getU32LE(p + 24);
-        r.dstHeight = getU32LE(p + 28);
+        r.outputId  = rd.u32();
+        r.poolId    = rd.u32();
+        r.offset    = rd.u32();
+        r.stride    = rd.u32();
+        r.srcWidth  = rd.u32();
+        r.srcHeight = rd.u32();
+        r.dstWidth  = rd.u32();
+        r.dstHeight = rd.u32();
         return r;
     }
 };
 static_assert(CursorImageShmPayload::kSize == 32,
-              "CursorImageShmPayload size mismatch with hand-counted layout");
+              "CursorImageShmPayload kSize does not match its encoded layout");
 
 // CursorStatePayload (core -> gpu; FrameKind::CursorState): cursor plane
 // position + visibility for one output. x/y are device pixels relative to
@@ -1021,24 +1079,26 @@ struct CursorStatePayload {
     uint8_t  commitNow;
     static constexpr size_t kSize = 3 * 4 + 2;  // 14
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, outputId);
-        putI32LE(out + 4, x);
-        putI32LE(out + 8, y);
-        out[12] = visible;
-        out[13] = commitNow;
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.i32(x);
+        w.i32(y);
+        w.u8(visible);
+        w.u8(commitNow);
     }
     static CursorStatePayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         CursorStatePayload r{};
-        r.outputId  = getU32LE(p + 0);
-        r.x         = getI32LE(p + 4);
-        r.y         = getI32LE(p + 8);
-        r.visible   = p[12];
-        r.commitNow = p[13];
+        r.outputId  = rd.u32();
+        r.x         = rd.i32();
+        r.y         = rd.i32();
+        r.visible   = rd.u8();
+        r.commitNow = rd.u8();
         return r;
     }
 };
 static_assert(CursorStatePayload::kSize == 14,
-              "CursorStatePayload size mismatch with hand-counted layout");
+              "CursorStatePayload kSize does not match its encoded layout");
 
 // CursorPlaneStatusPayload (gpu -> core; FrameKind::CursorPlaneStatus):
 // ok=1 with the device's cursor buffer dims when outputId has a usable
@@ -1051,22 +1111,24 @@ struct CursorPlaneStatusPayload {
     uint8_t  ok;
     static constexpr size_t kSize = 3 * 4 + 1;  // 13
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, outputId);
-        putU32LE(out + 4, maxWidth);
-        putU32LE(out + 8, maxHeight);
-        out[12] = ok;
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(maxWidth);
+        w.u32(maxHeight);
+        w.u8(ok);
     }
     static CursorPlaneStatusPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         CursorPlaneStatusPayload r{};
-        r.outputId  = getU32LE(p + 0);
-        r.maxWidth  = getU32LE(p + 4);
-        r.maxHeight = getU32LE(p + 8);
-        r.ok        = p[12];
+        r.outputId  = rd.u32();
+        r.maxWidth  = rd.u32();
+        r.maxHeight = rd.u32();
+        r.ok        = rd.u8();
         return r;
     }
 };
 static_assert(CursorPlaneStatusPayload::kSize == 13,
-              "CursorPlaneStatusPayload size mismatch with hand-counted layout");
+              "CursorPlaneStatusPayload kSize does not match its encoded layout");
 
 // ScanoutClientPresentPayload (core -> gpu; FrameKind::ScanoutClientPresent
 // or ScanoutClientPresentFence): put the client dmabuf behind the wire
@@ -1085,24 +1147,26 @@ struct ScanoutClientPresentPayload {
     uint32_t flags;
     static constexpr size_t kSize = 5 * 4;  // 20
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  outputId);
-        putU32LE(out + 4,  textureId);
-        putU32LE(out + 8,  textureGeneration);
-        putU32LE(out + 12, bufferId);
-        putU32LE(out + 16, flags);
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(textureId);
+        w.u32(textureGeneration);
+        w.u32(bufferId);
+        w.u32(flags);
     }
     static ScanoutClientPresentPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         ScanoutClientPresentPayload r{};
-        r.outputId          = getU32LE(p + 0);
-        r.textureId         = getU32LE(p + 4);
-        r.textureGeneration = getU32LE(p + 8);
-        r.bufferId          = getU32LE(p + 12);
-        r.flags             = getU32LE(p + 16);
+        r.outputId          = rd.u32();
+        r.textureId         = rd.u32();
+        r.textureGeneration = rd.u32();
+        r.bufferId          = rd.u32();
+        r.flags             = rd.u32();
         return r;
     }
 };
 static_assert(ScanoutClientPresentPayload::kSize == 20,
-              "ScanoutClientPresentPayload size mismatch with hand-counted layout");
+              "ScanoutClientPresentPayload kSize does not match its encoded layout");
 
 // ScanoutClientFlipPayload (gpu -> core; FrameKind::ScanoutClientFlip):
 // a page flip involving client scanout completed. latchedBufferId = the
@@ -1119,26 +1183,28 @@ struct ScanoutClientFlipPayload {
     uint32_t tvNsec;
     static constexpr size_t kSize = 4 * 4 + 8 + 4;  // 28
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  outputId);
-        putU32LE(out + 4,  latchedBufferId);
-        putU32LE(out + 8,  retiredBufferId);
-        putU32LE(out + 12, seq);
-        putU64LE(out + 16, tvSec);
-        putU32LE(out + 24, tvNsec);
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(latchedBufferId);
+        w.u32(retiredBufferId);
+        w.u32(seq);
+        w.u64(tvSec);
+        w.u32(tvNsec);
     }
     static ScanoutClientFlipPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         ScanoutClientFlipPayload r{};
-        r.outputId        = getU32LE(p + 0);
-        r.latchedBufferId = getU32LE(p + 4);
-        r.retiredBufferId = getU32LE(p + 8);
-        r.seq             = getU32LE(p + 12);
-        r.tvSec           = getU64LE(p + 16);
-        r.tvNsec          = getU32LE(p + 24);
+        r.outputId        = rd.u32();
+        r.latchedBufferId = rd.u32();
+        r.retiredBufferId = rd.u32();
+        r.seq             = rd.u32();
+        r.tvSec           = rd.u64();
+        r.tvNsec          = rd.u32();
         return r;
     }
 };
 static_assert(ScanoutClientFlipPayload::kSize == 28,
-              "ScanoutClientFlipPayload size mismatch with hand-counted layout");
+              "ScanoutClientFlipPayload kSize does not match its encoded layout");
 
 // ScanoutClientRejectPayload (gpu -> core; FrameKind::ScanoutClientReject):
 // AddFB2 / atomic TEST refused this buffer on this output; the core
@@ -1148,18 +1214,20 @@ struct ScanoutClientRejectPayload {
     uint32_t bufferId;
     static constexpr size_t kSize = 2 * 4;  // 8
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, outputId);
-        putU32LE(out + 4, bufferId);
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(bufferId);
     }
     static ScanoutClientRejectPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         ScanoutClientRejectPayload r{};
-        r.outputId = getU32LE(p + 0);
-        r.bufferId = getU32LE(p + 4);
+        r.outputId = rd.u32();
+        r.bufferId = rd.u32();
         return r;
     }
 };
 static_assert(ScanoutClientRejectPayload::kSize == 8,
-              "ScanoutClientRejectPayload size mismatch with hand-counted layout");
+              "ScanoutClientRejectPayload kSize does not match its encoded layout");
 
 // ScanoutFormatsPayload (gpu -> core; FrameKind::ScanoutFormats): the
 // dmabuf-feedback format-table indices whose (fourcc, modifier) the named
@@ -1170,23 +1238,20 @@ struct ScanoutFormatsPayload {
     std::vector<uint16_t> indices;
     size_t encodedSize() const { return 8 + indices.size() * 2; }
     void encode(uint8_t* out) const {
-        putU32LE(out + 0, outputId);
-        putU32LE(out + 4, static_cast<uint32_t>(indices.size()));
-        for (size_t i = 0; i < indices.size(); ++i) {
-            out[8 + i * 2]     = static_cast<uint8_t>(indices[i] & 0xff);
-            out[8 + i * 2 + 1] = static_cast<uint8_t>(indices[i] >> 8);
-        }
+        ByteWriter w(out);
+        w.u32(outputId);
+        w.u32(static_cast<uint32_t>(indices.size()));
+        for (uint16_t idx : indices) w.u16(idx);
+        assert(w.offset() == encodedSize());
     }
     static bool decode(const uint8_t* p, size_t len, ScanoutFormatsPayload& out) {
         if (len < 8) return false;
-        out.outputId = getU32LE(p + 0);
-        const uint32_t count = getU32LE(p + 4);
+        ByteReader rd(p);
+        out.outputId = rd.u32();
+        const uint32_t count = rd.u32();
         if (len != 8 + static_cast<size_t>(count) * 2) return false;
         out.indices.resize(count);
-        for (uint32_t i = 0; i < count; ++i) {
-            out.indices[i] = static_cast<uint16_t>(
-                p[8 + i * 2] | (p[8 + i * 2 + 1] << 8));
-        }
+        for (uint32_t i = 0; i < count; ++i) out.indices[i] = rd.u16();
         return true;
     }
 };
@@ -1207,29 +1272,32 @@ struct AllocShmTexPayload {
     WireHandle device;
     static constexpr size_t kSize = 4 * 4 + 2 * 8;  // 32
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  surfaceId);
-        putU32LE(out + 4,  width);
-        putU32LE(out + 8,  height);
-        putU32LE(out + 12, 0);
-        putU32LE(out + 16, texture.id);
-        putU32LE(out + 20, texture.generation);
-        putU32LE(out + 24, device.id);
-        putU32LE(out + 28, device.generation);
+        ByteWriter w(out);
+        w.u32(surfaceId);
+        w.u32(width);
+        w.u32(height);
+        w.u32(0);
+        w.u32(texture.id);
+        w.u32(texture.generation);
+        w.u32(device.id);
+        w.u32(device.generation);
     }
     static AllocShmTexPayload decode(const uint8_t* p) {
+        ByteReader rd(p);
         AllocShmTexPayload r{};
-        r.surfaceId          = getU32LE(p + 0);
-        r.width              = getU32LE(p + 4);
-        r.height             = getU32LE(p + 8);
-        r.texture.id         = getU32LE(p + 16);
-        r.texture.generation = getU32LE(p + 20);
-        r.device.id          = getU32LE(p + 24);
-        r.device.generation  = getU32LE(p + 28);
+        r.surfaceId          = rd.u32();
+        r.width              = rd.u32();
+        r.height             = rd.u32();
+        rd.skip(4);
+        r.texture.id         = rd.u32();
+        r.texture.generation = rd.u32();
+        r.device.id          = rd.u32();
+        r.device.generation  = rd.u32();
         return r;
     }
 };
 static_assert(AllocShmTexPayload::kSize == 32,
-              "AllocShmTexPayload size mismatch with hand-counted layout");
+              "AllocShmTexPayload kSize does not match its encoded layout");
 
 // ShmUploadPayload (core -> gpu; FrameKind::ShmUpload):
 // upload a committed shm region into a previously-AllocShmTex'd
@@ -1266,46 +1334,46 @@ struct ShmUploadPayload {
         return kHeaderSize + damage.size() * DamageRect::kSize;
     }
     void encode(uint8_t* out) const {
-        putU32LE(out + 0,  surfaceId);
-        putU32LE(out + 4,  uploadSeq);
-        putU32LE(out + 8,  poolId);
-        putU32LE(out + 12, 0);
-        putU64LE(out + 16, offset);
-        putU32LE(out + 24, width);
-        putU32LE(out + 28, height);
-        putU32LE(out + 32, stride);
-        putU32LE(out + 36, static_cast<uint32_t>(damage.size()));
-        size_t off = 40;
+        ByteWriter w(out);
+        w.u32(surfaceId);
+        w.u32(uploadSeq);
+        w.u32(poolId);
+        w.u32(0);
+        w.u64(offset);
+        w.u32(width);
+        w.u32(height);
+        w.u32(stride);
+        w.u32(static_cast<uint32_t>(damage.size()));
         for (const DamageRect& r : damage) {
-            putI32LE(out + off + 0,  r.x);
-            putI32LE(out + off + 4,  r.y);
-            putU32LE(out + off + 8,  r.w);
-            putU32LE(out + off + 12, r.h);
-            off += DamageRect::kSize;
+            w.i32(r.x);
+            w.i32(r.y);
+            w.u32(r.w);
+            w.u32(r.h);
         }
+        assert(w.offset() == encodedSize());
     }
     static bool decode(const uint8_t* p, size_t len, ShmUploadPayload& out) {
         if (len < kHeaderSize) return false;
-        out.surfaceId = getU32LE(p + 0);
-        out.uploadSeq = getU32LE(p + 4);
-        out.poolId    = getU32LE(p + 8);
-        out.offset    = getU64LE(p + 16);
-        out.width     = getU32LE(p + 24);
-        out.height    = getU32LE(p + 28);
-        out.stride    = getU32LE(p + 32);
-        const uint32_t count = getU32LE(p + 36);
+        ByteReader rd(p);
+        out.surfaceId = rd.u32();
+        out.uploadSeq = rd.u32();
+        out.poolId    = rd.u32();
+        rd.skip(4);
+        out.offset    = rd.u64();
+        out.width     = rd.u32();
+        out.height    = rd.u32();
+        out.stride    = rd.u32();
+        const uint32_t count = rd.u32();
         if (len != kHeaderSize + count * DamageRect::kSize) return false;
         out.damage.clear();
         out.damage.reserve(count);
-        size_t off = kHeaderSize;
         for (uint32_t i = 0; i < count; ++i) {
             DamageRect r{};
-            r.x = getI32LE(p + off + 0);
-            r.y = getI32LE(p + off + 4);
-            r.w = getU32LE(p + off + 8);
-            r.h = getU32LE(p + off + 12);
+            r.x = rd.i32();
+            r.y = rd.i32();
+            r.w = rd.u32();
+            r.h = rd.u32();
             out.damage.push_back(r);
-            off += DamageRect::kSize;
         }
         return true;
     }
@@ -1319,15 +1387,13 @@ struct ShmUploadPayload {
 struct ShmUploadedPayload {
     uint32_t uploadSeq;
     static constexpr size_t kSize = 4;
-    void encode(uint8_t* out) const {
-        putU32LE(out + 0, uploadSeq);
-    }
+    void encode(uint8_t* out) const { putU32LE(out, uploadSeq); }
     static ShmUploadedPayload decode(const uint8_t* p) {
-        return { getU32LE(p + 0) };
+        return { getU32LE(p) };
     }
 };
 static_assert(ShmUploadedPayload::kSize == 4,
-              "ShmUploadedPayload size mismatch with hand-counted layout");
+              "ShmUploadedPayload kSize does not match its encoded layout");
 
 }  // namespace overdraw::ipc
 
