@@ -7,8 +7,9 @@
 //   * core six invariants (mirroring the spec list 1..6)
 //   * #7 producer-consumer fence self-chain
 //   * #8 destroyed-mid-flight
-//   * #9 syncobj acquire fence throws (not stubbed -- the asserted-not-implemented
-//     decision)
+//   * #9 acquire-fence ownership (consume-once, replace-with-discard,
+//     discard-on-teardown, takeAcquireFence) + syncobj throws (not stubbed --
+//     the asserted-not-implemented decision)
 //   * frame contract (frameAborted, frameStart-twice, etc.)
 //   * accessFailed: poisons and recovers via supersede
 //   * fuzz: 1000 valid random sequences, all invariants hold after every step
@@ -535,6 +536,131 @@ test("#9: syncobj rejection is at intent-emission, not at acquireFenceAvailable 
   const f = runFrame(m, [1], 1);
   const b = pick(f, "beginAccess")[0];
   assert.deepEqual(b.acquireFence, sfFence(7777));
+});
+
+// Acquire-fence ownership (invariant 9) -------------------------------------
+// The machine owns the fence lifecycle: consume-once via beginAccess (or
+// takeAcquireFence), replace-with-discard, discard-on-teardown. The executor
+// only closes fds when told (discardAcquireFence).
+
+test("fence: consumed exactly once on the first sample; re-sample of unchanged buffer carries none", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
+  const f1 = runFrame(m, [1], 1);
+  assert.deepEqual(pick(f1, "beginAccess")[0].acquireFence, sfFence(9001));
+  m.step({ kind: "endAccessFenceExported", bufferId: 100, fence: sfFence(1) });
+  m.step({ kind: "gpuCompleted", serial: 1 });
+  // No re-commit, no fresh fence: the next sample of the same buffer must
+  // carry none (the first sample already waited the client's writes).
+  const f2 = runFrame(m, [1], 2);
+  assert.deepEqual(pick(f2, "beginAccess")[0].acquireFence, noFence);
+});
+
+test("fence: same-buffer re-commit discards the stale pending fence (old fence in the intent)", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
+  // Re-commit before any sample; the new commit's fence replaces the old one.
+  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  const i = m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9002) });
+  const d = pick(i, "discardAcquireFence");
+  assert.equal(d.length, 1, "stale fence handed back for close");
+  assert.equal(d[0].bufferId, 100);
+  assert.deepEqual(d[0].fence, sfFence(9001), "the OLD fence is discarded");
+  // The sample carries the NEW fence, exactly once.
+  const f = runFrame(m, [1], 1);
+  assert.deepEqual(pick(f, "beginAccess")[0].acquireFence, sfFence(9002));
+});
+
+test("fence: a fence-less re-commit leaves the pending fence armed (no discard, next sample carries it)", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
+  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  const i = m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: noFence });
+  assert.equal(pick(i, "discardAcquireFence").length, 0);
+  const f = runFrame(m, [1], 1);
+  assert.deepEqual(pick(f, "beginAccess")[0].acquireFence, sfFence(9001));
+});
+
+test("fence: bufferDestroyed with a pending fence emits discardAcquireFence", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
+  const i = m.step({ kind: "bufferDestroyed", bufferId: 100 });
+  const d = pick(i, "discardAcquireFence");
+  assert.equal(d.length, 1);
+  assert.deepEqual(d[0].fence, sfFence(9001));
+  assert.equal(pick(i, "releaseImport").length, 1, "teardown proceeds normally");
+  assert.equal(m.snapshot().buffers.length, 0);
+});
+
+test("fence: destroyed mid-flight defers the discard to the drain (with releaseImport)", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  runFrame(m, [1], 1);
+  // A fresh commit's fence arrives while frame 1 is on the GPU.
+  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
+  const i1 = m.step({ kind: "bufferDestroyed", bufferId: 100 });
+  assert.equal(pick(i1, "discardAcquireFence").length, 0, "deferred until drain");
+  const i2 = m.step({ kind: "gpuCompleted", serial: 1 });
+  const d = pick(i2, "discardAcquireFence");
+  assert.equal(d.length, 1);
+  assert.deepEqual(d[0].fence, sfFence(9001));
+  assert.equal(pick(i2, "releaseImport").length, 1);
+});
+
+test("fence: surfaceRemoved drain with a pending fence emits discardAcquireFence", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
+  const i = m.step({ kind: "surfaceRemoved", surfaceId: 1 });
+  const d = pick(i, "discardAcquireFence");
+  assert.equal(d.length, 1);
+  assert.deepEqual(d[0].fence, sfFence(9001));
+  assert.equal(pick(i, "sendWlRelease").length, 1);
+  assert.equal(pick(i, "releaseImport").length, 1);
+  assert.equal(m.isEmpty(), true);
+});
+
+test("fence: never crosses buffers (old buffer's sample does not consume the new buffer's fence)", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  // Surface 2 gets buffer 200 with a fence; surface 1's buffer 100 has none.
+  commitImported(m, 2, 200, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 200, fence: sfFence(9002) });
+  const f = runFrame(m, [1, 2], 1);
+  const b100 = pick(f, "beginAccess", (x) => x.bufferId === 100)[0];
+  const b200 = pick(f, "beginAccess", (x) => x.bufferId === 200)[0];
+  assert.deepEqual(b100.acquireFence, noFence, "buffer 100 has no fence to carry");
+  assert.deepEqual(b200.acquireFence, sfFence(9002), "buffer 200 carries its own");
+});
+
+test("fence: takeAcquireFence consumes the pending fence out-of-frame; the next beginAccess carries none", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
+  // An out-of-frame sampler (freeze snapshot / intercept bracket / scanout
+  // present) wins the race for the fence.
+  assert.deepEqual(m.takeAcquireFence(100), sfFence(9001));
+  assert.deepEqual(m.takeAcquireFence(100), noFence, "consume-once");
+  const f = runFrame(m, [1], 1);
+  assert.deepEqual(pick(f, "beginAccess")[0].acquireFence, noFence);
+  // Unknown buffer: nothing pending.
+  assert.deepEqual(m.takeAcquireFence(999), noFence);
+});
+
+test("fence: syncobj throws on takeAcquireFence too (no silent degrade on out-of-frame samplers)", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({
+    kind: "acquireFenceAvailable", bufferId: 100,
+    fence: { kind: "syncobj", handle: 42, point: 7n },
+  });
+  assert.throws(() => m.takeAcquireFence(100),
+    /syncobj acquire fence not implemented/);
 });
 
 // Frame contract ------------------------------------------------------------

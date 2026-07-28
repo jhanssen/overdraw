@@ -439,6 +439,7 @@ const TRANSITION_KIND_CODE: Record<TransitionKind, number> = {
 };
 import {
   ClientBufferLifecycle,
+  type AcquireFence,
   type LifecycleIntent,
 } from "./client-buffer-lifecycle.js";
 
@@ -1122,9 +1123,12 @@ export class JsCompositor implements CompositorSink {
 
   // dmabuf buffer-release lifecycle. The pure state machine (no GPU, no Dawn)
   // is the source of truth; the executor here translates events <-> intents.
-  // See src/gpu/client-buffer-lifecycle.ts for the rules; the design is in
-  // docs/client-buffer-lifecycle.md.
-  private lifecycle = new ClientBufferLifecycle();
+  // The machine also owns the acquire-fence bookkeeping (consume-once,
+  // replace-with-discard, discard-on-teardown); it treats the fd as an opaque
+  // token, so it is instantiated with WaylandFd and the executor keeps all
+  // close/ownership side effects. See src/gpu/client-buffer-lifecycle.ts for
+  // the rules; the design is in docs/client-buffer-lifecycle.md.
+  private lifecycle = new ClientBufferLifecycle<WaylandFd>();
   // Per-bufferId cached GPU import. Populated when an importBuffer intent's
   // async addon callback resolves; cleared by releaseImport. Cache lifetime is
   // the wl_buffer lifetime (rule A): cycling clients hit cache on re-attach.
@@ -1148,22 +1152,6 @@ export class JsCompositor implements CompositorSink {
   // calls on the same commit cycle replace the prior point.
   private bufferIdToSyncobjRelease = new Map<
     number, { handle: number; pointHi: number; pointLo: number }>();
-
-  // wp_linux_drm_syncobj_v1 acquire-fence handoff: bufferId -> the sync_file
-  // exported from the most recent commit's acquire timeline point. Consumed by
-  // openImportBrackets the FIRST time we sample that bufferId; on subsequent
-  // samples of the same buffer (kitty re-renders the same buffer across blink
-  // toggles) the implicit-sync fallback engages, which is correct -- the
-  // client signaled their writes when the FIRST acquire point fired; nothing
-  // else is pending on that dmabuf until the buffer is re-committed.
-  //
-  // Keyed by bufferId (not surfaceId) because the fence is paired with the
-  // specific buffer it accompanies. A surface that's still presenting an OLD
-  // buffer while the NEW buffer's import is in flight must NOT consume the
-  // new buffer's fence on its sample of the old one -- that's the
-  // every-third-present bug.
-  private bufferIdToAcquireFenceFd = new Map<
-    number, import("../types.js").WaylandFd>();
 
   // Submit-serial bookkeeping. completedSerial is what onSubmittedWorkDone
   // turns into gpuCompleted(serial) events; both also drive afterCurrentFrame.
@@ -1925,8 +1913,12 @@ export class JsCompositor implements CompositorSink {
     const snap = this.acquireSnapTex(w, h);
     // Standalone bracketed submit: open the client import's access bracket,
     // render the surface filling the snapshot (its crop/transform apply), close
-    // the bracket. FIFO-ordered on the wire like any other sample.
-    if (!this.beginClientAccess(s.currentBufferId, imp.importId)) {
+    // the bracket. FIFO-ordered on the wire like any other sample. This runs
+    // outside the lifecycle frame flow, so it takes the buffer's pending
+    // acquire fence directly -- carrying it if this bracket is the first
+    // sample since the commit, per the machine's consume-once rule.
+    if (!this.beginClientAccess(imp.importId,
+        this.lifecycle.takeAcquireFence(s.currentBufferId))) {
       this.releaseSnapTex(snap);
       return;
     }
@@ -2518,20 +2510,6 @@ export class JsCompositor implements CompositorSink {
       surf.pendingContentDamage = null;
     }
 
-    // wp_linux_drm_syncobj_v1: stash the explicit-sync acquire fence keyed by
-    // BUFFER (not surface). openImportBrackets consumes the fence the first
-    // time it samples this bufferId; on re-samples of the same buffer the
-    // implicit fallback engages (which is correct: the client signaled their
-    // writes on the first acquire point; subsequent samples are read-only on
-    // an unchanged dmabuf). Replacing a stale fence for the same bufferId is
-    // the legitimate case where a client commits the same buffer twice with
-    // two acquire points -- the newer one wins; close the older one.
-    if (acquireFenceFd) {
-      const prev = this.bufferIdToAcquireFenceFd.get(bufferId);
-      if (prev && !prev.closed) { try { prev.close(); } catch { /* */ } }
-      this.bufferIdToAcquireFenceFd.set(bufferId, acquireFenceFd);
-    }
-
     // Stash the descriptor BEFORE the commit event: if the lifecycle emits an
     // importBuffer intent, the intent handler reads dmabufPending to find the
     // descriptor. (The lifecycle keeps the rules; the executor keeps the GPU
@@ -2550,17 +2528,23 @@ export class JsCompositor implements CompositorSink {
       pending.pendingInstalls.push(id);
     }
 
-    // Feed the lifecycle. It emits importBuffer (cache miss) or nothing (cache
-    // hit / same-buffer re-commit). The acquireFenceAvailable event is a stub
-    // in Layer B: `kind: "none"` until Layer C re-exports the dmabuf sync_file
-    // per commit. (Today the GPU process exports the sync_file at import time
-    // and feeds it into the single BeginAccess at import, which is the bug
-    // Layer C fixes; Layer B leaves the existing behavior untouched.)
+    // Feed the lifecycle. The commit emits importBuffer (cache miss) or
+    // nothing (cache hit / same-buffer re-commit).
     this.dispatch(this.lifecycle.step({
       kind: "commit", surfaceId: id, bufferId, dims: { w, h },
     }));
+    // wp_linux_drm_syncobj_v1: the explicit-sync acquire fence (already
+    // materialized to a sync_file by the protocol layer) is handed to the
+    // machine, which keys it by BUFFER (not surface) and owns its
+    // consume-once / replace / teardown bookkeeping. A surface still
+    // presenting an OLD buffer while the NEW buffer's import is in flight
+    // must not consume the new buffer's fence on its sample of the old one.
+    // If this commit's fence replaces a still-pending one, the machine emits
+    // discardAcquireFence and the dispatch below closes the stale fd.
     this.dispatch(this.lifecycle.step({
-      kind: "acquireFenceAvailable", bufferId, fence: { kind: "none" },
+      kind: "acquireFenceAvailable", bufferId,
+      fence: acquireFenceFd ? { kind: "syncFile", fd: acquireFenceFd }
+                            : { kind: "none" },
     }));
 
     // Cache hit: the lifecycle did NOT emit importBuffer, and we already have
@@ -2651,14 +2635,12 @@ export class JsCompositor implements CompositorSink {
   }
 
   // Run the intents the lifecycle just emitted. The executor is intentionally
-  // dumb: it has no policy of its own. Layer B implements importBuffer +
-  // releaseImport + sendWlRelease; beginAccess + endAccess are stubs filled in
-  // by Layer C (the cross-process per-frame Begin/End bracket).
-  private dispatch(intents: LifecycleIntent[]): void {
+  // dumb: it has no policy of its own.
+  private dispatch(intents: LifecycleIntent<WaylandFd>[]): void {
     for (const i of intents) this.runIntent(i);
   }
 
-  private runIntent(intent: LifecycleIntent): void {
+  private runIntent(intent: LifecycleIntent<WaylandFd>): void {
     switch (intent.kind) {
       case "importBuffer": this.runImportBuffer(intent.bufferId); break;
       case "releaseImport": this.runReleaseImport(intent.bufferId); break;
@@ -2676,15 +2658,25 @@ export class JsCompositor implements CompositorSink {
         }
         break;
       }
+      case "discardAcquireFence": {
+        // The machine dropped a pending acquire fence (replaced by a newer
+        // commit's, or its buffer tore down before any sample carried it).
+        // The fd is executor-owned; close it here.
+        const f = intent.fence;
+        if (f.kind === "syncFile" && !f.fd.closed) {
+          try { f.fd.close(); } catch { /* already closed */ }
+        }
+        break;
+      }
       case "beginAccess":
       case "endAccess":
-        // The actual GPU-process BeginAccess/EndAccess are written in-band in
-        // renderFrame() (writeBeginAccess before the sample, writeEndAccess
-        // after the submit). They are not driven from here: renderFrame writes
-        // the Begin frame and only THEN feeds frameSampled, so the lifecycle
-        // intents are informational. They record the LOGICAL contract the unit
-        // tests verify (alternation, chain-fence threading), while the wire
-        // frames enforce the actual GPU-side bracket ordering.
+        // The wire BeginAccess/EndAccess are written in-band: openImportBrackets
+        // steps frameSampled and immediately translates the returned beginAccess
+        // intent (including its acquire fence) into the Begin write, and
+        // closeImportBrackets writes the Ends after the submit. Nothing to do
+        // here; the intents reaching this dispatch record the LOGICAL contract
+        // the unit tests verify (alternation, chain-fence threading), while the
+        // wire frames enforce the actual GPU-side bracket ordering.
         break;
     }
   }
@@ -2784,14 +2776,9 @@ export class JsCompositor implements CompositorSink {
     // waiting on the point.) Without this, the map leaks one entry per
     // destroyed buffer over the run.
     this.bufferIdToSyncobjRelease.delete(bufferId);
-    // Same for any pending acquire fence stashed for a buffer that never got
-    // sampled (e.g. the surface tore down before the import resolved). Close
-    // the fence fd so we do not leak it.
-    const stale = this.bufferIdToAcquireFenceFd.get(bufferId);
-    if (stale) {
-      if (!stale.closed) { try { stale.close(); } catch { /* */ } }
-      this.bufferIdToAcquireFenceFd.delete(bufferId);
-    }
+    // (An acquire fence still pending at teardown arrives as a
+    // discardAcquireFence intent alongside this releaseImport; runIntent
+    // closes the fd there.)
     // Native release: drops the server-side STM + texture + dmabuf fd.
     if (imp.importId !== 0) this.addon.releaseDmabufImport(imp.importId);
     // A destroyed buffer's scanout veto entries are moot; drop them.
@@ -3377,27 +3364,27 @@ export class JsCompositor implements CompositorSink {
     this.device.queue.writeBuffer(s.uniformBuf, 0, data);
   }
 
-  // Open the import's access bracket, consuming the buffer's pending
-  // explicit-sync acquire fence if one is stashed.
+  // Open the import's access bracket, translating the acquire fence the
+  // lifecycle handed out (a beginAccess intent's acquireFence, or a
+  // takeAcquireFence result on the out-of-frame sampler paths).
   //
-  // wp_linux_drm_syncobj_v1: when the most recent commit carried an acquire
-  // fence, hand it to the GPU process via writeBeginAccessWithFence -- it
-  // waits on THAT sync_file instead of running EXPORT_SYNC_FILE on the
-  // dmabuf (the implicit-sync path). Clients on drivers that don't attach
-  // implicit fences (NVIDIA proprietary, incl. Xwayland/glamor) are
-  // unsynchronized without this wait: sampling races the client's GPU
-  // writes and reads stale or never-written (transparent) content.
+  // wp_linux_drm_syncobj_v1: a syncFile fence rides
+  // writeBeginAccessWithFence -- the GPU process waits on THAT sync_file
+  // instead of running EXPORT_SYNC_FILE on the dmabuf (the implicit-sync
+  // path). Clients on drivers that don't attach implicit fences (NVIDIA
+  // proprietary, incl. Xwayland/glamor) are unsynchronized without this
+  // wait: sampling races the client's GPU writes and reads stale or
+  // never-written (transparent) content.
   //
-  // The fence is one-shot per commit: once one Begin waits on it, later
-  // samples of the same buffer chain on the GPU process's access-fence
-  // sequence; nothing writes the dmabuf again until the client re-commits.
-  // EVERY path that samples a client dmabuf must Begin through here so the
-  // wait happens on whichever sample runs first after the commit.
-  private beginClientAccess(bufferId: number, importId: number): boolean {
-    const fenceFd = this.bufferIdToAcquireFenceFd.get(bufferId);
-    if (fenceFd && !fenceFd.closed) {
-      this.bufferIdToAcquireFenceFd.delete(bufferId);
-      return this.addon.writeBeginAccessWithFence(importId, fenceFd);
+  // The machine hands each commit's fence out exactly once (to whichever
+  // sampler runs first after the commit); later samples of the same buffer
+  // arrive here with kind "none" and chain on the GPU process's
+  // access-fence sequence -- nothing writes the dmabuf again until the
+  // client re-commits. Syncobj fences never reach here: the machine throws
+  // rather than handing one out.
+  private beginClientAccess(importId: number, fence: AcquireFence<WaylandFd>): boolean {
+    if (fence.kind === "syncFile" && !fence.fd.closed) {
+      return this.addon.writeBeginAccessWithFence(importId, fence.fd);
     }
     return this.addon.writeBeginAccess(importId);
   }
@@ -3415,20 +3402,19 @@ export class JsCompositor implements CompositorSink {
   // `tickleLifecycle` (default true) drives the per-buffer lifecycle's
   // frameSampled event. The on-screen renderFrame wraps these calls in a
   // matching frameStart/submitted pair, so the lifecycle's begin/end
-  // alternation is intact. Snapshot callers (composeSnapshot via
-  // composeOutput/composeRegion, capture frames) do NOT run inside a
-  // lifecycle frame; the comment above composeSnapshot explicitly says
-  // the lifecycle state machine is not driven by snapshots, so they pass
-  // false to skip the lifecycle dispatch. The WIRE-level Begin/End is
-  // still written (snapshot dmabuf samples still need bracketing on the
-  // GPU process side; that's what the dedupe + writeBeginAccess/EndAccess
-  // do), but the JS-side lifecycle bookkeeping is bypassed so a snapshot
-  // taken outside a renderFrame doesn't trip "frameSampled without
-  // frameStart". Without this gate a snapshot pre-existing renderFrame
-  // wrote Begin to the wire, then threw inside lifecycle.step before the
-  // bracketed[] entry was pushed, leaving a wire bracket open with no End
-  // pairing -- which the GPU process detected on the next renderFrame's
-  // Begin as "bracket already open" and aborted.
+  // alternation is intact, and the beginAccess intent frameSampled returns
+  // carries the buffer's pending acquire fence for THIS bracket's Begin
+  // write. The lifecycle step runs BEFORE the wire write, so a contract
+  // throw from the machine leaves no dangling wire bracket. Snapshot
+  // callers (composeSnapshot via composeOutput/composeRegion, capture
+  // frames) do NOT run inside a lifecycle frame; the comment above
+  // composeSnapshot explicitly says the lifecycle state machine is not
+  // driven by snapshots, so they pass false to skip the frameSampled
+  // dispatch (which would trip "frameSampled without frameStart") and
+  // instead take the pending acquire fence directly. The WIRE-level
+  // Begin/End is still written either way -- snapshot dmabuf samples still
+  // need bracketing on the GPU process side; that's what the dedupe +
+  // writeBeginAccess/EndAccess do.
   private openImportBrackets(
     drawList: number[],
     bracketed: Array<{ importId: number; bufferId: number }>,
@@ -3454,21 +3440,35 @@ export class JsCompositor implements CompositorSink {
       // surface in this list) gets one Begin per frame. The GPU process's
       // ClientTex.accessOpen invariant forbids two Begins without an End.
       if (bracketed.some((b) => b.importId === imp.importId)) continue;
+      // Resolve this bracket's acquire fence through the machine: in the
+      // frame flow the frameSampled step hands it out on the beginAccess
+      // intent; snapshot callers take it directly. Either way the machine's
+      // consume-once rule decides whether THIS bracket carries the commit's
+      // fence (whichever sampler runs first after the commit wins).
+      let fence: AcquireFence<WaylandFd> = { kind: "none" };
+      if (tickleLifecycle) {
+        const intents = this.lifecycle.step({ kind: "frameSampled", surfaceId: id });
+        for (const i of intents) {
+          if (i.kind === "beginAccess" && i.bufferId === s.currentBufferId) {
+            fence = i.acquireFence;
+          }
+        }
+        this.dispatch(intents);
+      } else {
+        fence = this.lifecycle.takeAcquireFence(s.currentBufferId);
+      }
       // The dmabufImports gate above already proved the import is live (its
       // handle was installed only after the GPU process applied the inject).
       // writeBeginAccess therefore must succeed; a false return means the
       // JS-side import gate and the core's jsImportHandles_ map have desynced
       // -- a contract violation, not a recoverable per-frame condition.
-      const beginOk = this.beginClientAccess(s.currentBufferId, imp.importId);
+      const beginOk = this.beginClientAccess(imp.importId, fence);
       if (!beginOk) {
         throw new Error(
           `writeBeginAccess returned false for live import ` +
           `(bufferId=${s.currentBufferId}, importId=${imp.importId}): ` +
           `dmabufImports gate / core handle map desync`,
         );
-      }
-      if (tickleLifecycle) {
-        this.dispatch(this.lifecycle.step({ kind: "frameSampled", surfaceId: id }));
       }
       bracketed.push({ importId: imp.importId, bufferId: s.currentBufferId });
     }
@@ -3903,11 +3903,11 @@ export class JsCompositor implements CompositorSink {
   // offscreen target (read via readback()).
   //
   // Lifecycle wiring: frameStart at top; frameSampled per drawn dmabuf
-  // surface (drives Layer C's per-frame BeginAccess); submitted after
-  // queue.submit (drives EndAccess); gpuCompleted on onSubmittedWorkDone
-  // (drives release intents). The early-return paths emit frameAborted so
-  // the lifecycle's open begin is rolled back without leaving a dangling
-  // access bracket.
+  // surface (its beginAccess intent supplies the per-frame Begin's acquire
+  // fence); submitted after queue.submit (drives EndAccess); gpuCompleted on
+  // onSubmittedWorkDone (drives release intents). The early-return paths
+  // emit frameAborted so the lifecycle's open begin is rolled back without
+  // leaving a dangling access bracket.
   renderFrame(): void {
     let frameOpen = false;
 
@@ -4597,7 +4597,13 @@ export class JsCompositor implements CompositorSink {
       // the import will be live.
       return false;
     }
-    if (!this.beginClientAccess(s.currentBufferId, imp.importId)) return false;
+    // While an intercept is active, the on-screen pass samples the intercept
+    // output and skips the client import entirely (openImportBrackets), so
+    // THIS bracket is the buffer's first sampler after a commit and carries
+    // the commit's acquire fence. It runs outside the lifecycle frame flow;
+    // take the fence directly.
+    if (!this.beginClientAccess(imp.importId,
+        this.lifecycle.takeAcquireFence(s.currentBufferId))) return false;
     try {
       fn();
     } finally {
@@ -5046,13 +5052,14 @@ export class JsCompositor implements CompositorSink {
     log.info("core", `scanout: output ${outputId} ineligible: ${reason}`);
   }
 
-  // Consume the buffer's stashed explicit-sync acquire fence for a scanout
-  // present (the role wire-BeginAccess plays on the composite path).
+  // Consume the buffer's pending explicit-sync acquire fence for a scanout
+  // present (the role wire-BeginAccess plays on the composite path). A
+  // scanned-out buffer is never GPU-sampled -- the composite pass is skipped
+  // for its output -- so this present is the fence's sole consumer.
   private takeScanoutAcquireFence(bufferId: number): WaylandFd | null {
-    const f = this.bufferIdToAcquireFenceFd.get(bufferId);
-    if (!f) return null;
-    this.bufferIdToAcquireFenceFd.delete(bufferId);
-    return f.closed ? null : f;
+    const f = this.lifecycle.takeAcquireFence(bufferId);
+    if (f.kind !== "syncFile" || f.fd.closed) return null;
+    return f.fd;
   }
 
   // ScanoutClientFlip from the GPU process: latch bookkeeping + the

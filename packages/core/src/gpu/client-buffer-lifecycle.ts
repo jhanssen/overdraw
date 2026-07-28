@@ -34,22 +34,35 @@
 //      (Dawn's per-access fence chaining).
 //   8. bufferDestroyed never produces sendWlRelease for that B; releaseImport
 //      still fires once in-flight frames complete.
-//   9. Syncobj acquire fences are UNIMPLEMENTED: emitting a beginAccess that
-//      would carry one THROWS. No silent degrade to "no acquire" (that would
-//      reintroduce the black-frame bug for explicit-sync clients).
+//   9. The machine owns the acquire-fence lifecycle. A syncFile fence fed via
+//      acquireFenceAvailable is held as B's pending fence and leaves the
+//      machine through exactly ONE of: the first beginAccess intent that
+//      samples B after the commit (consume-once; later samples carry
+//      "none"), a takeAcquireFence(B) call from an out-of-frame sampler, or
+//      a discardAcquireFence intent (the executor closes the fd) when a
+//      newer fence replaces a still-pending one or teardown (bufferDestroyed
+//      / surfaceRemoved drain) deletes B with a fence still pending. A fence
+//      never crosses buffers. Syncobj acquire fences are UNIMPLEMENTED:
+//      carrying one out of the machine THROWS -- no silent degrade to "no
+//      acquire" (that would reintroduce the black-frame bug for
+//      explicit-sync clients).
+//
+// The syncFile fd is an opaque token to the machine (type parameter Fd;
+// defaults to number so the tests stay plain). The executor instantiates
+// Fd = WaylandFd and keeps all close/ownership side effects to itself.
 
-export type AcquireFence =
+export type AcquireFence<Fd = number> =
   | { kind: "none" }
-  | { kind: "syncFile"; fd: number }
+  | { kind: "syncFile"; fd: Fd }
   | { kind: "syncobj"; handle: number; point: bigint };
 
 export type ReleaseFence =
   | { kind: "none" }
   | { kind: "syncFile"; fd: number };
 
-export type LifecycleEvent =
+export type LifecycleEvent<Fd = number> =
   | { kind: "commit"; surfaceId: number; bufferId: number; dims: { w: number; h: number } }
-  | { kind: "acquireFenceAvailable"; bufferId: number; fence: AcquireFence }
+  | { kind: "acquireFenceAvailable"; bufferId: number; fence: AcquireFence<Fd> }
   | { kind: "frameStart" }
   | { kind: "frameSampled"; surfaceId: number }
   | { kind: "frameAborted" }
@@ -73,13 +86,17 @@ export type LifecycleEvent =
   | { kind: "scanoutPresented"; bufferId: number }
   | { kind: "scanoutRetired"; bufferId: number };
 
-export type LifecycleIntent =
+export type LifecycleIntent<Fd = number> =
   | { kind: "importBuffer"; bufferId: number; surfaceId: number; dims: { w: number; h: number } }
   | { kind: "beginAccess"; bufferId: number; surfaceId: number;
-      acquireFence: AcquireFence; chainFence: ReleaseFence }
+      acquireFence: AcquireFence<Fd>; chainFence: ReleaseFence }
   | { kind: "endAccess"; bufferId: number; surfaceId: number }
   | { kind: "releaseImport"; bufferId: number }
-  | { kind: "sendWlRelease"; bufferId: number };
+  | { kind: "sendWlRelease"; bufferId: number }
+  // The pending acquire fence will never be carried by a beginAccess: it was
+  // replaced by a newer commit's fence, or its buffer is being torn down.
+  // The executor owns the fd's close.
+  | { kind: "discardAcquireFence"; bufferId: number; fence: AcquireFence<Fd> };
 
 // Per-buffer state. (Rule A: the cache lives until the buffer is destroyed
 // or the only surface referencing it is torn down. Supersede does NOT drop
@@ -101,7 +118,7 @@ type BufferState = "Importing" | "Imported" | "Poisoned";
 //              path still runs.
 // (No explicit Released/Retiring: the entry is deleted once released.)
 
-interface BufferRec {
+interface BufferRec<Fd> {
   state: BufferState;
   // The surface that currently has this buffer as its current. 0 = none (the
   // buffer was superseded on its surface, the surface was removed, the buffer
@@ -124,9 +141,11 @@ interface BufferRec {
   // endAccess fence to chain). After the first end, chainFence = the last
   // exported fence.
   chainFence: ReleaseFence;
-  // The most recently captured acquire fence from the client (consumed by the
-  // NEXT beginAccess; cleared on use). Set by acquireFenceAvailable.
-  pendingAcquireFence: AcquireFence;
+  // The most recent commit's acquire fence, pending its single consumer: the
+  // next beginAccess (or takeAcquireFence). Cleared on consume; replaced (with
+  // a discardAcquireFence intent for the old one) by a newer
+  // acquireFenceAvailable; discarded at teardown if still pending.
+  pendingAcquireFence: AcquireFence<Fd>;
   // Submit serials that sampled this buffer and have not yet been GPU-completed.
   // Drained as gpuCompleted(serial) arrives; once empty AND the buffer has an
   // outstanding release/import-release owed, the corresponding intents fire.
@@ -155,8 +174,8 @@ interface FrameRec {
   sampled: Array<{ surfaceId: number; bufferId: number }>;
 }
 
-export class ClientBufferLifecycle {
-  private buffers = new Map<number, BufferRec>();
+export class ClientBufferLifecycle<Fd = number> {
+  private buffers = new Map<number, BufferRec<Fd>>();
   private surfaces = new Map<number, SurfaceRec>();
   private frame: FrameRec | null = null;
   // Submit serials whose endAccess has been emitted but whose exported fence
@@ -166,9 +185,9 @@ export class ClientBufferLifecycle {
   private pendingEndExports = new Map<number, number[]>();  // serial -> bufferIds
 
   // The intent buffer this step is filling. Cleared at the start of step().
-  private out: LifecycleIntent[] = [];
+  private out: LifecycleIntent<Fd>[] = [];
 
-  step(event: LifecycleEvent): LifecycleIntent[] {
+  step(event: LifecycleEvent<Fd>): LifecycleIntent<Fd>[] {
     this.out = [];
     switch (event.kind) {
       case "commit": this.onCommit(event.surfaceId, event.bufferId, event.dims); break;
@@ -240,9 +259,15 @@ export class ClientBufferLifecycle {
     b.importOwed = false;
   }
 
-  private onAcquireFenceAvailable(bufferId: number, fence: AcquireFence): void {
+  private onAcquireFenceAvailable(bufferId: number, fence: AcquireFence<Fd>): void {
     const b = this.buffers.get(bufferId);
     if (!b) return;  // commit hasn't arrived yet, or buffer destroyed/unknown
+    // A fence-less commit leaves any still-pending fence armed: the client's
+    // last signaled fence still gates the first sample of its writes.
+    if (fence.kind === "none") return;
+    // A newer fence supersedes a still-pending one; the old fence will never
+    // be carried, so hand it back for close.
+    this.discardPendingAcquireFence(bufferId, b);
     b.pendingAcquireFence = fence;
   }
 
@@ -472,9 +497,39 @@ export class ClientBufferLifecycle {
       b.releaseOwed = false;
     }
     if (b.importOwed) {
+      // The entry is going away; a fence still pending here has lost its
+      // consumer for good.
+      this.discardPendingAcquireFence(bufferId, b);
       this.out.push({ kind: "releaseImport", bufferId });
       this.buffers.delete(bufferId);
     }
+  }
+
+  // Emit discardAcquireFence for a still-pending fence and clear it. No-op
+  // when nothing is pending.
+  private discardPendingAcquireFence(bufferId: number, b: BufferRec<Fd>): void {
+    if (b.pendingAcquireFence.kind === "none") return;
+    this.out.push({
+      kind: "discardAcquireFence", bufferId, fence: b.pendingAcquireFence,
+    });
+    b.pendingAcquireFence = { kind: "none" };
+  }
+
+  // Consume-once accessor for samplers that run OUTSIDE the frame flow (the
+  // executor's freeze-snapshot bracket, the intercept bracket, snapshot
+  // composes, direct-scanout presents). Ownership matches the beginAccess
+  // path: whichever consumer runs first after the commit takes the fence;
+  // everyone after gets "none". Syncobj is refused here for the same reason
+  // beginAccess refuses it -- this is a hand-off point to the executor.
+  takeAcquireFence(bufferId: number): AcquireFence<Fd> {
+    const b = this.buffers.get(bufferId);
+    if (!b) return { kind: "none" };
+    if (b.pendingAcquireFence.kind === "syncobj") {
+      throw new Error("syncobj acquire fence not implemented");
+    }
+    const fence = b.pendingAcquireFence;
+    b.pendingAcquireFence = { kind: "none" };
+    return fence;
   }
 
   private onScanoutPresented(bufferId: number): void {
