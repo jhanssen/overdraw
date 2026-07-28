@@ -34,7 +34,7 @@ import {
   createCursorBroker, CURSOR_NOT_HANDLED,
 } from "./plugins/cursor-broker.js";
 import { createCursorThemeResolver } from "./cursor/theme-resolver.js";
-import { resolveScale, logicalSize, edidDpi } from "./output/scale.js";
+import { edidDpi } from "./output/scale.js";
 import { makeComposeFlatteners, makeSubsurfaceAccessor } from "./subsurfaces.js";
 import { Kinematics } from "./cursor/kinematics.js";
 import { CursorRuleEngine } from "./cursor/rule-engine.js";
@@ -53,12 +53,13 @@ import { createBackdropBlurRenderer } from "./gpu/backdrop-blur.js";
 import type { Addon, InputEvent } from "./types.js";
 import type { CompositorSink, CompositorState } from "./protocols/ctx.js";
 import { OUTPUT_DEFAULT } from "./protocols/ctx.js";
-import { nextOutputPosition, durableKeyOf, formatRefreshHz } from "./output/arrangement.js";
+import { nextOutputPosition, formatRefreshHz } from "./output/arrangement.js";
 import { reemitWlOutput } from "./protocols/wl_output.js";
 import { reemitXdgOutput } from "./protocols/zxdg_output_manager_v1.js";
 import { reemitFractionalScale } from "./protocols/wp_fractional_scale_manager_v1.js";
 import { reemitScanoutFeedback } from "./protocols/zwp_linux_dmabuf_v1.js";
-import { makeOnOutputAdded, makeOnOutputRemoved } from "./output/hotplug.js";
+import { makeOnOutputAdded, makeOnOutputRemoved, deriveOutputGeometry,
+         buildOutputRecord, pushOutputsToLayers } from "./output/hotplug.js";
 import { WINDOW_EVENT } from "./events/types.js";
 import { createCompositorBus, KEYBOARD_EVENT, POINTER_EVENT } from "./events/window-bus.js";
 import { DynamicBus } from "./events/dynamic-bus.js";
@@ -432,19 +433,9 @@ addon.setOnOutputDescriptor((d) => {
   // policy: an explicit config value wins, else the EDID-DPI auto fallback
   // (KMS only -- a nested host window's physical dims describe the host
   // monitor, not our render target).
-  const device = { width: d.width, height: d.height };
-  // Per-output durable key. Used to consult the memorized position / scale
-  // maps populated by user config OR by prior wlr-output-management apply.
-  const durable = durableKeyOf({ edidId: d.edidId, name: d.name });
-  const memorizedScale = durable !== ""
-    ? state.outputScaleMemory?.get(durable) ?? null : null;
-  const scale = resolveScale({
-    configScale: config.scale ?? memorizedScale,
-    deviceWidth: device.width, deviceHeight: device.height,
-    physicalWidthMm: d.physicalWidthMm, physicalHeightMm: d.physicalHeightMm,
-    allowEdidAuto: backendOpts.backend === "kms",
-  });
-  const logical = logicalSize(device.width, device.height, scale);
+  const { device, scale, logical, memorizedScale, memorizedPos } =
+    deriveOutputGeometry(
+      { state, config, allowEdidAutoScale: backendOpts.backend === "kms" }, d);
   // Scale derivation, appended to whichever add/update log fires below so the
   // resolved scale is never logged twice. Source is the config value, a
   // memorized set_scale, or the EDID-DPI auto fallback (KMS only).
@@ -453,8 +444,6 @@ addon.setOnOutputDescriptor((d) => {
     : (backendOpts.backend === "kms" && scaleDpi > 0 ? "edid-auto" : "default");
   const scaleInfo = `dpi=${scaleDpi.toFixed(1)} raw=${(scaleDpi / 96).toFixed(3)} `
     + `scale=${scale}(${scaleSrc})`;
-  const memorizedPos = durable !== ""
-    ? state.outputPositionMemory?.get(durable) : undefined;
 
   let rec = outputs.get(d.outputId);
   let sizeChanged = false;
@@ -463,22 +452,7 @@ addon.setOnOutputDescriptor((d) => {
     // present (config / prior set_position), else the deterministic
     // right-of-rightmost fallback. See multi-output-design §10.
     const pos = memorizedPos ?? nextOutputPosition(outputs.values());
-    rec = {
-      id: d.outputId,
-      logicalPosition: pos,
-      logicalSize: logical,
-      deviceSize: device,
-      scale,
-      name: d.name,
-      description: d.model || d.name,
-      refreshMhz: d.refreshMhz,
-      transform: d.transform,
-      physicalWidthMm: d.physicalWidthMm,
-      physicalHeightMm: d.physicalHeightMm,
-      make: d.make,
-      model: d.model,
-      edidId: d.edidId,
-    };
+    rec = buildOutputRecord(d, pos, { device, logical, scale });
     outputs.set(d.outputId, rec);
     // Advertise a wl_output global for this new connector so clients see it
     // via wl_registry. installProtocols created globals for the outputs
@@ -542,28 +516,11 @@ addon.setOnOutputDescriptor((d) => {
       + `xform=${d.transform} phys=${d.physicalWidthMm}x${d.physicalHeightMm}mm name=${d.name}`);
   }
 
-  // Feed the full per-output geometry to the compositor so renderFrame draws
-  // each monitor's slice of the global logical space into its own scanout
-  // target. Covers ALL outputs (not just the primary); setOutputSize below
-  // still drives the primary's render dims (harmless overlap -- setOutputs is
-  // the fuller picture).
-  if (compositor instanceof JsCompositor && compositor.setOutputs) {
-    compositor.setOutputs([...outputs.values()].map((r) => ({
-      id: r.id,
-      deviceWidth: r.deviceSize.width, deviceHeight: r.deviceSize.height,
-      logicalX: r.logicalPosition.x, logicalY: r.logicalPosition.y,
-      scale: r.scale,
-    })));
-  }
-
-  // Push the full multi-output layout to the input backend so the cursor
-  // is clamped against the union of every monitor's rect (with edge-sliding
-  // for gaps), not just the primary's dims. Covers every output, not just
-  // primary -- the cursor must be free to cross output boundaries.
-  addon.updateOutputLayout([...outputs.values()].map((r) => ({
-    x: r.logicalPosition.x, y: r.logicalPosition.y,
-    w: r.logicalSize.width, h: r.logicalSize.height,
-  })));
+  // Mirror the full per-output set to the compositor / input backend / WM
+  // (shared with the hotplug add/remove paths). setOutputSize below still
+  // drives the primary's render dims (harmless overlap -- setOutputs inside
+  // pushOutputsToLayers is the fuller picture).
+  pushOutputsToLayers({ addon, state, compositor });
 
   // Compositor's primary render-target dims still ride setOutputSize on the
   // primary output; setOutputs (above) drives every other output's render
@@ -572,18 +529,6 @@ addon.setOnOutputDescriptor((d) => {
     compositor.setOutputSize(device.width, device.height, scale);
   }
 
-  // WM: feed the full per-output set every time, so a freshly-arrived monitor
-  // joins the WM's layout pass without a separate add/remove protocol.
-  if (state.wm) {
-    state.wm.setOutputs([...outputs.values()].map((r) => ({
-      id: r.id,
-      rect: {
-        x: r.logicalPosition.x, y: r.logicalPosition.y,
-        width: r.logicalSize.width, height: r.logicalSize.height,
-      },
-      scale: r.scale,
-    })));
-  }
   if (sizeChanged) state.relayout?.("output-resized");
 
   // Recompute wl_surface.enter/leave for every mapped surface: an output's

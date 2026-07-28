@@ -49,6 +49,71 @@ export interface HotplugDeps {
   log?: { info: (msg: string) => void; warn: (msg: string) => void };
 }
 
+// Resolve one descriptor's geometry policy: device dims, the durable
+// memory key, the scale (config > memorized > EDID-auto > 1), the logical
+// size, and any memorized position. Shared by the boot OutputDescriptor
+// path (main.ts) and the hotplug OutputAdded path so the two cannot drift
+// on scale/position precedence.
+export function deriveOutputGeometry(
+  deps: {
+    state: CompositorState;
+    config: { scale?: number | null };
+    allowEdidAutoScale: boolean;
+  },
+  d: OutputDescriptor,
+): {
+  device: { width: number; height: number };
+  durable: string;
+  memorizedScale: number | null;
+  scale: number;
+  logical: { width: number; height: number };
+  memorizedPos: { x: number; y: number } | undefined;
+} {
+  const device = { width: d.width, height: d.height };
+  const durable = durableKeyOf({ edidId: d.edidId, name: d.name });
+  const memorizedScale = durable !== ""
+    ? deps.state.outputScaleMemory?.get(durable) ?? null : null;
+  const scale = resolveScale({
+    configScale: deps.config.scale ?? memorizedScale,
+    deviceWidth: device.width, deviceHeight: device.height,
+    physicalWidthMm: d.physicalWidthMm, physicalHeightMm: d.physicalHeightMm,
+    allowEdidAuto: deps.allowEdidAutoScale,
+  });
+  const logical = logicalSize(device.width, device.height, scale);
+  const memorizedPos = durable !== ""
+    ? deps.state.outputPositionMemory?.get(durable) : undefined;
+  return { device, durable, memorizedScale, scale, logical, memorizedPos };
+}
+
+// Build the state.outputs record for a descriptor at a resolved position +
+// geometry. Field set shared by boot enumeration and hotplug add.
+export function buildOutputRecord(
+  d: OutputDescriptor,
+  pos: { x: number; y: number },
+  g: {
+    device: { width: number; height: number };
+    logical: { width: number; height: number };
+    scale: number;
+  },
+): OutputRecord {
+  return {
+    id: d.outputId,
+    logicalPosition: pos,
+    logicalSize: g.logical,
+    deviceSize: g.device,
+    scale: g.scale,
+    name: d.name,
+    description: d.model || d.name,
+    refreshMhz: d.refreshMhz,
+    transform: d.transform,
+    physicalWidthMm: d.physicalWidthMm,
+    physicalHeightMm: d.physicalHeightMm,
+    make: d.make,
+    model: d.model,
+    edidId: d.edidId,
+  };
+}
+
 // Push the current state.outputs snapshot to every layer that mirrors it:
 // the JsCompositor's per-output geometry, the input backend's pointer
 // layout, the WM's output rects. Shared between hotplug add/remove and
@@ -107,26 +172,10 @@ export function makeOnOutputAdded(deps: HotplugDeps): (d: OutputDescriptor) => v
     const { addon, state, pluginBus, config, allowEdidAutoScale } = deps;
     const outputs = state.outputs;
     if (!outputs) return;
-    const device = { width: d.width, height: d.height };
-    // Durable identifier the memory maps key on. Same precedence the
-    // workspace plugin uses (edidId first, name fallback).
-    const durable = durableKeyOf({ edidId: d.edidId, name: d.name });
-    // Scale precedence: explicit config scale wins (handled inside
-    // resolveScale); else memorized scale from a prior set_scale or
-    // config.byKey; else EDID-DPI auto / 1.
-    const memorizedScale = durable !== ""
-      ? state.outputScaleMemory?.get(durable) ?? null : null;
-    const scale = resolveScale({
-      configScale: config.scale ?? memorizedScale,
-      deviceWidth: device.width, deviceHeight: device.height,
-      physicalWidthMm: d.physicalWidthMm, physicalHeightMm: d.physicalHeightMm,
-      allowEdidAuto: allowEdidAutoScale,
-    });
-    const logical = logicalSize(device.width, device.height, scale);
+    const { device, scale, logical, memorizedPos } =
+      deriveOutputGeometry({ state, config, allowEdidAutoScale }, d);
     // Position precedence: memorized position (config or prior set_position)
     // wins; else the deterministic right-of-rightmost fallback.
-    const memorizedPos = durable !== ""
-      ? state.outputPositionMemory?.get(durable) : undefined;
     const pos = memorizedPos ?? nextOutputPosition(outputs.values());
 
     // Dense id reuse without a paired OutputRemoved is a contract violation
@@ -140,22 +189,7 @@ export function makeOnOutputAdded(deps: HotplugDeps): (d: OutputDescriptor) => v
       outputs.delete(d.outputId);
     }
 
-    const rec: OutputRecord = {
-      id: d.outputId,
-      logicalPosition: pos,
-      logicalSize: logical,
-      deviceSize: device,
-      scale,
-      name: d.name,
-      description: d.model || d.name,
-      refreshMhz: d.refreshMhz,
-      transform: d.transform,
-      physicalWidthMm: d.physicalWidthMm,
-      physicalHeightMm: d.physicalHeightMm,
-      make: d.make,
-      model: d.model,
-      edidId: d.edidId,
-    };
+    const rec = buildOutputRecord(d, pos, { device, logical, scale });
     outputs.set(d.outputId, rec);
 
     if (state.events) {
