@@ -228,6 +228,14 @@ export type ProposalReason =
   | "window-rule"       // a window-rules plugin applying its policy
   | "core";             // core's own self-propose
 
+// Runtime vocabularies of the unions above, for validators that check a
+// wire value against the allowed set.
+export const TILINGS: ReadonlyArray<Tiling> = ["managed", "floating"];
+export const SIZE_MODES: ReadonlyArray<SizeMode> = ["none", "maximized", "fullscreen"];
+export const PROPOSAL_REASONS: ReadonlyArray<ProposalReason> = [
+  "client-request", "plugin", "user-input", "window-rule", "core",
+];
+
 // Pre-commit interceptable event. `current` is the window's state right
 // now; `candidate` is what the WM would commit. An interceptor returning a
 // modified payload with a different `candidate` redirects the commit; an

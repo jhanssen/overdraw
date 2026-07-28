@@ -483,18 +483,19 @@ export interface DawnGlobals {
   GPUMapMode: typeof GPUMapMode;
 }
 
-// Per-surface analytic shape used to mask the on-screen coverage. Composed
-// MULTIPLICATIVELY with the optional alpha-mask texture (so a plugin can use
-// either or both -- a rounded rect for the corners + a custom alpha texture
-// for, say, a non-rectangular shadow). Evaluated by an SDF in the fragment
-// shader; the rectangular case (`null`) is an early-out and pays no extra
-// cost. Radii / extents are in surface logical pixels.
-export type SurfaceShape =
-  | null                                    // rectangle (default)
-  | { kind: "rounded-rect"; radius: number }
-  | { kind: "rounded-rect-per-corner";
-      tl: number; tr: number; br: number; bl: number }
-  | { kind: "superellipse"; exponent: number; radius: number };
+// Per-surface render-state payload types (SurfaceShape, SurfaceTransform,
+// SurfaceMargin, SurfaceTint, ColorMatrix, SurfaceBackdropEffect) are
+// defined in render-state.ts, shared with the plugin SDK + windows broker.
+// Re-exported here because the sink's consumers (ctx.ts, the broker's
+// payload types) name them via this module.
+export type {
+  SurfaceShape, SurfaceTransform, SurfaceMargin, SurfaceTint, ColorMatrix,
+  SurfaceBackdropEffect,
+} from "../render-state.js";
+import type {
+  SurfaceShape, SurfaceTransform, SurfaceMargin, SurfaceTint, ColorMatrix,
+  SurfaceBackdropEffect,
+} from "../render-state.js";
 
 // The content-gate release decision (surfaceContentReady's core), pulled out
 // pure for testing. The gate releases once the client has a drawable buffer
@@ -802,47 +803,6 @@ interface DmabufDescriptor {
 }
 
 const DEFAULT_FORMAT = "bgra8unorm";
-
-// Public payloads for the per-surface render-state setters
-// (setSurfaceTransform, setSurfaceOutputMargin, setSurfaceTint). Each field
-// is optional so callers may partially update; missing fields reset to the
-// identity / zero.
-export interface SurfaceTransform {
-  translateX?: number;
-  translateY?: number;
-  scaleX?: number;
-  scaleY?: number;
-}
-export interface SurfaceMargin {
-  top?: number;
-  right?: number;
-  bottom?: number;
-  left?: number;
-}
-// Per-channel tint multiplier on the sampled rgba (after colorMatrix).
-// Missing fields default to 1 (identity, no change to that channel).
-export interface SurfaceTint {
-  r?: number;
-  g?: number;
-  b?: number;
-  a?: number;
-}
-// 4x4 color matrix applied to the sampled rgba. Caller passes 16 numbers in
-// column-major order (matching WGSL mat4x4f layout). Identity has 1s on the
-// diagonal and 0s elsewhere; that is the default if a surface has never had
-// setSurfaceColorMatrix called.
-export type ColorMatrix = readonly number[] | Float32Array;
-
-// Backdrop effect assigned to a surface: the surface composites over a
-// transformed copy of everything BELOW it in the draw order. `kind` names a
-// renderer registered via registerBackdropEffectRenderer (the built-in
-// "blur" default is registered at startup; plugins may register more).
-// `params` is a flat numeric bag the renderer interprets (e.g. { radius }
-// for blur).
-export interface SurfaceBackdropEffect {
-  kind: string;
-  params?: Record<string, number>;
-}
 
 // What a backdrop-effect renderer receives per effect-surface per
 // composited scene, mid-pass: the target with everything below the surface

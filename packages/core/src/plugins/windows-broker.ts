@@ -8,19 +8,20 @@
 import type { Wm, WindowStateProposal } from "../wm/index.js";
 import type { DynamicBus } from "../events/dynamic-bus.js";
 import { WINDOW_EVENT } from "../events/types.js";
-import type {
-  WindowStateBagChangedEvent, ProposalReason, Tiling, SizeMode,
-} from "../events/types.js";
+import type { WindowStateBagChangedEvent, ProposalReason } from "../events/types.js";
+import { TILINGS, SIZE_MODES, PROPOSAL_REASONS } from "../events/types.js";
 import type { CompositorState, CompositorSink } from "../protocols/ctx.js";
 import { rebuildStackWithPopups } from "../protocols/xdg_popup.js";
 import { FOCUS_REASONS } from "@overdraw/focus-types";
 import { log } from "../log.js";
-
-const TILINGS: ReadonlyArray<Tiling> = ["managed", "floating"];
-const SIZE_MODES: ReadonlyArray<SizeMode> = ["none", "maximized", "fullscreen"];
-const PROPOSAL_REASONS: ReadonlyArray<ProposalReason> = [
-  "client-request", "plugin", "user-input", "window-rule", "core",
-];
+import {
+  assertTransform, assertMargin, assertInsets, assertShape,
+  assertBackdropEffect, assertTint, assertColorMatrix, validates,
+} from "../render-state.js";
+import type {
+  SurfaceTransform, SurfaceMargin, SurfaceTint, ColorMatrix,
+  SurfaceBackdropEffect, SurfaceShape,
+} from "../render-state.js";
 
 export interface WindowsBrokerDeps {
   wm: Wm;
@@ -763,34 +764,21 @@ function isSetOpacityPayload(d: unknown): d is { id: number; opacity: number } {
 }
 
 function isSetTransformPayload(d: unknown): d is {
-  id: number; t: import("../gpu/compositor.js").SurfaceTransform;
+  id: number; t: SurfaceTransform;
 } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   if (typeof o.id !== "number") return false;
-  if (typeof o.t !== "object" || o.t === null) return false;
-  const t = o.t as { [k: string]: unknown };
-  for (const k of ["translateX", "translateY", "scaleX", "scaleY"]) {
-    const v = t[k];
-    if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v))) return false;
-  }
-  return true;
+  return validates(() => assertTransform(o.t as SurfaceTransform));
 }
 
 function isSetOutputMarginPayload(d: unknown): d is {
-  id: number; m: import("../gpu/compositor.js").SurfaceMargin;
+  id: number; m: SurfaceMargin;
 } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   if (typeof o.id !== "number") return false;
-  if (typeof o.m !== "object" || o.m === null) return false;
-  const m = o.m as { [k: string]: unknown };
-  for (const k of ["top", "right", "bottom", "left"]) {
-    const v = m[k];
-    if (v !== undefined
-        && (typeof v !== "number" || !Number.isFinite(v) || v < 0)) return false;
-  }
-  return true;
+  return validates(() => assertMargin(o.m as SurfaceMargin));
 }
 
 function isSetInsetsPayload(d: unknown): d is {
@@ -799,13 +787,8 @@ function isSetInsetsPayload(d: unknown): d is {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   if (typeof o.id !== "number") return false;
-  if (typeof o.insets !== "object" || o.insets === null) return false;
-  const i = o.insets as { [k: string]: unknown };
-  for (const k of ["top", "right", "bottom", "left"]) {
-    const v = i[k];
-    if (typeof v !== "number" || !Number.isFinite(v)) return false;
-  }
-  return true;
+  return validates(() =>
+    assertInsets(o.insets as { top: number; right: number; bottom: number; left: number }));
 }
 
 function isSetMaskPayload(d: unknown): d is { id: number; mask: GPUTexture | null } {
@@ -818,81 +801,41 @@ function isSetMaskPayload(d: unknown): d is { id: number; mask: GPUTexture | nul
   return o.mask === null || typeof o.mask === "object";
 }
 
-function isFiniteNumber(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v);
-}
-
 function isSetShapePayload(d: unknown): d is {
-  id: number; shape: import("../gpu/compositor.js").SurfaceShape;
+  id: number; shape: SurfaceShape;
 } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   if (typeof o.id !== "number") return false;
-  if (o.shape === null) return true;
-  if (typeof o.shape !== "object") return false;
-  const s = o.shape as { [k: string]: unknown };
-  switch (s.kind) {
-    case "rounded-rect":
-      return isFiniteNumber(s.radius) && s.radius >= 0;
-    case "rounded-rect-per-corner":
-      return (["tl", "tr", "br", "bl"] as const).every(
-        (k) => isFiniteNumber(s[k]) && (s[k] as number) >= 0);
-    case "superellipse":
-      return isFiniteNumber(s.radius) && s.radius >= 0
-        && isFiniteNumber(s.exponent) && (s.exponent as number) >= 2;
-    default:
-      return false;
-  }
+  return validates(() => assertShape(o.shape as SurfaceShape));
 }
 
 function isSetTintPayload(d: unknown): d is {
-  id: number; t: import("../gpu/compositor.js").SurfaceTint;
+  id: number; t: SurfaceTint;
 } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   if (typeof o.id !== "number") return false;
-  if (typeof o.t !== "object" || o.t === null) return false;
-  const t = o.t as { [k: string]: unknown };
-  for (const k of ["r", "g", "b", "a"]) {
-    const v = t[k];
-    if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v))) return false;
-  }
-  return true;
+  return validates(() => assertTint(o.t as SurfaceTint));
 }
 
 function isSetColorMatrixPayload(d: unknown): d is {
-  id: number; m: import("../gpu/compositor.js").ColorMatrix | null;
+  id: number; m: ColorMatrix | null;
 } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   if (typeof o.id !== "number") return false;
   if (o.m === null) return true;
-  if (!Array.isArray(o.m) && !(o.m instanceof Float32Array)) return false;
-  const m = o.m as ArrayLike<unknown>;
-  if (m.length !== 16) return false;
-  for (let i = 0; i < 16; i++) {
-    const v = m[i];
-    if (typeof v !== "number" || !Number.isFinite(v)) return false;
-  }
-  return true;
+  return validates(() => assertColorMatrix(o.m as ColorMatrix));
 }
 
 function isSetBackdropEffectPayload(d: unknown): d is {
-  id: number; e: import("../gpu/compositor.js").SurfaceBackdropEffect | null;
+  id: number; e: SurfaceBackdropEffect | null;
 } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   if (typeof o.id !== "number") return false;
-  if (o.e === null) return true;
-  if (typeof o.e !== "object" || o.e === null) return false;
-  const e = o.e as { [k: string]: unknown };
-  if (typeof e.kind !== "string" || e.kind.length === 0) return false;
-  if (e.params === undefined) return true;
-  if (typeof e.params !== "object" || e.params === null) return false;
-  for (const v of Object.values(e.params)) {
-    if (typeof v !== "number" || !Number.isFinite(v)) return false;
-  }
-  return true;
+  return validates(() => assertBackdropEffect(o.e as SurfaceBackdropEffect | null));
 }
 
 function isDestroyPhantomPayload(d: unknown): d is { id: number } {

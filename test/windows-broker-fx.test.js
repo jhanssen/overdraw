@@ -41,6 +41,9 @@ function mockSink() {
     setSurfaceBackdropEffect(id, e) {
       calls.push({ method: 'setSurfaceBackdropEffect', id, e });
     },
+    setSurfaceShape(id, shape) {
+      calls.push({ method: 'setSurfaceShape', id, shape });
+    },
   };
 }
 
@@ -389,4 +392,43 @@ test('set-backdrop-effect: sink without setSurfaceBackdropEffect -> not supporte
   const { broker } = makeBroker(bare);
   assert.throws(() => broker('p', 'windows.set-backdrop-effect', { id: 1, e: null }),
     /not supported/);
+});
+
+// ---- set-shape --------------------------------------------------------------
+
+test('set-shape: forwards each shape kind and null', () => {
+  const { broker, sink } = makeBroker();
+  broker('p', 'windows.set-shape', { id: 7, shape: { kind: 'rounded-rect', radius: 12 } });
+  broker('p', 'windows.set-shape', { id: 7, shape: {
+    kind: 'rounded-rect-per-corner', tl: 1, tr: 2, br: 3, bl: 4 } });
+  broker('p', 'windows.set-shape', { id: 7, shape: {
+    kind: 'superellipse', exponent: 4, radius: 16 } });
+  broker('p', 'windows.set-shape', { id: 7, shape: null });
+  assert.deepEqual(sink.calls.map((c) => c.shape), [
+    { kind: 'rounded-rect', radius: 12 },
+    { kind: 'rounded-rect-per-corner', tl: 1, tr: 2, br: 3, bl: 4 },
+    { kind: 'superellipse', exponent: 4, radius: 16 },
+    null,
+  ]);
+});
+
+test('set-shape: negative radius / bad exponent / unknown kind throw', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-shape',
+    { id: 1, shape: { kind: 'rounded-rect', radius: -1 } }), /malformed payload/);
+  assert.throws(() => broker('p', 'windows.set-shape',
+    { id: 1, shape: { kind: 'superellipse', exponent: 1.5, radius: 8 } }),
+    /malformed payload/);
+  assert.throws(() => broker('p', 'windows.set-shape',
+    { id: 1, shape: { kind: 'blob' } }), /malformed payload/);
+  assert.throws(() => broker('p', 'windows.set-shape',
+    { id: 1, shape: { kind: 'rounded-rect-per-corner', tl: 1, tr: 2, br: 3 } }),
+    /malformed payload/);
+});
+
+test('set-shape: missing id or missing shape throws', () => {
+  const { broker } = makeBroker();
+  assert.throws(() => broker('p', 'windows.set-shape',
+    { shape: null }), /malformed payload/);
+  assert.throws(() => broker('p', 'windows.set-shape', { id: 1 }), /malformed payload/);
 });
