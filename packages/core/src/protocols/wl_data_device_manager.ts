@@ -30,68 +30,16 @@ import type { Ctx } from "./ctx.js";
 import { seatViewToWorldX, seatViewToWorldY } from "./ctx.js";
 import { rebuildStackWithPopups } from "./xdg_popup.js";
 import type { Resource, WaylandFd } from "../types.js";
-import { KEYBOARD_EVENT, SELECTION_EVENT } from "../events/window-bus.js";
+import { KEYBOARD_EVENT } from "../events/window-bus.js";
+import {
+  SLOT, SLOT_KINDS, claimSlot, dropOffer, receiveFromOffer,
+  selectionOwnerGone, sendSlotTo, setOfferSource,
+} from "./selection-slot.js";
 
-// Tell a source it lost ownership of a selection slot (the spec's
-// "cancelled" on replacement). The selection state is shared across all three
-// selection protocols, so the displaced source may belong to any of them --
-// dispatch the cancelled event by the resource's interface. No-op if the slot
-// is unchanged or the source is the same one re-asserting.
-export function cancelDisplacedSource(
-  ctx: Ctx, prev: Resource | null, replacement: Resource | null,
-): void {
-  if (!prev || prev === replacement || prev.destroyed) return;
-  switch (prev.interfaceName) {
-    case "wl_data_source":
-      ctx.events.wl_data_source.send_cancelled(prev); break;
-    case "zwp_primary_selection_source_v1":
-      ctx.events.zwp_primary_selection_source_v1.send_cancelled(prev); break;
-    case "ext_data_control_source_v1":
-      ctx.events.ext_data_control_source_v1.send_cancelled(prev); break;
-    case "zwlr_data_control_source_v1":
-      ctx.events.zwlr_data_control_source_v1.send_cancelled(prev); break;
-  }
-}
-
-// Forward a receive() request to the source backing an offer. Like
-// cancelDisplacedSource, the source may belong to any of the selection
-// protocols (a data-control client's source can own the clipboard that a
-// wl_data_device client pastes from), so the send event must be dispatched
-// by the resource's interface -- each family's `send` has a different
-// opcode, and posting through the wrong sender emits a different event
-// entirely on the recipient's interface.
-//
-// Fd ownership: send_send takes a dup (libwayland owns it once the event is
-// queued); the request fd itself is CLOSED here -- the dispatcher owns it
-// and nothing else will close it. A merely-taken fd would hold the
-// receiver's pipe write-end open forever, so the reading client never sees
-// EOF after the source finishes writing.
-export function forwardReceiveToSource(
-  ctx: Ctx, source: Resource | null, mimeType: string, fd: WaylandFd,
-): void {
-  if (source && !source.destroyed) {
-    switch (source.interfaceName) {
-      case "wl_data_source":
-        ctx.events.wl_data_source.send_send(source, mimeType, fd.dup()); break;
-      case "zwp_primary_selection_source_v1":
-        ctx.events.zwp_primary_selection_source_v1.send_send(source, mimeType, fd.dup()); break;
-      case "ext_data_control_source_v1":
-        ctx.events.ext_data_control_source_v1.send_send(source, mimeType, fd.dup()); break;
-      case "zwlr_data_control_source_v1":
-        ctx.events.zwlr_data_control_source_v1.send_send(source, mimeType, fd.dup()); break;
-    }
-  }
-  fd.close();
-}
-
-// Map a wl_data_offer resource back to the source it represents, so receive() can
-// forward to the right source. Lives module-scope (keyed by offer resource).
-const offerToSource = new WeakMap<Resource, Resource>();
-
-// X-backed offers (clipboard or primary). When set, wl_data_offer.receive /
-// primary receive on the offer routes to the selection bridge instead of
-// forwarding to a wl source. Keyed by the offer resource.
-const xBackedOffer = new WeakMap<Resource, "clipboard" | "primary">();
+// The slot machinery (claim, fan-out, offer backing, receive forwarding)
+// lives in selection-slot.ts, shared with the data-control families.
+export { cancelDisplacedSource, forwardReceiveToSource, selectionOwnerGone }
+  from "./selection-slot.js";
 
 // dnd_action enum (wl_data_device_manager): none=0, copy=1, move=2, ask=4.
 const DND = { none: 0, copy: 1, move: 2, ask: 4 } as const;
@@ -176,7 +124,7 @@ function dragMotion(d: DragSession, x: number, y: number,
     const offer = d.ctx.events.wl_data_device.send_data_offer(device, null) as Resource;
     if (!offer) return;
     dragOfferSession.set(offer, d);
-    offerToSource.set(offer, d.source as Resource);
+    setOfferSource(offer, d.source);
     for (const mime of mimes) d.ctx.events.wl_data_offer.send_offer(offer, mime);
     // source_actions tells the receiver what the source supports (since 3;
     // skip for a receiver bound below v3, which has no listener for it).
@@ -271,85 +219,6 @@ function hideDragIcon(d: DragSession): void {
   if (rec) d.ctx.state.compositor.removeSurface(rec.id);
 }
 
-// Send the current selection to one client's data_device(s). Mints a
-// wl_data_offer (server-side new_id event), advertises each mime, then points the
-// client at it via selection(). If there is no selection, sends selection(null).
-// Falls back to the Xwayland-backed source when no wl client owns the
-// selection and an X client does.
-function sendSelectionTo(ctx: Ctx, clientId: number): void {
-  const devices = ctx.state.dataDevices?.get(clientId);
-  if (!devices || devices.size === 0) return;
-  const wlSource = ctx.state.selection ?? null;
-  const xSource = ctx.state.xClipboardSource ?? null;
-  const mimes = wlSource ? (ctx.state.dataSources?.get(wlSource)?.mimes ?? [])
-              : xSource ? xSource.mimes : [];
-
-  for (const device of devices) {
-    if (device.destroyed) continue;
-    if (!wlSource && !xSource) {
-      ctx.events.wl_data_device.send_selection(device, null);
-      continue;
-    }
-    // data_offer is an event carrying a server-minted new_id; postEvent returns
-    // the new wl_data_offer resource. Pass null as the new_id slot -- the
-    // trampoline treats a non-number new_id arg as "mint server-side".
-    const offer = ctx.events.wl_data_device.send_data_offer(device, null) as Resource;
-    if (!offer) continue;
-    if (wlSource) offerToSource.set(offer, wlSource);
-    else xBackedOffer.set(offer, "clipboard");
-    for (const mime of mimes) ctx.events.wl_data_offer.send_offer(offer, mime);
-    ctx.events.wl_data_device.send_selection(device, offer);
-  }
-}
-
-// --- primary selection (zwp_primary_selection_*): same flow, separate state and
-// interfaces (no DnD). ---
-const primaryOfferToSource = new WeakMap<Resource, Resource>();
-
-function sendPrimaryTo(ctx: Ctx, clientId: number): void {
-  const devices = ctx.state.primaryDevices?.get(clientId);
-  if (!devices || devices.size === 0) return;
-  const wlSource = ctx.state.primarySelection ?? null;
-  const xSource = ctx.state.xPrimarySource ?? null;
-  const mimes = wlSource ? (ctx.state.primarySources?.get(wlSource)?.mimes ?? [])
-              : xSource ? xSource.mimes : [];
-  for (const device of devices) {
-    if (device.destroyed) continue;
-    if (!wlSource && !xSource) {
-      ctx.events.zwp_primary_selection_device_v1.send_selection(device, null);
-      continue;
-    }
-    const offer = ctx.events.zwp_primary_selection_device_v1
-      .send_data_offer(device, null) as Resource;
-    if (!offer) continue;
-    if (wlSource) primaryOfferToSource.set(offer, wlSource);
-    else xBackedOffer.set(offer, "primary");
-    for (const mime of mimes) ctx.events.zwp_primary_selection_offer_v1.send_offer(offer, mime);
-    ctx.events.zwp_primary_selection_device_v1.send_selection(device, offer);
-  }
-}
-
-// The owner of a selection slot is gone (its source was destroyed
-// explicitly, or its client disconnected and the per-frame sweep noticed).
-// Clear the slot, rescind the X-side claim via the Xwayland selection
-// bridge, broadcast to data-control observers, and re-push to the
-// keyboard-focused client so it drops the now-dangling offer (falling back
-// to an X-backed source when one exists).
-export function selectionOwnerGone(ctx: Ctx, kind: "clipboard" | "primary"): void {
-  const focusClient = ctx.state.seat?.kbFocus?.clientId;
-  if (kind === "clipboard") {
-    ctx.state.selection = null;
-    ctx.state.onWlSelectionChanged?.("clipboard", null, "data");
-    ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "clipboard" });
-    if (focusClient != null) sendSelectionTo(ctx, focusClient);
-  } else {
-    ctx.state.primarySelection = null;
-    ctx.state.onWlSelectionChanged?.("primary", null, "primary");
-    ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "primary" });
-    if (focusClient != null) sendPrimaryTo(ctx, focusClient);
-  }
-}
-
 // Per-frame disconnect sweep (wired in installProtocols alongside the
 // other protocol sweeps). A client that vanished ran none of the destroy
 // handlers, so a selection it owned would stay claimed forever: every
@@ -357,8 +226,8 @@ export function selectionOwnerGone(ctx: Ctx, kind: "clipboard" | "primary"): voi
 // Run the same owner-gone path as an explicit source destroy, and drop
 // source records / device registrations keyed to destroyed resources.
 export function sweepDataDeviceState(ctx: Ctx): void {
-  if (ctx.state.selection?.destroyed) selectionOwnerGone(ctx, "clipboard");
-  if (ctx.state.primarySelection?.destroyed) selectionOwnerGone(ctx, "primary");
+  for (const kind of SLOT_KINDS)
+    if (SLOT[kind].getSource(ctx)?.destroyed) selectionOwnerGone(ctx, kind);
   for (const m of [ctx.state.dataSources, ctx.state.primarySources]) {
     if (!m) continue;
     for (const r of [...m.keys()]) if (r.destroyed) m.delete(r);
@@ -377,27 +246,28 @@ export default function makeDataDeviceManager(ctx: Ctx): WlDataDeviceManagerHand
   // Expose the per-client push helpers so sibling protocol modules
   // (ext_data_control) can re-fan a selection change to the keyboard-
   // focused client without duplicating offer-minting code.
-  ctx.state.sendSelectionToClient = (clientId) => sendSelectionTo(ctx, clientId);
-  ctx.state.sendPrimaryToClient = (clientId) => sendPrimaryTo(ctx, clientId);
+  ctx.state.sendSelectionToClient = (clientId) => sendSlotTo(ctx, "clipboard", clientId);
+  ctx.state.sendPrimaryToClient = (clientId) => sendSlotTo(ctx, "primary", clientId);
 
   // Resend BOTH selections to a client when it gains keyboard focus (selection
   // follows keyboard focus). Subscribe to the bus keyboard.focus event. The bus is
   // optional (GPU-free tests may omit it); subscribe only when present.
   ctx.state.bus?.on(KEYBOARD_EVENT.focus, ({ clientId }) => {
-    if (clientId != null) { sendSelectionTo(ctx, clientId); sendPrimaryTo(ctx, clientId); }
+    if (clientId != null) {
+      sendSlotTo(ctx, "clipboard", clientId);
+      sendSlotTo(ctx, "primary", clientId);
+    }
   });
   // The Xwayland selection bridge fires this when an X client publishes a
   // selection: re-push to the focused wayland client so it sees the X-backed
   // offer. Composes with the bus subscription above for focus-driven pushes.
   // The bridge installs / clears state.onXSelectionAvailable; we set our own
   // closure once so subsequent installs land in the same path.
-  const onX = (kind: "clipboard" | "primary"): void => {
+  ctx.state.onXSelectionAvailable = (kind) => {
     const focusClient = ctx.state.seat?.kbFocus?.clientId;
     if (focusClient == null) return;
-    if (kind === "clipboard") sendSelectionTo(ctx, focusClient);
-    else sendPrimaryTo(ctx, focusClient);
+    sendSlotTo(ctx, kind, focusClient);
   };
-  ctx.state.onXSelectionAvailable = onX;
 
   return {
     create_data_source(_resource, id) {
@@ -435,24 +305,12 @@ export function makeDataDevice(ctx: Ctx): WlDataDeviceHandler {
       });
     },
     set_selection(resource, source, _serial) {
-      // Tell the displaced owner it lost the selection.
-      cancelDisplacedSource(ctx, ctx.state.selection ?? null, source ?? null);
-      ctx.state.selection = source ?? null;
-      // Notify the Xwayland selection bridge so it can claim / release the
-      // X side. No-op when no bridge is installed.
-      ctx.state.onWlSelectionChanged?.("clipboard", source ?? null, "data");
-      // Broadcast the change so any subscriber that bypasses keyboard-
-      // focus gating (the data-control protocol) re-pushes its offers.
-      ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "clipboard" });
-      // Push to the currently keyboard-focused client (selection follows focus).
+      claimSlot(ctx, "clipboard", source ?? null);
+      // Push to the currently keyboard-focused client (selection follows
+      // focus); with no focused client, push to the setter's own client
+      // instead (some clients expect to observe their own selection).
       const focusClient = ctx.state.seat?.kbFocus?.clientId;
-      if (focusClient != null) sendSelectionTo(ctx, focusClient);
-      else {
-        // No focused client: also push to the setter's own client (some clients
-        // expect to observe their own selection). Harmless if unfocused.
-        const own = ctx.addon.clientId(resource);
-        sendSelectionTo(ctx, own);
-      }
+      sendSlotTo(ctx, "clipboard", focusClient ?? ctx.addon.clientId(resource));
     },
     release(resource) {
       const clientId = ctx.addon.clientId(resource);
@@ -496,18 +354,10 @@ export function makeDataOffer(ctx: Ctx): WlDataOfferHandler {
       }
     },
     receive(resource, mimeType, fd: WaylandFd) {
-      // X-backed offers (an X client owns the clipboard): the dispatcher
-      // owns the request fd; transfer it to the selection bridge, which
-      // closes it after the X transfer completes.
-      const xKind = xBackedOffer.get(resource);
-      if (xKind && ctx.state.receiveForXSource) {
-        ctx.state.receiveForXSource(xKind, mimeType, fd.takeRawFd());
-        return;
-      }
-      forwardReceiveToSource(ctx, offerToSource.get(resource) ?? null, mimeType, fd);
+      receiveFromOffer(ctx, resource, mimeType, fd);
     },
     destroy(resource) {
-      offerToSource.delete(resource);
+      dropOffer(resource);
       dragOfferSession.delete(resource);
     },
     finish(resource) {
@@ -547,13 +397,9 @@ export function makePrimaryManager(ctx: Ctx): ZwpPrimarySelectionDeviceManagerV1
 export function makePrimaryDevice(ctx: Ctx): ZwpPrimarySelectionDeviceV1Handler {
   return {
     set_selection(resource, source, _serial) {
-      cancelDisplacedSource(ctx, ctx.state.primarySelection ?? null, source ?? null);
-      ctx.state.primarySelection = source ?? null;
-      ctx.state.onWlSelectionChanged?.("primary", source ?? null, "primary");
-      ctx.state.bus?.emit(SELECTION_EVENT.changed, { kind: "primary" });
+      claimSlot(ctx, "primary", source ?? null);
       const focusClient = ctx.state.seat?.kbFocus?.clientId;
-      if (focusClient != null) sendPrimaryTo(ctx, focusClient);
-      else sendPrimaryTo(ctx, ctx.addon.clientId(resource));
+      sendSlotTo(ctx, "primary", focusClient ?? ctx.addon.clientId(resource));
     },
     destroy(resource) {
       const clientId = ctx.addon.clientId(resource);
@@ -582,13 +428,8 @@ export function makePrimarySource(ctx: Ctx): ZwpPrimarySelectionSourceV1Handler 
 export function makePrimaryOffer(ctx: Ctx): ZwpPrimarySelectionOfferV1Handler {
   return {
     receive(resource, mimeType, fd: WaylandFd) {
-      const xKind = xBackedOffer.get(resource);
-      if (xKind && ctx.state.receiveForXSource) {
-        ctx.state.receiveForXSource(xKind, mimeType, fd.takeRawFd());
-        return;
-      }
-      forwardReceiveToSource(ctx, primaryOfferToSource.get(resource) ?? null, mimeType, fd);
+      receiveFromOffer(ctx, resource, mimeType, fd);
     },
-    destroy(resource) { primaryOfferToSource.delete(resource); },
+    destroy(resource) { dropOffer(resource); },
   };
 }
