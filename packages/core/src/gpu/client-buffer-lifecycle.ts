@@ -34,18 +34,24 @@
 //      (Dawn's per-access fence chaining).
 //   8. bufferDestroyed never produces sendWlRelease for that B; releaseImport
 //      still fires once in-flight frames complete.
-//   9. The machine owns the acquire-fence lifecycle. A syncFile fence fed via
-//      acquireFenceAvailable is held as B's pending fence and leaves the
-//      machine through exactly ONE of: the first beginAccess intent that
-//      samples B after the commit (consume-once; later samples carry
-//      "none"), a takeAcquireFence(B) call from an out-of-frame sampler, or
-//      a discardAcquireFence intent (the executor closes the fd) when a
-//      newer fence replaces a still-pending one or teardown (bufferDestroyed
-//      / surfaceRemoved drain) deletes B with a fence still pending. A fence
-//      never crosses buffers. Syncobj acquire fences are UNIMPLEMENTED:
-//      carrying one out of the machine THROWS -- no silent degrade to "no
-//      acquire" (that would reintroduce the black-frame bug for
-//      explicit-sync clients).
+//   9. The machine owns the acquire-fence lifecycle. Every commit arms B's
+//      pending acquire fence: a syncFile fence fed via acquireFenceAvailable
+//      is held as-is; a fence-less commit ({ kind: "none" }) arms
+//      { kind: "implicit" } instead -- the executor translates implicit to a
+//      GPU-process-side export of the dmabuf's reservation write-fences, so
+//      the FIRST sample after ANY commit waits the client's writes. The
+//      pending fence leaves the machine through exactly ONE of: the first
+//      beginAccess intent that samples B after the commit (consume-once;
+//      later samples carry "none" -- they read an unchanged dmabuf), a
+//      takeAcquireFence(B) call from an out-of-frame sampler, or -- for
+//      syncFile only -- a discardAcquireFence intent (the executor closes
+//      the fd) when a newer commit's fence replaces a still-pending one or
+//      teardown (bufferDestroyed / surfaceRemoved drain) deletes B with a
+//      fence still pending. An implicit pending fence carries no fd, so
+//      replacing or dropping it emits no discard. A fence never crosses
+//      buffers. Syncobj acquire fences are UNIMPLEMENTED: carrying one out
+//      of the machine THROWS -- no silent degrade to "no acquire" (that
+//      would reintroduce the black-frame bug for explicit-sync clients).
 //
 // The syncFile fd is an opaque token to the machine (type parameter Fd;
 // defaults to number so the tests stay plain). The executor instantiates
@@ -53,6 +59,10 @@
 
 export type AcquireFence<Fd = number> =
   | { kind: "none" }
+  // Wait the dmabuf's kernel-reservation write-fences (implicit sync). No
+  // payload: the executor sets a flag on the wire Begin and the GPU process
+  // exports/imports the sync_file itself.
+  | { kind: "implicit" }
   | { kind: "syncFile"; fd: Fd }
   | { kind: "syncobj"; handle: number; point: bigint };
 
@@ -95,7 +105,9 @@ export type LifecycleIntent<Fd = number> =
   | { kind: "sendWlRelease"; bufferId: number }
   // The pending acquire fence will never be carried by a beginAccess: it was
   // replaced by a newer commit's fence, or its buffer is being torn down.
-  // The executor owns the fd's close.
+  // Emitted only for fences with an executor-owned payload (syncFile); the
+  // executor owns the fd's close. An implicit pending fence has no payload
+  // and is dropped without an intent.
   | { kind: "discardAcquireFence"; bufferId: number; fence: AcquireFence<Fd> };
 
 // Per-buffer state. (Rule A: the cache lives until the buffer is destroyed
@@ -142,9 +154,11 @@ interface BufferRec<Fd> {
   // exported fence.
   chainFence: ReleaseFence;
   // The most recent commit's acquire fence, pending its single consumer: the
-  // next beginAccess (or takeAcquireFence). Cleared on consume; replaced (with
-  // a discardAcquireFence intent for the old one) by a newer
-  // acquireFenceAvailable; discarded at teardown if still pending.
+  // next beginAccess (or takeAcquireFence). Every acquireFenceAvailable arms
+  // it -- syncFile as-is, "none" as "implicit" (invariant 9). Cleared on
+  // consume; replaced by a newer acquireFenceAvailable (with a
+  // discardAcquireFence intent when the old one was a syncFile); a syncFile
+  // still pending at teardown is discarded.
   pendingAcquireFence: AcquireFence<Fd>;
   // Submit serials that sampled this buffer and have not yet been GPU-completed.
   // Drained as gpuCompleted(serial) arrives; once empty AND the buffer has an
@@ -262,13 +276,13 @@ export class ClientBufferLifecycle<Fd = number> {
   private onAcquireFenceAvailable(bufferId: number, fence: AcquireFence<Fd>): void {
     const b = this.buffers.get(bufferId);
     if (!b) return;  // commit hasn't arrived yet, or buffer destroyed/unknown
-    // A fence-less commit leaves any still-pending fence armed: the client's
-    // last signaled fence still gates the first sample of its writes.
-    if (fence.kind === "none") return;
-    // A newer fence supersedes a still-pending one; the old fence will never
-    // be carried, so hand it back for close.
+    // The commit's fence supersedes whatever was pending (the latest commit's
+    // sync mode wins); a superseded syncFile is handed back for close. A
+    // fence-less commit arms "implicit": the client's new writes are ordered
+    // only by the dmabuf's kernel reservation, so the first sample after this
+    // commit must wait those write-fences (invariant 9).
     this.discardPendingAcquireFence(bufferId, b);
-    b.pendingAcquireFence = fence;
+    b.pendingAcquireFence = fence.kind === "none" ? { kind: "implicit" } : fence;
   }
 
   private onFrameStart(): void {
@@ -505,13 +519,16 @@ export class ClientBufferLifecycle<Fd = number> {
     }
   }
 
-  // Emit discardAcquireFence for a still-pending fence and clear it. No-op
-  // when nothing is pending.
+  // Emit discardAcquireFence for a still-pending fence and clear it. Only a
+  // fence with an executor-owned payload (syncFile's fd) needs the hand-back;
+  // "none" and "implicit" clear silently.
   private discardPendingAcquireFence(bufferId: number, b: BufferRec<Fd>): void {
-    if (b.pendingAcquireFence.kind === "none") return;
-    this.out.push({
-      kind: "discardAcquireFence", bufferId, fence: b.pendingAcquireFence,
-    });
+    const pending = b.pendingAcquireFence;
+    if (pending.kind === "none" || pending.kind === "implicit") {
+      b.pendingAcquireFence = { kind: "none" };
+      return;
+    }
+    this.out.push({ kind: "discardAcquireFence", bufferId, fence: pending });
     b.pendingAcquireFence = { kind: "none" };
   }
 

@@ -297,6 +297,15 @@ export interface Addon {
   // desync the caller surfaces).
   writeBeginAccess(importId: number): boolean;
   writeEndAccess(importId: number): void;
+  // Same as writeBeginAccess, but sets the frame's implicitAcquire flag: the
+  // GPU process exports the dmabuf's reservation write-fences
+  // (EXPORT_SYNC_FILE) and uses that sync_file as the Dawn acquire fence, so
+  // the sample waits an implicit-sync client's pending writes. The lifecycle
+  // machine hands out kind "implicit" for the first sample after a fence-less
+  // commit; plain writeBeginAccess (no wait) covers re-samples of an
+  // unchanged buffer. Returns false iff the import is unknown (same JS-gate
+  // contract as writeBeginAccess).
+  writeBeginAccessImplicit(importId: number): boolean;
   // Same as writeBeginAccess, but additionally attaches `acquireFenceFd` (a
   // sync_file fd from wp_linux_drm_syncobj_v1's acquire timeline point) to
   // the BeginAccess wire frame via SCM_RIGHTS. The GPU process uses that

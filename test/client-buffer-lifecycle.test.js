@@ -31,6 +31,7 @@ function drive(events) {
 }
 
 const noFence = { kind: "none" };
+const implFence = { kind: "implicit" };
 const sfFence = (fd) => ({ kind: "syncFile", fd });
 const dims = (w, h) => ({ w, h });
 
@@ -573,15 +574,19 @@ test("fence: same-buffer re-commit discards the stale pending fence (old fence i
   assert.deepEqual(pick(f, "beginAccess")[0].acquireFence, sfFence(9002));
 });
 
-test("fence: a fence-less re-commit leaves the pending fence armed (no discard, next sample carries it)", () => {
+test("fence: a fence-less re-commit replaces a pending explicit fence with implicit (old fd discarded)", () => {
   const m = new ClientBufferLifecycle();
   commitImported(m, 1, 100, dims(8, 8));
   m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
   m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
   const i = m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: noFence });
-  assert.equal(pick(i, "discardAcquireFence").length, 0);
+  // The latest commit's sync mode wins: the stale explicit fence is handed
+  // back for close, and the new commit's writes get the implicit wait.
+  const d = pick(i, "discardAcquireFence");
+  assert.equal(d.length, 1);
+  assert.deepEqual(d[0].fence, sfFence(9001));
   const f = runFrame(m, [1], 1);
-  assert.deepEqual(pick(f, "beginAccess")[0].acquireFence, sfFence(9001));
+  assert.deepEqual(pick(f, "beginAccess")[0].acquireFence, implFence);
 });
 
 test("fence: bufferDestroyed with a pending fence emits discardAcquireFence", () => {
@@ -661,6 +666,83 @@ test("fence: syncobj throws on takeAcquireFence too (no silent degrade on out-of
   });
   assert.throws(() => m.takeAcquireFence(100),
     /syncobj acquire fence not implemented/);
+});
+
+// Implicit acquire (invariant 9, fence-less commits) -------------------------
+
+test("implicit: armed on a fence-less commit; first sample carries it, consumed once, re-sample none", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: noFence });
+  const f1 = runFrame(m, [1], 1);
+  assert.deepEqual(pick(f1, "beginAccess")[0].acquireFence, implFence);
+  m.step({ kind: "gpuCompleted", serial: 1 });
+  // No re-commit: the re-sample reads an unchanged dmabuf; no implicit wait.
+  const f2 = runFrame(m, [1], 2);
+  assert.deepEqual(pick(f2, "beginAccess")[0].acquireFence, noFence);
+});
+
+test("implicit: EVERY fence-less commit re-arms it (cached re-commit gets a fresh acquire wait)", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: noFence });
+  runFrame(m, [1], 1);
+  m.step({ kind: "gpuCompleted", serial: 1 });
+  // Same-buffer re-commit (cache hit): the client wrote new content into the
+  // same dmabuf; the next sample must wait its writes again.
+  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: noFence });
+  const f = runFrame(m, [1], 2);
+  assert.deepEqual(pick(f, "beginAccess")[0].acquireFence, implFence);
+});
+
+test("implicit: an explicit syncFile supersedes a pending implicit with NO discard intent", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: noFence });
+  // A newer commit carries an explicit fence. Implicit has no fd to close,
+  // so nothing is handed back.
+  m.step({ kind: "commit", surfaceId: 1, bufferId: 100, dims: dims(8, 8) });
+  const i = m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: sfFence(9001) });
+  assert.equal(pick(i, "discardAcquireFence").length, 0);
+  const f = runFrame(m, [1], 1);
+  assert.deepEqual(pick(f, "beginAccess")[0].acquireFence, sfFence(9001));
+});
+
+test("implicit: teardown with a pending implicit emits NO discard (discard is syncFile-only)", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: noFence });
+  const i = m.step({ kind: "bufferDestroyed", bufferId: 100 });
+  assert.equal(pick(i, "discardAcquireFence").length, 0);
+  assert.equal(pick(i, "releaseImport").length, 1, "teardown proceeds normally");
+  assert.equal(m.snapshot().buffers.length, 0);
+});
+
+test("implicit: takeAcquireFence hands it to an out-of-frame sampler, consume-once", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: noFence });
+  assert.deepEqual(m.takeAcquireFence(100), implFence);
+  assert.deepEqual(m.takeAcquireFence(100), noFence, "consume-once");
+  const f = runFrame(m, [1], 1);
+  assert.deepEqual(pick(f, "beginAccess")[0].acquireFence, noFence);
+});
+
+test("implicit: never crosses buffers", () => {
+  const m = new ClientBufferLifecycle();
+  commitImported(m, 1, 100, dims(8, 8));
+  commitImported(m, 2, 200, dims(8, 8));
+  // Only buffer 200's commit arms an implicit acquire (buffer 100's fence
+  // event was consumed by an earlier sample).
+  m.step({ kind: "acquireFenceAvailable", bufferId: 100, fence: noFence });
+  assert.deepEqual(m.takeAcquireFence(100), implFence);
+  m.step({ kind: "acquireFenceAvailable", bufferId: 200, fence: noFence });
+  const f = runFrame(m, [1, 2], 1);
+  const b100 = pick(f, "beginAccess", (x) => x.bufferId === 100)[0];
+  const b200 = pick(f, "beginAccess", (x) => x.bufferId === 200)[0];
+  assert.deepEqual(b100.acquireFence, noFence);
+  assert.deepEqual(b200.acquireFence, implFence);
 });
 
 // Frame contract ------------------------------------------------------------

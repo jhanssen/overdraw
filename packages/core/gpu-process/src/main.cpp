@@ -1595,15 +1595,19 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
 
     // Open a per-frame BeginAccess on a cached client texture. When the core
     // passes an explicit acquire sync_file fd (>= 0) -- the wp_linux_drm_syncobj_v1
-    // path -- that fd is used as the Dawn acquire fence. Otherwise the dmabuf's
-    // implicit-sync acquire fence is re-exported here via EXPORT_SYNC_FILE
-    // (the implicit-sync path). Either way, the prior frame's EndAccess fence
-    // is also chained so Dawn waits on both.
+    // path -- that fd is used as the Dawn acquire fence. When it instead sets
+    // implicitAcquire (the frame's flag byte), the dmabuf's implicit-sync
+    // acquire fence is exported here via EXPORT_SYNC_FILE. The core's
+    // lifecycle machine sets the flag on the first sample after each
+    // fence-less commit; a flag-less fence-less Begin is a re-sample of an
+    // unchanged buffer and waits nothing beyond the chain. Either way, the
+    // prior frame's EndAccess fence is also chained so Dawn waits on both.
     //
     // explicitAcquireFd, when >= 0, is owned by this function (it closes it
     // after import).
     auto runBeginClientAccess = [&](uint32_t textureId, uint32_t textureGen,
-                                    int explicitAcquireFd) -> bool {
+                                    int explicitAcquireFd,
+                                    bool implicitAcquire) -> bool {
         auto it = clientTextures.find(textureId);
         if (it == clientTextures.end() || it->second.generation != textureGen) {
             LOG_ERR(Gpu,
@@ -1629,14 +1633,17 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         }
 
         // Acquire fence: explicit when the core (wp_linux_drm_syncobj_v1) sent
-        // a sync_file fd alongside this BeginAccess; otherwise the dmabuf's
-        // current implicit-sync read-acquire sync_file. Explicit sync is
-        // required for clients (e.g. the NVIDIA proprietary driver) that do
-        // not attach implicit fences to their dmabufs -- their EXPORT_SYNC_FILE
-        // returns an already-signaled stub fence, so without the explicit path
-        // the compositor's sample races the client's pending GPU writes.
+        // a sync_file fd alongside this BeginAccess; otherwise, when the
+        // implicitAcquire flag is set, the dmabuf's current reservation
+        // write-fences exported here. Explicit sync is required for clients
+        // (e.g. the NVIDIA proprietary driver) that do not attach implicit
+        // fences to their dmabufs -- their EXPORT_SYNC_FILE returns an
+        // already-signaled stub fence, so without the explicit path the
+        // compositor's sample races the client's pending GPU writes. A failed
+        // export logs (inside the helper) and the Begin proceeds without an
+        // acquire wait.
         int syncFd = explicitAcquireFd;
-        if (syncFd < 0) syncFd = exportDmabufAcquireFence(ct.fd);
+        if (syncFd < 0 && implicitAcquire) syncFd = exportDmabufAcquireFence(ct.fd);
         wgpu::SharedFence acquireFence;
         if (syncFd >= 0) {
             wgpu::SharedFenceSyncFDDescriptor sfd{};
@@ -2665,17 +2672,19 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             }
             uint32_t texId = ipc::getU32LE(frame.data() + 1);
             uint32_t texGen = ipc::getU32LE(frame.data() + 5);
+            const bool implicitAcquire = frame[9] != 0;
             bool ok;
             if (kind == ipc::FrameKind::BeginAccess) {
-                // Implicit-sync BeginAccess: zero fds (BeginAccessWithFence
-                // carries the explicit-sync fd as kind=5 instead).
+                // Fd-less BeginAccess (BeginAccessWithFence carries the
+                // explicit-sync fd as kind=5 instead). The payload's
+                // implicitAcquire flag selects the reservation-fence wait.
                 if (nfds != 0) {
                     LOG_ERR(Ipc,
                         "core wire: BeginAccess with nfds={} (must be 0; "
                         "explicit sync uses BeginAccessWithFence)", nfds);
                     std::abort();
                 }
-                ok = runBeginClientAccess(texId, texGen, -1);
+                ok = runBeginClientAccess(texId, texGen, -1, implicitAcquire);
             } else if (kind == ipc::FrameKind::BeginAccessWithFence) {
                 // Explicit-sync (wp_linux_drm_syncobj_v1) BeginAccess: exactly
                 // one SCM_RIGHTS fd, a sync_file the GPU process passes to
@@ -2686,7 +2695,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         nfds);
                     std::abort();
                 }
-                ok = runBeginClientAccess(texId, texGen, fds[0]);
+                ok = runBeginClientAccess(texId, texGen, fds[0], false);
             } else {
                 if (nfds != 0) {
                     LOG_ERR(Ipc, "core wire: ClientTex End with nfds={} (must be 0)", nfds);

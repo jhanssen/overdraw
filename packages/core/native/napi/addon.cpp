@@ -2067,6 +2067,22 @@ napi_value WriteBeginAccess(napi_env env, napi_callback_info info) {
     napi_value out; napi_get_boolean(env, ok, &out); return out;
 }
 
+// writeBeginAccessImplicit(importId) -> bool. Same as writeBeginAccess, but
+// sets the frame's implicitAcquire flag: the GPU process exports the dmabuf's
+// reservation write-fences (EXPORT_SYNC_FILE) and uses them as the Dawn
+// acquire fence, so the sample waits an implicit-sync client's pending
+// writes. Sent for the first sample after a fence-less commit.
+napi_value WriteBeginAccessImplicit(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (!g_addon.compositor) { napi_value f; napi_get_boolean(env, false, &f); return f; }
+    uint32_t importId = 0;
+    napi_get_value_uint32(env, argv[0], &importId);
+    const bool ok = importId != 0
+        && g_addon.compositor->writeClientTexBeginAccessImplicit(importId);
+    napi_value out; napi_get_boolean(env, ok, &out); return out;
+}
+
 // writeBeginAccessWithFence(importId, acquireFenceFd: WaylandFd) -> bool.
 // In-band per-frame BeginAccess that ATTACHES the given sync_file fd via
 // SCM_RIGHTS. The GPU process uses it as the Dawn acquire fence instead of
@@ -3547,6 +3563,11 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_create_function(env, "writeBeginAccess", NAPI_AUTO_LENGTH,
                          WriteBeginAccess, nullptr, &fnWriteBeginAccess);
     napi_set_named_property(env, exports, "writeBeginAccess", fnWriteBeginAccess);
+    napi_value fnWriteBeginAccessImplicit;
+    napi_create_function(env, "writeBeginAccessImplicit", NAPI_AUTO_LENGTH,
+                         WriteBeginAccessImplicit, nullptr, &fnWriteBeginAccessImplicit);
+    napi_set_named_property(env, exports, "writeBeginAccessImplicit",
+                            fnWriteBeginAccessImplicit);
     napi_value fnWriteBeginAccessFence;
     napi_create_function(env, "writeBeginAccessWithFence", NAPI_AUTO_LENGTH,
                          WriteBeginAccessWithFence, nullptr, &fnWriteBeginAccessFence);

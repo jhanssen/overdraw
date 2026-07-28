@@ -455,6 +455,7 @@ export type CompositorAddon = Pick<
   | "commitShmUpload"
   | "takeShmUploadAcks"
   | "writeBeginAccess"
+  | "writeBeginAccessImplicit"
   | "writeBeginAccessWithFence"
   | "writeEndAccess"
   | "syncobjTimelineSignal"
@@ -3369,22 +3370,30 @@ export class JsCompositor implements CompositorSink {
   // takeAcquireFence result on the out-of-frame sampler paths).
   //
   // wp_linux_drm_syncobj_v1: a syncFile fence rides
-  // writeBeginAccessWithFence -- the GPU process waits on THAT sync_file
-  // instead of running EXPORT_SYNC_FILE on the dmabuf (the implicit-sync
-  // path). Clients on drivers that don't attach implicit fences (NVIDIA
+  // writeBeginAccessWithFence -- the GPU process waits on THAT sync_file.
+  // Clients on drivers that don't attach implicit fences (NVIDIA
   // proprietary, incl. Xwayland/glamor) are unsynchronized without this
   // wait: sampling races the client's GPU writes and reads stale or
   // never-written (transparent) content.
+  //
+  // "implicit" rides writeBeginAccessImplicit: the GPU process exports the
+  // dmabuf's reservation write-fences (EXPORT_SYNC_FILE) and waits those --
+  // the implicit-sync path for a fence-less commit.
   //
   // The machine hands each commit's fence out exactly once (to whichever
   // sampler runs first after the commit); later samples of the same buffer
   // arrive here with kind "none" and chain on the GPU process's
   // access-fence sequence -- nothing writes the dmabuf again until the
   // client re-commits. Syncobj fences never reach here: the machine throws
-  // rather than handing one out.
+  // rather than handing one out. A syncFile whose fd was closed out from
+  // under us degrades to the implicit wait rather than no wait at all.
   private beginClientAccess(importId: number, fence: AcquireFence<WaylandFd>): boolean {
     if (fence.kind === "syncFile" && !fence.fd.closed) {
       return this.addon.writeBeginAccessWithFence(importId, fence.fd);
+    }
+    if (fence.kind === "implicit"
+        || (fence.kind === "syncFile" && fence.fd.closed)) {
+      return this.addon.writeBeginAccessImplicit(importId);
     }
     return this.addon.writeBeginAccess(importId);
   }
@@ -5052,10 +5061,15 @@ export class JsCompositor implements CompositorSink {
     log.info("core", `scanout: output ${outputId} ineligible: ${reason}`);
   }
 
-  // Consume the buffer's pending explicit-sync acquire fence for a scanout
-  // present (the role wire-BeginAccess plays on the composite path). A
-  // scanned-out buffer is never GPU-sampled -- the composite pass is skipped
-  // for its output -- so this present is the fence's sole consumer.
+  // Consume the buffer's pending acquire fence for a scanout present (the
+  // role wire-BeginAccess plays on the composite path). A scanned-out buffer
+  // is never GPU-sampled -- the composite pass is skipped for its output --
+  // so this present is the fence's sole consumer. Only a syncFile becomes an
+  // explicit fd (the GPU process attaches it as the atomic commit's
+  // IN_FENCE_FD); "implicit" translates to no fd on purpose: when a plane
+  // update carries no IN_FENCE_FD, the kernel's atomic-commit prepare_fb
+  // step waits the framebuffer dmabuf's reservation write-fences itself, so
+  // implicit-sync scanout is ordered without an exported sync_file.
   private takeScanoutAcquireFence(bufferId: number): WaylandFd | null {
     const f = this.lifecycle.takeAcquireFence(bufferId);
     if (f.kind !== "syncFile" || f.fd.closed) return null;

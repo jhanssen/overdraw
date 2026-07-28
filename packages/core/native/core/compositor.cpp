@@ -1151,9 +1151,10 @@ WGPUTexture Compositor::coreSurfaceTexture(uint32_t surfaceBufId) const {
 }
 
 // Encode `payload` into a stack-allocated buffer sized by Payload::kSize and
-// append it as a wire frame of `kind`. The six write* helpers below differ
-// only in payload type (ClientTexAccessPayload vs SurfaceAccessPayload) and
-// the kind constant; everything else is mechanical encode + appendFrame.
+// append it as a wire frame of `kind`. The write* helpers below differ
+// only in payload (ClientTexAccessPayload vs SurfaceAccessPayload, flag
+// values) and the kind constant; everything else is mechanical encode +
+// appendFrame.
 template <typename Payload>
 void Compositor::writeAccessFrame(ipc::FrameKind kind, const Payload& payload) {
     uint8_t buf[Payload::kSize];
@@ -1170,6 +1171,19 @@ bool Compositor::writeClientTexBeginAccess(uint32_t importId) {
     }
     writeAccessFrame(ipc::FrameKind::BeginAccess,
                      ipc::ClientTexAccessPayload{wh->second.id, wh->second.generation});
+    return true;
+}
+
+bool Compositor::writeClientTexBeginAccessImplicit(uint32_t importId) {
+    auto wh = jsImportHandles_.find(importId);
+    if (wh == jsImportHandles_.end()) {
+        LOG_ERR(Core, "writeClientTexBeginAccessImplicit: no handle for importId={}",
+                importId);
+        return false;
+    }
+    writeAccessFrame(ipc::FrameKind::BeginAccess,
+                     ipc::ClientTexAccessPayload{wh->second.id, wh->second.generation,
+                                                 /*implicitAcquire=*/true});
     return true;
 }
 

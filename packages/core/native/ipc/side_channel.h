@@ -362,16 +362,22 @@ private:
     size_t off_ = 0;
 };
 
-// Client-texture Begin/End payload: variant + (id, generation). 9 bytes.
+// Client-texture Begin/End payload: variant + (id, generation) + a trailing
+// implicitAcquire flag. 10 bytes. The flag is meaningful only on a plain
+// BeginAccess (kind=1): the GPU process exports the dmabuf's reservation
+// write-fences and uses them as the Begin's acquire fence (implicit sync).
+// BeginAccessWithFence carries an explicit sync_file instead; End ignores it.
 struct ClientTexAccessPayload {
     uint32_t textureId;
     uint32_t textureGeneration;
-    static constexpr size_t kSize = 1 + 4 + 4;
+    bool implicitAcquire = false;
+    static constexpr size_t kSize = 1 + 4 + 4 + 1;
     void encode(uint8_t* out) const {
         ByteWriter w(out);
         w.u8(static_cast<uint8_t>(AccessVariant::ClientTex));
         w.u32(textureId);
         w.u32(textureGeneration);
+        w.u8(implicitAcquire ? 1 : 0);
     }
 };
 

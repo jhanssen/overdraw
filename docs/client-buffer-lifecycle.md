@@ -9,8 +9,8 @@ unit-tested, and the executor (`gpu/compositor.ts` + the GPU process's
 bracket handler) is a mechanical translator of the intents the machine
 emits. The invariants are numbered and documented at the top of the
 machine's source; the tests in `test/client-buffer-lifecycle.test.js` pin
-them. This doc covers what the code cannot: how fences flow today, why
-that shape is a known limitation, and the design that completes it.
+them. This doc covers what the code cannot: how fences flow, and the
+design steps that produced that shape.
 
 ## Fence flow today
 
@@ -31,9 +31,21 @@ fence (compositor's sampling must finish before the client reuses).
   unchanged buffer carry none. Replacement by a newer commit's fence and
   teardown with a fence still pending emit a `discardAcquireFence` intent;
   the executor closes the fd.
-- **Implicit sync**: the GPU process exports the dmabuf's reservation
-  fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, write fences) once, at IMPORT
-  time, and feeds it into that import's first BeginAccess.
+- **Implicit sync**: a fence-less commit arms the machine's pending fence
+  as `{ kind: "implicit" }` (no payload). The first sampler after the
+  commit carries it; the executor translates it to a wire Begin with the
+  `implicitAcquire` flag set, and the GPU process exports the dmabuf's
+  reservation fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, write fences) and
+  imports it into THAT BeginAccess. Re-samples of the unchanged buffer
+  carry `none` — no export, no wait beyond the intra-process access
+  chain. A failed export logs and the Begin proceeds without an acquire
+  wait. Replacing a pending implicit (a newer commit's syncFile wins)
+  emits no discard — there is no fd to close.
+- **Direct scanout**: only a syncFile becomes the atomic commit's
+  `IN_FENCE_FD`. An implicit pending fence translates to *no* explicit
+  fd on purpose: when a plane update carries no `IN_FENCE_FD`, the
+  kernel's atomic-commit prepare_fb step waits the framebuffer dmabuf's
+  reservation write-fences itself.
 - **Release**: the real end-of-access fence lives in the GPU process and
   is chained intra-process between brackets; the core never sees it.
 
@@ -42,16 +54,6 @@ sentinel (an ordering event, not a fence carrier), and it deliberately
 THROWS if a beginAccess intent (or takeAcquireFence) would ever carry a
 syncobj fence — a tripwire so the executor cannot silently drop a real
 fence (the black-frame bug for explicit-sync clients).
-
-## The known limitation
-
-**Cached re-commits skip the implicit acquire.** The implicit sync_file
-is exported once at import time. A buffer-cycling client that re-commits
-a CACHED buffer (rule A: supersede does not drop the cache) gets no
-fresh acquire wait on its new frame's writes. Explicit-sync clients are
-unaffected (per-commit fences through the machine); implicit-sync clients
-rely on the sampling GPU work being slower than their render, which is
-timing, not correctness.
 
 ## Completed design
 
@@ -87,24 +89,27 @@ timing, not correctness.
 Step 1 is a refactor with byte-identical wire behavior — verifiable by
 the existing GPU suite alone.
 
-### Step 2 — per-sample implicit acquire (fixes the known limitation)
+### Step 2 — per-sample implicit acquire — IMPLEMENTED
 
-- The wire Begin frame (`ClientTexAccessPayload`) gains a flag byte:
-  `implicitAcquire`. On decode, the GPU process re-exports the dmabuf's
-  current write-reservation sync_file (helper already exists:
-  `exportDmabufAcquireFence`) and imports it into that BeginAccess.
-- The machine models it as acquire kind `"implicit"`: emitted on the
-  first beginAccess after a commit that carried no explicit fence.
-  Re-samples of an unchanged buffer stay `"none"` (the first sample
-  already waited the client's writes; later samples read an unchanged
-  dmabuf).
+- The wire Begin frame (`ClientTexAccessPayload`) carries a flag byte:
+  `implicitAcquire`. On decode, the GPU process exports the dmabuf's
+  current write-reservation sync_file (`exportDmabufAcquireFence`) and
+  imports it into that BeginAccess.
+- The machine models it as acquire kind `"implicit"`: armed by every
+  commit that carried no explicit fence, emitted on the first
+  beginAccess (or takeAcquireFence) after that commit. Re-samples of an
+  unchanged buffer stay `"none"` (the first sample already waited the
+  client's writes; later samples read an unchanged dmabuf). The machine
+  decides WHEN the export happens; the GPU process no longer exports
+  unconditionally, so a re-sample costs no ioctl and waits no fence
+  attached after the sampled commit.
 - Cost: one ioctl per commit-then-first-sample, GPU-process side, off the
   core's frame path.
 
-Step 2 changes sampling behavior for implicit-sync clients and needs
-bare-metal verification (an implicit-sync client under load; NVIDIA,
-which attaches no implicit fences, must show no regression on the
-explicit path).
+Step 2 changed sampling behavior for implicit-sync clients and still
+needs bare-metal verification (an implicit-sync client under load;
+NVIDIA, which attaches no implicit fences, must show no regression on
+the explicit path).
 
 ### Explicitly out of scope
 

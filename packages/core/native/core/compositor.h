@@ -589,10 +589,16 @@ class Compositor {
     // unknown -- the JS side gates Begin on the import being live, so a miss is
     // a JS-gate bug the caller should surface.
     bool writeClientTexBeginAccess(uint32_t importId);
+    // Same as writeClientTexBeginAccess, but sets the payload's
+    // implicitAcquire flag: the GPU process exports the dmabuf's reservation
+    // write-fences (EXPORT_SYNC_FILE) and uses that sync_file as the Dawn
+    // acquire fence. Sent for the first sample after a fence-less commit so
+    // the sample waits an implicit-sync client's pending writes.
+    bool writeClientTexBeginAccessImplicit(uint32_t importId);
     // Same as writeClientTexBeginAccess, but additionally attaches a sync_file
     // fd as SCM_RIGHTS on the BeginAccess frame. The GPU process uses that fd
     // as the Dawn acquire fence INSTEAD of running EXPORT_SYNC_FILE on the
-    // dmabuf (the implicit-sync path). Driven by wp_linux_drm_syncobj_v1:
+    // dmabuf. Driven by wp_linux_drm_syncobj_v1:
     // the JS layer exports the sync_file from the client's acquire timeline
     // point and hands it here. Takes ownership of acquireFenceFd (closes it on
     // failure; on success the wire serializer dups it for in-flight retention).
