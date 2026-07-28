@@ -236,51 +236,16 @@ bool pickCrtc(int drmFd, uint32_t connectorId, uint32_t& outCrtcId,
     return ok;
 }
 
-bool pickPrimaryPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId) {
+// Find a plane of the given DRM_PLANE_TYPE_* reachable from crtcId, skipping
+// excludePlanes. The type comes from each plane's "type" property
+// (universal-planes makes this required reading).
+static bool pickPlaneOfType(int drmFd, uint32_t crtcId, uint64_t planeType,
+                            const std::vector<uint32_t>& excludePlanes,
+                            uint32_t& outPlaneId) {
     drmModeRes* res = drmModeGetResources(drmFd);
     if (!res) return false;
 
     // Map crtcId -> its index in res->crtcs, to evaluate plane->possible_crtcs.
-    int crtcIdx = -1;
-    for (int i = 0; i < res->count_crtcs; ++i) {
-        if (res->crtcs[i] == crtcId) { crtcIdx = i; break; }
-    }
-    drmModeFreeResources(res);
-    if (crtcIdx < 0) return false;
-
-    drmModePlaneRes* planes = drmModeGetPlaneResources(drmFd);
-    if (!planes) return false;
-    bool ok = false;
-    for (uint32_t i = 0; i < planes->count_planes && !ok; ++i) {
-        drmModePlane* p = drmModeGetPlane(drmFd, planes->planes[i]);
-        if (!p) continue;
-        const bool reachable = (p->possible_crtcs & (1u << crtcIdx)) != 0;
-        drmModeFreePlane(p);
-        if (!reachable) continue;
-        // The plane is reachable from the CRTC; check its type via the type
-        // property (universal-planes makes this required reading).
-        bool isPrimary = false;
-        walkProperties(drmFd, planes->planes[i], DRM_MODE_OBJECT_PLANE,
-            [&](const char* name, uint64_t value, const drmModePropertyRes*) {
-                if (std::strcmp(name, "type") == 0 && value == DRM_PLANE_TYPE_PRIMARY) {
-                    isPrimary = true;
-                }
-            });
-        if (isPrimary) {
-            outPlaneId = planes->planes[i];
-            ok = true;
-        }
-    }
-    drmModeFreePlaneResources(planes);
-    if (!ok) LOG_ERR(Gpu, "[drm] no primary plane for CRTC {}", crtcId);
-    return ok;
-}
-
-bool pickCursorPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId,
-                     const std::vector<uint32_t>& excludePlanes) {
-    drmModeRes* res = drmModeGetResources(drmFd);
-    if (!res) return false;
-
     int crtcIdx = -1;
     for (int i = 0; i < res->count_crtcs; ++i) {
         if (res->crtcs[i] == crtcId) { crtcIdx = i; break; }
@@ -299,22 +264,35 @@ bool pickCursorPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId,
         const bool reachable = (p->possible_crtcs & (1u << crtcIdx)) != 0;
         drmModeFreePlane(p);
         if (!reachable) continue;
-        bool isCursor = false;
+        bool matches = false;
         walkProperties(drmFd, planes->planes[i], DRM_MODE_OBJECT_PLANE,
             [&](const char* name, uint64_t value, const drmModePropertyRes*) {
-                if (std::strcmp(name, "type") == 0 && value == DRM_PLANE_TYPE_CURSOR) {
-                    isCursor = true;
+                if (std::strcmp(name, "type") == 0 && value == planeType) {
+                    matches = true;
                 }
             });
-        if (isCursor) {
+        if (matches) {
             outPlaneId = planes->planes[i];
             ok = true;
         }
     }
     drmModeFreePlaneResources(planes);
+    return ok;
+}
+
+bool pickPrimaryPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId) {
+    if (pickPlaneOfType(drmFd, crtcId, DRM_PLANE_TYPE_PRIMARY, {}, outPlaneId))
+        return true;
+    LOG_ERR(Gpu, "[drm] no primary plane for CRTC {}", crtcId);
+    return false;
+}
+
+bool pickCursorPlane(int drmFd, uint32_t crtcId, uint32_t& outPlaneId,
+                     const std::vector<uint32_t>& excludePlanes) {
     // No log on miss: absence of a cursor plane is a normal configuration
     // (the output just uses the software cursor).
-    return ok;
+    return pickPlaneOfType(drmFd, crtcId, DRM_PLANE_TYPE_CURSOR, excludePlanes,
+                           outPlaneId);
 }
 
 void queryCursorSizeCaps(int drmFd, uint32_t& outWidth, uint32_t& outHeight) {

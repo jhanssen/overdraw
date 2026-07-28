@@ -551,6 +551,28 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     std::unordered_map<uint32_t, std::pair<uint32_t, int>> scanoutBufIdToSlot;
     std::unordered_map<uint32_t, int> scanoutFenceFdByBufId;
 
+    // Erase every scanout slot's bookkeeping (surfaceBufs entry, slot routing,
+    // pending sync_file fd) whose outputId satisfies `match`. Ring teardown
+    // paths (nested resize re-reserve, SwitchMode, hotplug removal) all route
+    // through this so no path can forget the fence-fd close.
+    auto dropScanoutSlotState = [&](auto&& match) {
+        for (auto it = scanoutBufIdToSlot.begin();
+             it != scanoutBufIdToSlot.end();) {
+            if (match(it->second.first)) {
+                const uint32_t bufId = it->first;
+                surfaceBufs.erase(bufId);
+                auto fit = scanoutFenceFdByBufId.find(bufId);
+                if (fit != scanoutFenceFdByBufId.end()) {
+                    if (fit->second >= 0) ::close(fit->second);
+                    scanoutFenceFdByBufId.erase(fit);
+                }
+                it = scanoutBufIdToSlot.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+
     // Send a ScanoutReady reply on the WIRE. The matching ScanoutReserve
     // arrived on the wire (kind=6), so the reply also rides the wire to keep
     // the handshake's two sides on the same FIFO. The core's inboundHandler
@@ -892,21 +914,7 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
         // resize handler; the GPU process's wire dispatch is sequential
         // per fd, so any old in-flight bracket frames already ran).
         // First-time bring-up: the map is empty for outputId=0, no-op.
-        for (auto it = scanoutBufIdToSlot.begin();
-             it != scanoutBufIdToSlot.end();) {
-            if (it->second.first == 0) {
-                const uint32_t bufId = it->first;
-                surfaceBufs.erase(bufId);
-                auto fit = scanoutFenceFdByBufId.find(bufId);
-                if (fit != scanoutFenceFdByBufId.end()) {
-                    if (fit->second >= 0) ::close(fit->second);
-                    scanoutFenceFdByBufId.erase(fit);
-                }
-                it = scanoutBufIdToSlot.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        dropScanoutSlotState([](uint32_t outputId) { return outputId == 0; });
         wgpu::SharedTextureMemory mems[3];
         wgpu::Texture texs[3];
         for (int i = 0; i < 3; ++i) {
@@ -2009,21 +2017,8 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // Erase the old ring's surfaceBufs / fence-fd / slot-routing
             // entries BEFORE the ring is torn down. The wgpu::Texture refs
             // in surfaceBufs would keep the old textures alive otherwise.
-            for (auto it = scanoutBufIdToSlot.begin();
-                 it != scanoutBufIdToSlot.end();) {
-                if (it->second.first == p.outputId) {
-                    const uint32_t bufId = it->first;
-                    surfaceBufs.erase(bufId);
-                    auto fit = scanoutFenceFdByBufId.find(bufId);
-                    if (fit != scanoutFenceFdByBufId.end()) {
-                        if (fit->second >= 0) ::close(fit->second);
-                        scanoutFenceFdByBufId.erase(fit);
-                    }
-                    it = scanoutBufIdToSlot.erase(it);
-                } else {
-                    ++it;
-                }
-            }
+            dropScanoutSlotState(
+                [&](uint32_t outputId) { return outputId == p.outputId; });
             if (!kms->switchMode(p.outputId, p.width, p.height, p.refreshMhz,
                                   coreDevice)) {
                 // switchMode logs the cause. The output stays in outputs_ but
@@ -3078,21 +3073,9 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             // output. Also drop any pending sync_file fd.
                             std::unordered_set<uint32_t> removedSet(
                                 result.removed.begin(), result.removed.end());
-                            for (auto it = scanoutBufIdToSlot.begin();
-                                 it != scanoutBufIdToSlot.end();) {
-                                if (removedSet.count(it->second.first)) {
-                                    const uint32_t bufId = it->first;
-                                    surfaceBufs.erase(bufId);
-                                    auto fit = scanoutFenceFdByBufId.find(bufId);
-                                    if (fit != scanoutFenceFdByBufId.end()) {
-                                        if (fit->second >= 0) ::close(fit->second);
-                                        scanoutFenceFdByBufId.erase(fit);
-                                    }
-                                    it = scanoutBufIdToSlot.erase(it);
-                                } else {
-                                    ++it;
-                                }
-                            }
+                            dropScanoutSlotState([&](uint32_t outputId) {
+                                return removedSet.count(outputId) != 0;
+                            });
 
                             // Emit OutputRemoved for every vanished id BEFORE
                             // any OutputAdded (ordering matters: the core

@@ -659,6 +659,41 @@ void advanceAllPending(napi_env env) {
     napi_close_handle_scope(env, scope);
 }
 
+void onFrameComplete();
+void wake();
+
+// Route everything a steady-state drainCtrl()/drainWire() pass may have
+// RECORDED: JS dmabuf-import resolution, the hotplug event queues, plugin-
+// broker advancement, and the wake state machine. MUST run after ANY
+// steady-state drain on the Node thread — a drain site that skips a step
+// strands that reply until an unrelated event happens to fire it (an
+// awaiting plugin op or an idle output hangs). Both fd polls call this so
+// neither can miss a reply the other's drain consumed.
+void dispatchAfterDrain(napi_env env) {
+    fireJsImports(env);
+    // Order: Removed before Descriptor/Added. The GPU process emits all
+    // removeds for a rescan pass before any addeds (CRTC pool clean before
+    // assignment); the JS workspace migration policy depends on that
+    // ordering. OutputDescriptor (re-emit on identity change) doesn't
+    // interact with the hotplug pair and runs alongside. OutputModes after
+    // Added: the mode list applies to an already-created state.outputs entry.
+    fireOutputsRemoved(env);
+    fireOutputDescriptors(env);
+    fireOutputsAdded(env);
+    fireOutputModes(env);
+    fireCursorPlaneStatuses(env);
+    fireScanoutClientEvents(env);
+    advanceAllPending(env);
+    // A drain may have observed a ScanoutFlipComplete / FrameComplete;
+    // route it to the wake state machine.
+    if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
+    // An shm upload completed: its ack carries deferred output damage that
+    // JS applies on drain (dispatchFrameCallbacks -> takeShmUploadAcks).
+    // Wake so an idle compositor renders it now instead of stranding it
+    // until the next unrelated wake (input / another output's flip).
+    if (g_addon.compositor->hasShmUploadAcks()) wake();
+}
+
 void onWireReadable(uv_poll_t*, int status, int events) {
     if (status < 0 || !g_addon.compositor) return;
     UvJsScope jsScope(g_addon.env, g_addon.uvJsCtx);
@@ -674,31 +709,7 @@ void onWireReadable(uv_poll_t*, int status, int events) {
         // The wire advancing may let deferred imports complete on the GPU side,
         // whose ClientTexImported replies arrive on the ctrl fd; drain it too.
         g_addon.compositor->drainCtrl();
-        fireJsImports(g_addon.env);
-        // Order: Removed before Descriptor/Added. The GPU process emits all
-        // removeds for a rescan pass before any addeds (CRTC pool clean before
-        // assignment); the JS workspace migration policy depends on that
-        // ordering. OutputDescriptor (re-emit on identity change) doesn't
-        // interact with the hotplug pair and runs alongside.
-        fireOutputsRemoved(g_addon.env);
-        fireOutputDescriptors(g_addon.env);
-        fireOutputsAdded(g_addon.env);
-        // OutputModes after Added: the mode list applies to an
-        // already-created state.outputs entry.
-        fireOutputModes(g_addon.env);
-        fireCursorPlaneStatuses(g_addon.env);
-        fireScanoutClientEvents(g_addon.env);
-        // drainCtrl above may have consumed plugin-broker replies (alloc/begin/...);
-        // advance them here too, else they are stranded (see advanceAllPending).
-        advanceAllPending(g_addon.env);
-        // drainCtrl may have observed a ScanoutFlipComplete / FrameComplete;
-        // route it to the wake state machine.
-        if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
-        // An shm upload completed: its ack carries deferred output damage that
-        // JS applies on drain (dispatchFrameCallbacks -> takeShmUploadAcks).
-        // Wake so an idle compositor renders it now instead of stranding it
-        // until the next unrelated wake (input / another output's flip).
-        if (g_addon.compositor->hasShmUploadAcks()) wake();
+        dispatchAfterDrain(g_addon.env);
         napi_close_handle_scope(g_addon.env, scope);
     }
     armWirePoll();  // update WRITABLE arming based on remaining queue
@@ -715,17 +726,7 @@ void onCtrlReadable(uv_poll_t*, int status, int events) {
     if (events & UV_WRITABLE) g_addon.compositor->ctrlPumpOut();
     if (events & UV_READABLE) {
         g_addon.compositor->drainCtrl();
-        fireJsImports(g_addon.env);  // resolve JS dmabuf imports (opens its own scope)
-        // Removed before Descriptor/Added (see onWireReadable for rationale).
-        fireOutputsRemoved(g_addon.env);
-        fireOutputDescriptors(g_addon.env);
-        fireOutputsAdded(g_addon.env);
-        fireOutputModes(g_addon.env);
-        fireCursorPlaneStatuses(g_addon.env);
-        fireScanoutClientEvents(g_addon.env);
-        advanceAllPending(g_addon.env);
-        if (g_addon.compositor->takeFrameComplete()) onFrameComplete();
-        if (g_addon.compositor->hasShmUploadAcks()) wake();  // see onWireReadable
+        dispatchAfterDrain(g_addon.env);
         armWirePoll();  // finishing an import flushes wire output (bind group etc.)
     }
     armCtrlPoll();  // re-arm UV_WRITABLE based on remaining queue

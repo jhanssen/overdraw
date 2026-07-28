@@ -301,18 +301,9 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
 export async function loadConfig(explicit: string | null): Promise<ResolvedConfig> {
   const path = resolveConfigPath(explicit);
   if (path === null) {
-    return {
-      output: null, card: null, scale: null, outputsByKey: {},
-      focus: undefined, hotkeys: undefined,
-      decoration: undefined, layout: undefined, canvas: undefined,
-      actions: undefined, plugins: [],
-      xwayland: { enabled: false, terminate: false, xwaylandPath: null, displayNumber: 50, scale: 0 },
-      autostart: [],
-      windowRules: [],
-      cursor: { hardware: true },
-      directScanout: true,
-      sourcePath: null,
-    };
+    // Built-in defaults: an empty config through normalize, so the default
+    // shape has exactly one source of truth.
+    return { ...normalize({}, "(built-in defaults)"), sourcePath: null };
   }
   // Node's ESM registry caches by full URL, so a bare file URL would return
   // the first evaluation forever. Keying a query param to the file's
