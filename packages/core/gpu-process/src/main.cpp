@@ -552,9 +552,12 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
     std::unordered_map<uint32_t, int> scanoutFenceFdByBufId;
 
     // Erase every scanout slot's bookkeeping (surfaceBufs entry, slot routing,
-    // pending sync_file fd) whose outputId satisfies `match`. Ring teardown
-    // paths (nested resize re-reserve, SwitchMode, hotplug removal) all route
-    // through this so no path can forget the fence-fd close.
+    // pending sync_file fd) whose outputId satisfies `match`. Runs only at
+    // drain-safe points -- the nested/KMS ScanoutReserve re-reserve handlers
+    // and the OutputRemovedDone ack -- where wire FIFO guarantees no bracket
+    // or present against the swept bufIds is still in flight. Never call it
+    // directly from a ring-teardown path: the core may still be rendering
+    // against these bufIds, and a Begin that finds no surfaceBuf aborts.
     auto dropScanoutSlotState = [&](auto&& match) {
         for (auto it = scanoutBufIdToSlot.begin();
              it != scanoutBufIdToSlot.end();) {
@@ -697,6 +700,15 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             sendScanoutReady(outputId, false);
             return false;
         }
+        // Sweep any prior ring's surfaceBufs / fence-fd / slot-routing for
+        // this outputId (mode-switch rebuild; also clears leftovers if an
+        // OutputRemovedDone ack never arrived before a replug). Wire FIFO:
+        // the core sent this Reserve after processing ScanoutRebuild /
+        // OutputAdded, so every bracket it issued against the old ring has
+        // already been decoded. The new slots' entries are inserted below
+        // (injectScanoutRingSlots), after the sweep, so it cannot touch
+        // them.
+        dropScanoutSlotState([&](uint32_t oid) { return oid == outputId; });
         wgpu::SharedTextureMemory mems[3];
         wgpu::Texture texs[3];
         for (int i = 0; i < 3; ++i) {
@@ -2021,22 +2033,33 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                         p.outputId);
                 return;
             }
-            // Erase the old ring's surfaceBufs / fence-fd / slot-routing
-            // entries BEFORE the ring is torn down. The wgpu::Texture refs
-            // in surfaceBufs would keep the old textures alive otherwise.
-            dropScanoutSlotState(
-                [&](uint32_t outputId) { return outputId == p.outputId; });
+            // The old ring's surfaceBufs / fence-fd / slot-routing entries
+            // are NOT swept here: the core keeps rendering against the old
+            // bufIds until it processes our ScanoutRebuild, and a
+            // ProducerBegin already behind this frame (or issued in that
+            // window) must still find its surfaceBuf -- the kept
+            // wgpu::Texture refs hold the old slot textures alive across
+            // the ring swap. handleScanoutReserve sweeps them when the
+            // core's re-reserve arrives, FIFO-after its last old-ring
+            // bracket. Stale presents in the window flip a rebuilt slot
+            // (one transient garbage frame during a modeset) or are
+            // swallowed by presentScanoutAt when the ring is gone.
             if (!kms->switchMode(p.outputId, p.width, p.height, p.refreshMhz,
                                   coreDevice)) {
-                // switchMode logs the cause. The output stays in outputs_ but
-                // its ring is torn down, so JS-side renders for it are
-                // silently dropped. Do NOT
-                // emit ScanoutRebuild -- there is no new ring for the core
-                // to reserve into.
+                // switchMode logs the cause. A missing mode fails before
+                // any teardown: the old ring is intact and the output keeps
+                // running at its current mode. A ring re-init failure
+                // leaves the output in outputs_ with an empty ring --
+                // brackets still resolve (surfaceBufs kept), presents are
+                // swallowed by presentScanoutAt, and the output is dark
+                // until a successful switch or hotplug cycle. Either way,
+                // do NOT emit ScanoutRebuild -- there is no new ring for
+                // the core to reserve into.
                 LOG_ERR(Gpu,
-                    "SwitchMode failed for outputId={} (mode missing or "
-                    "ring re-init failed); output is dark until a successful "
-                    "switch or hotplug cycle", p.outputId);
+                    "SwitchMode failed for outputId={} (mode missing: output "
+                    "keeps its current mode; ring re-init failed: output is "
+                    "dark until a successful switch or hotplug cycle)",
+                    p.outputId);
                 return;
             }
             // Emit ScanoutRebuild so the core releases its prior
@@ -2064,6 +2087,23 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                      "outputId={} {}x{} @{}.{:03}Hz",
                      p.outputId, info.width, info.height,
                      info.refreshMhz / 1000, info.refreshMhz % 1000);
+            return;
+        }
+        if (kind == ipc::FrameKind::OutputRemovedDone) {
+            // The core has processed OutputRemoved and dropped its slot
+            // state; wire FIFO guarantees every bracket/present it issued
+            // against the removed ring's bufIds has been decoded by now.
+            // Sweep the bookkeeping the udev removal path kept alive.
+            if (frame.size() != ipc::OutputRemovedPayload::kSize) {
+                LOG_ERR(Ipc, "core wire: bad OutputRemovedDone payload size {}",
+                        frame.size());
+                std::abort();
+            }
+            auto p = ipc::OutputRemovedPayload::decode(frame.data());
+            dropScanoutSlotState(
+                [&](uint32_t outputId) { return outputId == p.outputId; });
+            LOG_INFO(Gpu, "OutputRemovedDone: swept slot state for outputId={}",
+                     p.outputId);
             return;
         }
         if (kind == ipc::FrameKind::ScanoutPresent) {
@@ -2099,6 +2139,17 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 if (fit != scanoutFenceFdByBufId.end()) {
                     fenceFd = fit->second;
                     scanoutFenceFdByBufId.erase(fit);
+                }
+                if (!kms->hasOutput(outputId)) {
+                    // Removal drain window: the connector dropped but the
+                    // core's OutputRemovedDone has not arrived yet (the
+                    // slot routing is kept alive for in-flight brackets).
+                    // There is no display to present to; drop the flip.
+                    LOG_INFO(Gpu,
+                        "ScanoutPresent: output {} removed; flip dropped",
+                        outputId);
+                    if (fenceFd >= 0) ::close(fenceFd);
+                    return;
                 }
                 if (!kms->presentScanoutAt(outputId, slot, fenceFd)) {
                     LOG_ERR(Gpu, "presentScanoutAt(output={}, slot={}) rejected by kernel",
@@ -2730,10 +2781,13 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             // The payload's `producer` bit is a self-consistency check.
             // Direction validation: if the surface still exists, the role
             // bit MUST match its direction. Missing surface = release race
-            // (in-band End frames written before destroy can land after the
-            // surface is gone); handle the same way runSurface{Begin,End}
-            // did before this refactor -- log + skip for End, abort for
-            // Begin (a Begin against a freed surface is a real bug).
+            // (an in-band End written before a ReleaseSurfaceBuf can land
+            // after the surface is gone): log + skip for End, abort for
+            // Begin. Scanout-ring sweeps only run at drain-safe points
+            // (ScanoutReserve re-reserve, OutputRemovedDone ack) and
+            // ReleaseSurfaceBuf / ReleaseClientTex are FIFO with this
+            // wire's own brackets, so a Begin that finds no surfaceBuf
+            // here is a real state-machine bug.
             auto it = surfaceBufs.find(surfaceBufId);
             if (it != surfaceBufs.end()) {
                 const bool expectProducer = it->second.producerOnCore;
@@ -3071,20 +3125,24 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                             if (!kms) break;
                             auto result = kms->rescan();
 
-                            // Clean up main.cpp-owned per-slot state for every
-                            // removed output: the surfaceBufs entries for its
-                            // 3 ring slots (the textures are already gone, the
-                            // ring cleared by disconnectOutput), and the
-                            // bufId -> (outputId, slot) routing entries. Any
-                            // late ScanoutPresent the core sends for these
-                            // bufIds will then fall through as "unknown
-                            // surfaceBufId" instead of dereferencing a missing
-                            // output. Also drop any pending sync_file fd.
-                            std::unordered_set<uint32_t> removedSet(
-                                result.removed.begin(), result.removed.end());
-                            dropScanoutSlotState([&](uint32_t outputId) {
-                                return removedSet.count(outputId) != 0;
-                            });
+                            // The removed outputs' surfaceBufs / fence-fd /
+                            // slot-routing entries are NOT swept here. The
+                            // core keeps rendering until it processes
+                            // OutputRemoved, and its Begin/End/Present
+                            // frames for these bufIds may already be in
+                            // flight on the wire -- the two fds have no
+                            // cross ordering, so sweeping now would make an
+                            // in-flight ProducerBegin hit "unknown
+                            // surfaceBufId" and abort. The entries (whose
+                            // wgpu::Texture refs keep the slot textures
+                            // alive past disconnectOutput's ring teardown)
+                            // survive until the core's OutputRemovedDone
+                            // ack, which is FIFO-after the last frame the
+                            // core issued against the old ring. Straggler
+                            // brackets complete against the kept textures;
+                            // straggler presents are dropped by the
+                            // ScanoutPresent handler (output no longer
+                            // exists).
 
                             // Emit OutputRemoved for every vanished id BEFORE
                             // any OutputAdded (ordering matters: the core

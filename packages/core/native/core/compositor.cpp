@@ -164,10 +164,11 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
             return;
         }
         if (kind == ipc::FrameKind::OutputRemoved) {
-            // Hotplug: the connector vanished. The GPU process already
-            // tore down its ring before this frame; the JS-side handler
-            // fires output.pre-remove / removed and calls
-            // releaseScanoutForOutput.
+            // Hotplug: the connector vanished. The GPU process released the
+            // CRTC but keeps the ring's surfaceBuf bookkeeping until our
+            // OutputRemovedDone ack; the JS-side handler fires
+            // output.pre-remove / removed and calls releaseScanoutForOutput,
+            // which sends that ack.
             if (frame.size() != ipc::OutputRemovedPayload::kSize) {
                 LOG_ERR(Core, "OutputRemoved: bad payload size {}", frame.size());
                 return;
@@ -899,6 +900,15 @@ void Compositor::reserveScanoutForOutput(uint32_t outputId, uint32_t width, uint
 
 void Compositor::releaseScanoutForOutput(uint32_t outputId) {
     scanoutOutputs_.erase(outputId);
+    if (!link_) return;
+    // Ack the removal. The GPU process defers sweeping the removed ring's
+    // surfaceBuf bookkeeping until this frame arrives: wire FIFO places it
+    // after every Begin/End/Present this side issued against those bufIds,
+    // so the sweep cannot strand an in-flight bracket.
+    ipc::OutputRemovedPayload pl{ outputId };
+    uint8_t buf[ipc::OutputRemovedPayload::kSize];
+    pl.encode(buf);
+    link_->appendFrame(ipc::FrameKind::OutputRemovedDone, buf, sizeof(buf));
 }
 
 void Compositor::switchOutputMode(uint32_t outputId,

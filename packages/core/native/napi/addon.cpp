@@ -2822,10 +2822,12 @@ napi_value SwitchOutputMode(napi_env env, napi_callback_info info) {
 }
 
 // releaseScanoutForOutput(outputId) -> undefined
-// Drop the core-side per-output scanout state on output removal. The GPU
-// process has already torn down its ring; this clears the core's slot
-// bookkeeping so a future OutputAdded at the same outputId can build a fresh
-// ring. KMS only; nested/headless are silent no-ops.
+// Drop the core-side per-output scanout state on output removal, then ack
+// the removal (OutputRemovedDone on the wire) so the GPU process sweeps its
+// deferred surfaceBuf bookkeeping for the dead ring. Clearing the core's
+// slot state first means no frame after this call can reference the old
+// bufIds, so the ack is FIFO-after the last one that did. KMS only;
+// nested/headless are silent no-ops.
 napi_value ReleaseScanoutForOutput(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value argv[1];
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -2835,6 +2837,7 @@ napi_value ReleaseScanoutForOutput(napi_env env, napi_callback_info info) {
     uint32_t outputId = 0;
     napi_get_value_uint32(env, argv[0], &outputId);
     g_addon.compositor->releaseScanoutForOutput(outputId);
+    armWirePoll();  // the OutputRemovedDone ack may have queued wire bytes
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 

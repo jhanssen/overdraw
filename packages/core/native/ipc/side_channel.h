@@ -911,7 +911,8 @@ struct OutputModesPayload {
 };
 
 // OutputRemovedPayload (gpu -> core; FrameKind::OutputRemoved):
-// just the outputId. Symmetric pair to OutputAdded.
+// just the outputId. Symmetric pair to OutputAdded. Also carried by
+// the core's FrameKind::OutputRemovedDone ack in the other direction.
 struct OutputRemovedPayload {
     uint32_t outputId;
     static constexpr size_t kSize = 4;

@@ -235,7 +235,10 @@ export function makeOnOutputRemoved(deps: HotplugDeps): (d: { outputId: number }
     if (!outputs) return;
     const rec = outputs.get(outputId);
     if (!rec) {
-      deps.log?.warn(`OutputRemoved for unknown outputId=${outputId}; ignoring`);
+      deps.log?.warn(`OutputRemoved for unknown outputId=${outputId}; releasing scanout only`);
+      // Still release + ack: the GPU process holds its swept-on-ack ring
+      // bookkeeping for this outputId until OutputRemovedDone arrives.
+      addon.releaseScanoutForOutput(outputId);
       return;
     }
     const name = rec.name;
@@ -268,9 +271,10 @@ export function makeOnOutputRemoved(deps: HotplugDeps): (d: { outputId: number }
     //    output already gone).
     pluginBus.emit("output.removed", { outputId, name, edidId: rec.edidId });
 
-    // 6. Release the core-side scanout state. Any in-flight present for X
-    //    has already failed (compositor.acquireOutputTextureHandle returns
-    //    null for unknown outputIds), so this is the last cleanup.
+    // 6. Release the core-side scanout state and ack the removal
+    //    (OutputRemovedDone), letting the GPU process sweep the old ring's
+    //    deferred surfaceBuf bookkeeping. Kept last so the ack rides the
+    //    wire FIFO-after any frame the steps above may have queued.
     addon.releaseScanoutForOutput(outputId);
 
     deps.log?.info(`output ${outputId} removed (name=${name})`);

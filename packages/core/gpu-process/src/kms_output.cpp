@@ -1144,6 +1144,14 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
 bool KmsOutputBackend::presentScanoutAt(uint32_t outputId, int slotIdx, int inFenceFd) {
     PerOutput* o = find(outputId);
     if (!o) return false;
+    if (slotIdx >= 0 && slotIdx < static_cast<int>(KmsScanoutRing::kSlotCount)
+        && o->ring.slot(slotIdx).fbId == 0) {
+        // The output is connected but its ring is gone (a failed switchMode
+        // ring re-init). Swallow the present -- committing fb 0 would
+        // disable the plane -- and leave the output dark until a successful
+        // switch or hotplug cycle rebuilds the ring.
+        return true;
+    }
     return presentOutputImpl(*o, slotIdx, inFenceFd);
 }
 

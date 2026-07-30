@@ -102,18 +102,18 @@ enum class FrameKind : uint8_t {
                               // FIFO order with surrounding frames.
     SwitchMode = 8,           // core -> gpu: switch a connected output to a new
                               // mode (width/height/refreshMhz). The GPU process
-                              // tears down that output's ring, picks the matching
-                              // drmModeModeInfo from the connector's mode list,
-                              // updates its mode blob lazily on the next commit
-                              // (didInitialCommit=false), allocates a fresh ring
-                              // at the new dims, then emits ScanoutRebuild so
-                              // the core reserves fresh wire handles. Rides the
-                              // wire to FIFO-order against any in-flight
-                              // ProducerBegin for the same output -- a
-                              // ProducerBegin against the old ring already
-                              // queued on wire MUST complete before SwitchMode
-                              // tears down the ring's surfaceBufs. Payload:
-                              // SwitchModePayload (outputId/width/height/refresh).
+                              // rebuilds that output's ring at the new dims,
+                              // picks the matching drmModeModeInfo from the
+                              // connector's mode list, updates its mode blob
+                              // lazily on the next commit (didInitialCommit=
+                              // false), then emits ScanoutRebuild so the core
+                              // reserves fresh wire handles. The old ring's
+                              // surfaceBuf bookkeeping survives until that
+                              // ScanoutReserve arrives -- the core keeps
+                              // rendering against the old bufIds until it
+                              // processes ScanoutRebuild, and those brackets
+                              // must still resolve. Payload: SwitchModePayload
+                              // (outputId/width/height/refresh).
     ScanoutRebuild = 9,       // gpu -> core: the named output's ring has been
                               // rebuilt at new dims (e.g. after SwitchMode).
                               // The core resets its per-output bookkeeping
@@ -180,11 +180,13 @@ enum class FrameKind : uint8_t {
     OutputRemoved = 16,       // gpu -> core: the connector at this outputId
                               // vanished. Payload: just the outputId (4
                               // bytes). Rides wire as the symmetric pair to
-                              // OutputAdded; FIFO with the GPU's still-in-
-                              // flight wire frames for this output (none
-                              // expected -- disconnectOutput tore down the
-                              // ring before the rescan emit -- but kept
-                              // consistent so the pair is uniform).
+                              // OutputAdded. The GPU process keeps the old
+                              // ring's surfaceBuf bookkeeping alive until
+                              // the core's OutputRemovedDone ack -- the
+                              // core may still have Begin/End/Present
+                              // frames for those bufIds in flight when the
+                              // connector drops (its render loop only
+                              // stops once it processes this message).
     OutputModes = 17,         // gpu -> core: the full list of modes a
                               // connected output advertises. Sent right
                               // after each OutputAdded (or its startup
@@ -349,6 +351,18 @@ enum class FrameKind : uint8_t {
                               // (same reason BeginAccessWithFence is
                               // distinct from BeginAccess). Same payload
                               // as ScanoutClientPresent.
+    OutputRemovedDone = 34,   // core -> gpu: ack of OutputRemoved. Sent
+                              // after the core drops its per-output
+                              // scanout slot state, so wire FIFO places
+                              // it after the last Begin/End/Present the
+                              // core issued against the removed ring's
+                              // bufIds. On receipt the GPU process sweeps
+                              // the deferred surfaceBuf / slot-routing
+                              // entries for that output -- sweeping them
+                              // at disconnect time instead would race the
+                              // core's in-flight brackets and abort on an
+                              // unknown surfaceBufId. Payload reuses
+                              // OutputRemovedPayload (just the outputId).
 };
 
 // Max fds attachable in one message (control msg OR in-band wire frame).
