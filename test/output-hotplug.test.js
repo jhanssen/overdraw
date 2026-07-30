@@ -407,6 +407,29 @@ test('OutputAdded: memorized scale wins over EDID-DPI auto when no config scale 
   assert.equal(fixture.state.outputs.get(1).logicalSize.width, 960);
 });
 
+test('OutputAdded: name-keyed scale memory applies when the descriptor has an EDID id', () => {
+  const { deps, fixture } = makeDeps();
+  deps.allowEdidAutoScale = true;
+  // A config byKey entry may use the connector name even though the output
+  // has EDID identity; the lookup falls back to the name key.
+  fixture.state.outputScaleMemory = new Map([["DP-2", 1.25]]);
+  const onAdded = makeOnOutputAdded(deps);
+  onAdded(descriptor(1, "DP-2", 1920, 1080, "TST-0001-00000001"));
+  assert.equal(fixture.state.outputs.get(1).scale, 1.25);
+});
+
+test('OutputAdded: EDID-keyed scale memory wins over a name-keyed entry', () => {
+  const { deps, fixture } = makeDeps();
+  deps.allowEdidAutoScale = true;
+  fixture.state.outputScaleMemory = new Map([
+    ["DP-2", 1.25],
+    ["TST-0001-00000001", 2],
+  ]);
+  const onAdded = makeOnOutputAdded(deps);
+  onAdded(descriptor(1, "DP-2", 1920, 1080, "TST-0001-00000001"));
+  assert.equal(fixture.state.outputs.get(1).scale, 2);
+});
+
 test('OutputAdded: memorized position uses connector name when EDID is empty', () => {
   const { deps, fixture } = makeDeps();
   // Empty edidId -> durable key is the connector name.

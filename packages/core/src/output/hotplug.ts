@@ -71,8 +71,18 @@ export function deriveOutputGeometry(
 } {
   const device = { width: d.width, height: d.height };
   const durable = durableKeyOf({ edidId: d.edidId, name: d.name });
-  const memorizedScale = durable !== ""
-    ? deps.state.outputScaleMemory?.get(durable) ?? null : null;
+  // Memory lookups honor the documented key precedence (OutputConfigEntry):
+  // an entry keyed by the EDID id wins; a connector-name entry applies when
+  // no EDID entry matches. Runtime set_scale / set_position writes key by
+  // `durable` (EDID id when available), so a runtime change shadows a
+  // name-keyed config entry.
+  const memoryLookup = <T,>(m: Map<string, T> | undefined): T | undefined => {
+    if (!m) return undefined;
+    const byEdid = d.edidId !== "" ? m.get(d.edidId) : undefined;
+    if (byEdid !== undefined) return byEdid;
+    return d.name !== "" ? m.get(d.name) : undefined;
+  };
+  const memorizedScale = memoryLookup(deps.state.outputScaleMemory) ?? null;
   const scale = resolveScale({
     configScale: deps.config.scale ?? memorizedScale,
     deviceWidth: device.width, deviceHeight: device.height,
@@ -80,8 +90,7 @@ export function deriveOutputGeometry(
     allowEdidAuto: deps.allowEdidAutoScale,
   });
   const logical = logicalSize(device.width, device.height, scale);
-  const memorizedPos = durable !== ""
-    ? deps.state.outputPositionMemory?.get(durable) : undefined;
+  const memorizedPos = memoryLookup(deps.state.outputPositionMemory);
   return { device, durable, memorizedScale, scale, logical, memorizedPos };
 }
 
