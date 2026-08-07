@@ -1340,6 +1340,11 @@ export interface LayerSurfaceRecord {
   // zone (if any) is registered. Set when zone > 0 produces a valid edge;
   // cleared otherwise. Used to clear/update without scanning.
   reservedZoneId?: string;
+  // True while a size change's layout push is held by the shared
+  // surface-transaction broker (until the client renders at the
+  // configured size). Later rect changes fold into the hold via
+  // rec.rect; the hold's onApply/onCancel clears the flag.
+  resizeHoldActive?: boolean;
   // Cleared on destroy / wl_surface teardown to short-circuit any in-flight
   // sweep that still holds a reference (the sweep pattern used elsewhere).
   destroyed: boolean;

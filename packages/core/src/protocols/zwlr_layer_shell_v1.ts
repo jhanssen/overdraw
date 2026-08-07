@@ -167,13 +167,6 @@ function applyLayerSurface(ctx: Ctx, rec: LayerSurfaceRecord, opts: { firstConfi
   // Reserved-zone registry: keep it in sync with the applied state.
   updateReservedZone(state, rec);
 
-  // Push the surface layout to the compositor. This applies even for an
-  // unmapped surface (first commit hasn't happened yet); subsequent
-  // map-on-first-content uses the layout already in place.
-  state.compositor.setSurfaceLayout(
-    rec.surface.id, placement.rect.x, placement.rect.y,
-    placement.rect.width, placement.rect.height);
-
   // Send a configure when:
   //   - this is the first configure (deferred from get_layer_surface), OR
   //   - the placement size changed.
@@ -183,6 +176,54 @@ function applyLayerSurface(ctx: Ctx, rec: LayerSurfaceRecord, opts: { firstConfi
   if (opts.firstConfigure || sizeChanged) {
     sendConfigure(ctx, rec, placement.rect.width, placement.rect.height);
   }
+
+  pushLayerRect(state, rec, {
+    sizeChanged,
+    hadRect: !!prevRect && !opts.firstConfigure,
+  });
+}
+
+// Install rec.rect on the compositor. A MAPPED surface's size change is
+// HELD through the shared surface-transaction broker until the client
+// renders at the configured size (ack + a drawable buffer at the new
+// logical dims): pushing immediately would draw the old-size buffer
+// stretched into the new rect for a client round trip, and a client that
+// animates its size (a hover-expanding panel) re-sizes every frame --
+// one stretched frame per step reads as heavy flicker. The broker
+// freezes the surface (old appearance at the old rect) and its deadline
+// force-applies if the client is slow. Position-only changes and
+// pre-map placements need no re-render and apply immediately. While a
+// hold is in flight, later changes fold into it: ready()/onApply read
+// rec.configured*/rec.rect live.
+function pushLayerRect(
+  state: CompositorState, rec: LayerSurfaceRecord,
+  opts: { sizeChanged: boolean; hadRect: boolean },
+): void {
+  const r = rec.rect;
+  if (!r) return;
+  if (rec.resizeHoldActive) return;
+  const broker = state.surfaceTx;
+  if (!opts.sizeChanged || !opts.hadRect || !rec.mapped || !broker) {
+    state.compositor.setSurfaceLayout(rec.surface.id, r.x, r.y, r.width, r.height);
+    return;
+  }
+  rec.resizeHoldActive = true;
+  broker.begin(rec.surface.id, {
+    tag: "layer-resize",
+    ready: () => {
+      if (rec.destroyed) return true;
+      if (!rec.acked) return false;
+      return state.compositor.surfaceReadyAt?.(
+        rec.surface.id, rec.configuredWidth, rec.configuredHeight) ?? true;
+    },
+    onApply: () => {
+      rec.resizeHoldActive = false;
+      if (rec.destroyed || !rec.rect) return;
+      state.compositor.setSurfaceLayout(rec.surface.id,
+        rec.rect.x, rec.rect.y, rec.rect.width, rec.rect.height);
+    },
+    onCancel: () => { rec.resizeHoldActive = false; },
+  });
 }
 
 // Compute the reservation thickness + edge from the applied state and update
@@ -236,13 +277,14 @@ function reflowOtherLayerSurfaces(ctx: Ctx, changed: LayerSurfaceRecord): void {
     });
     const prev = rec.rect;
     rec.rect = placement.rect;
-    state.compositor.setSurfaceLayout(
-      rec.surface.id, placement.rect.x, placement.rect.y,
-      placement.rect.width, placement.rect.height);
+    const sizeChanged = !prev
+      || prev.width !== placement.rect.width
+      || prev.height !== placement.rect.height;
     // If a sibling's size changed, send it a fresh configure too.
-    if (!prev || prev.width !== placement.rect.width || prev.height !== placement.rect.height) {
+    if (sizeChanged) {
       sendConfigure(ctx, rec, placement.rect.width, placement.rect.height);
     }
+    pushLayerRect(state, rec, { sizeChanged, hadRect: !!prev });
   }
 }
 
@@ -277,6 +319,10 @@ export function applyLayerSurfaceInitial(ctx: Ctx, rec: LayerSurfaceRecord): voi
 export function applyLayerSurfacePending(ctx: Ctx, rec: LayerSurfaceRecord): void {
   applyLayerSurface(ctx, rec, { firstConfigure: false });
   reflowOtherLayerSurfaces(ctx, rec);
+  // A buffer-bearing commit may satisfy an in-flight resize hold (the
+  // frozen-ready signal covers the async-import case; this covers a
+  // buffer that is drawable immediately).
+  if (rec.resizeHoldActive) ctx.state.surfaceTx?.evaluate();
   // Keyboard interactivity may have just changed; let the seat re-evaluate
   // the exclusive override. Cheap when nothing is exclusive (an O(n) walk
   // of layer surfaces with no allocations).
@@ -300,6 +346,8 @@ export function markLayerSurfaceMapped(state: CompositorState, rec: LayerSurface
 export function teardownLayerSurface(state: CompositorState, rec: LayerSurfaceRecord): void {
   if (rec.destroyed) return;
   rec.destroyed = true;
+  // Drop an in-flight resize hold (thaws; onCancel clears the flag).
+  if (rec.resizeHoldActive) state.surfaceTx?.cancel(rec.surface.id);
   // Clear reserved zone.
   if (rec.reservedZoneId && state.reservedZones) {
     state.reservedZones.clear(rec.reservedZoneId);
@@ -370,6 +418,9 @@ function reflowOtherLayerSurfacesForTeardown(state: CompositorState, changed: La
       exclusiveZone: rec.applied.exclusiveZone,
     });
     rec.rect = placement.rect;
+    // A surface mid resize-hold keeps its frozen appearance; the new
+    // rect folds into the hold's eventual apply.
+    if (rec.resizeHoldActive) continue;
     state.compositor.setSurfaceLayout(
       rec.surface.id, placement.rect.x, placement.rect.y,
       placement.rect.width, placement.rect.height);
@@ -505,7 +556,11 @@ export function makeLayerSurface(ctx: Ctx): ZwlrLayerSurfaceV1Handler {
     ack_configure(resource, serial) {
       const r = rec(resource);
       if (!r) return;
-      if (serial === r.lastConfigureSerial) r.acked = true;
+      if (serial === r.lastConfigureSerial) {
+        r.acked = true;
+        // A resize hold gates on this ack; re-check it.
+        if (r.resizeHoldActive) ctx.state.surfaceTx?.evaluate();
+      }
     },
     destroy(resource) {
       const r = rec(resource);

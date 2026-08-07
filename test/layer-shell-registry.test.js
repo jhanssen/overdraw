@@ -16,6 +16,7 @@ import makeLayerShell, {
   isLayerSurfaceInitialCommit,
 } from "../packages/core/dist/protocols/zwlr_layer_shell_v1.js";
 import { createReservedZoneRegistry } from "../packages/core/dist/wm/reserved-zones.js";
+import { createSurfaceTransactionBroker } from "../packages/core/dist/surface-transaction.js";
 
 // Anchor bits from the protocol enum.
 const A = { top: 1, bottom: 2, left: 4, right: 8 };
@@ -279,6 +280,90 @@ test("apply after first configure: size change -> new configure", () => {
   const calls = configureCalls(ctx.events);
   assert.equal(calls.length, 2);
   assert.equal(calls[1].h, 40);
+});
+
+// ---- resize hold (mapped size changes) -----------------------------------
+// A mapped surface's size change holds the layout push through the shared
+// surface-transaction broker until the client renders at the configured
+// size -- pushing immediately would stretch the old-size buffer into the
+// new rect for a client round trip (per animation frame, for a client
+// that animates its size: heavy flicker).
+
+function setupMappedWithBroker() {
+  const ctx = mockCtx();
+  const ls = makeLayerSurface(ctx);
+  const created = createLayerSurface(ctx, 100);
+  const comp = ctx.state.compositor;
+  const ready = { at: false };
+  comp.surfaceReadyAt = () => ready.at;
+  ctx.state.surfaceTx = createSurfaceTransactionBroker(comp);
+  ls.set_size(created.resource, 0, 30);
+  ls.set_anchor(created.resource, A.top | A.left | A.right);
+  applyLayerSurfaceInitial(ctx, created.layerSurface);
+  ls.ack_configure(created.resource, created.layerSurface.lastConfigureSerial);
+  markLayerSurfaceMapped(ctx.state, created.layerSurface);
+  comp.layouts.length = 0;
+  return { ctx, ls, comp, ready, ...created };
+}
+
+test("mapped size change: layout push held until ack + drawable buffer", () => {
+  const { ctx, ls, comp, ready, layerSurface, resource } = setupMappedWithBroker();
+  // Hover-expand: 30 -> 300.
+  ls.set_size(resource, 0, 300);
+  applyLayerSurfacePending(ctx, layerSurface);
+  const c = configureCalls(ctx.events).at(-1);
+  assert.equal(c.h, 300, "configure carries the new size");
+  assert.equal(comp.layouts.length, 0, "layout held before the client catches up");
+  assert.equal(layerSurface.resizeHoldActive, true);
+  // Ack alone is not enough: no drawable buffer at the new size yet.
+  ls.ack_configure(resource, c.serial);
+  assert.equal(comp.layouts.length, 0, "still held after ack");
+  // The new-size buffer becomes drawable.
+  ready.at = true;
+  ctx.state.surfaceTx.evaluate();
+  assert.equal(comp.layouts.length, 1, "applied once the buffer is ready");
+  assert.equal(comp.layouts[0].h, 300);
+  assert.equal(layerSurface.resizeHoldActive, false);
+});
+
+test("mapped size change: further resizes fold into the in-flight hold", () => {
+  const { ctx, ls, comp, ready, layerSurface, resource } = setupMappedWithBroker();
+  ls.set_size(resource, 0, 100);
+  applyLayerSurfacePending(ctx, layerSurface);
+  // Animation continues before the client caught up: retarget.
+  ls.set_size(resource, 0, 200);
+  applyLayerSurfacePending(ctx, layerSurface);
+  assert.equal(comp.layouts.length, 0, "single hold, nothing pushed");
+  const c = configureCalls(ctx.events).at(-1);
+  assert.equal(c.h, 200);
+  ls.ack_configure(resource, c.serial);
+  ready.at = true;
+  ctx.state.surfaceTx.evaluate();
+  assert.equal(comp.layouts.length, 1, "one push for the coalesced resizes");
+  assert.equal(comp.layouts[0].h, 200, "the LATEST rect lands");
+  assert.equal(layerSurface.resizeHoldActive, false);
+});
+
+test("mapped position-only change applies immediately (no hold)", () => {
+  const { ctx, ls, comp, layerSurface, resource } = setupMappedWithBroker();
+  // Same size, different edge: the rect moves but needs no re-render.
+  ls.set_size(resource, 0, 30);
+  ls.set_anchor(resource, A.bottom | A.left | A.right);
+  applyLayerSurfacePending(ctx, layerSurface);
+  assert.equal(layerSurface.resizeHoldActive, undefined);
+  assert.equal(comp.layouts.length, 1, "position change pushes immediately");
+  assert.equal(comp.layouts[0].y, 570);
+});
+
+test("teardown mid-hold cancels it without a layout push", () => {
+  const { ctx, ls, comp, layerSurface, resource } = setupMappedWithBroker();
+  ls.set_size(resource, 0, 300);
+  applyLayerSurfacePending(ctx, layerSurface);
+  assert.equal(layerSurface.resizeHoldActive, true);
+  teardownLayerSurface(ctx.state, layerSurface);
+  assert.equal(layerSurface.resizeHoldActive, false);
+  assert.equal(comp.layouts.length, 0, "no stale push after teardown");
+  assert.equal(ctx.state.surfaceTx.size(), 0);
 });
 
 // ---- reserved-zone registration -----------------------------------------
