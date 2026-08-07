@@ -184,6 +184,10 @@ async function activate(
   //   unfitKeepsFocus (default true): workspace.unfit re-asserts the
   //     window focused at invoke time instead of letting the focus policy
   //     hand focus to whatever the landing leaves under the cursor.
+  //   dragPanRate (world px/s, default 1500): the strip's drag auto-pan
+  //     speed at the docked view's very edge; the pan ramps up linearly
+  //     across the edge band as the cursor approaches. 0 disables the
+  //     drag auto-pan.
   const boolOpt = (key: string, dflt: boolean): boolean => {
     const v = worldMode
       ? (config?.canvas as { [k: string]: unknown })[key] : undefined;
@@ -195,8 +199,21 @@ async function activate(
   const scrollOnHover = boolOpt("scrollOnHover", false);
   const clickReveals = boolOpt("clickReveals", true);
   const unfitKeepsFocus = boolOpt("unfitKeepsFocus", true);
+  const dragPanRateRaw = worldMode
+    ? (config?.canvas as { dragPanRate?: unknown }).dragPanRate : undefined;
+  const dragPanRate = (typeof dragPanRateRaw === "number"
+    && Number.isFinite(dragPanRateRaw) && dragPanRateRaw >= 0)
+    ? dragPanRateRaw : 1500;
   // Camera scroll animation within a strip (ms).
   const SCROLL_MS = 150;
+  // Per-step tween length for the drag auto-pan chase. Steps land at
+  // pointer-motion rate and each replaces the running tween, so this is
+  // the interpolation window between them, not a visible duration.
+  const DRAG_SCROLL_MS = 100;
+  // Width (world px; docked strips view at zoom 1) of the band along the
+  // view's left/right edges where a drag auto-pans. Speed ramps linearly
+  // from 0 at the band's inner boundary to dragPanRate at the edge.
+  const EDGE_PAN_BAND = 64;
   // Scroll-reveal margin (the layout gap): a revealed column sits this
   // many world px from the viewport edge, keeping the inter-column gap
   // visible -- the neighbor ends exactly at the edge.
@@ -557,6 +574,17 @@ async function activate(
     }
   });
 
+  // The surface an interactive move grab is currently dragging (set by
+  // window.drag-moved, cleared at drop). While set, the reveal below
+  // leaves the dragged window alone -- the drag auto-pan (edgePan, fed
+  // by the cursor's drag-moved stream) owns the camera. Chasing the
+  // window's rect instead would build a pan backlog: the world-anchored
+  // grab re-pins the window under the hand after every pan, so its
+  // off-view edge stays off-view and the chase keeps panning even after
+  // the cursor reverses.
+  let activeDragSurface: number | null = null;
+  let lastDragPanMs = 0;
+
   // Elastic strips: after each layout pass, if the focused window's rect
   // moved (retile, new column at the strip's head), keep it inside the
   // docked view. stack.relayout carries the fresh post-layout rects, so
@@ -590,6 +618,9 @@ async function activate(
     const rec = state.byHandle.get(handle);
     if (!rec || override.has(rec.outputId)) return;
     if (state.shownByOutput.get(rec.outputId) !== handle) return;
+    // A dragged window's rect follows the hand, not the layout; the
+    // cursor-driven edge pan owns the camera for the drag's duration.
+    if (activeDragSurface !== null && activeDragSurface === focusedSurfaceId) return;
     if (revealScroll(rec.outputId, handle, entry.newOuter, "visible") !== null) {
       void applyScroll(rec.outputId);
     }
@@ -1013,11 +1044,52 @@ async function activate(
     }
   }
 
+  // The drag auto-pan's camera chase. Unlike applyScroll (which drops
+  // updates while a tween flies, then snaps to the live scroll -- fine
+  // for discrete reveals, visibly steppy for a continuous chase), every
+  // call starts a short LINEAR tween from the camera's live value to the
+  // current scroll target, replacing the running one (the evaluator's
+  // cancel-on-replacement). Steps land at pointer-motion rate, so the
+  // camera glides between the edge pan's integrated targets instead of
+  // jumping. The newest call owns the settle write.
+  const dragScrollSeq = new Map<number, number>();
+  async function applyDragScroll(outputId: number): Promise<void> {
+    if (override.has(outputId)) return;
+    const shown = state.shownByOutput.get(outputId);
+    if (shown === undefined) return;
+    const target = camPosFor(outputId, shown);
+    const last = lastCamByOutput.get(outputId);
+    if (last && last.x === target.x && last.y === target.y) return;
+    const token = (dragScrollSeq.get(outputId) ?? 0) + 1;
+    dragScrollSeq.set(outputId, token);
+    if (sdk.animations) {
+      try {
+        const cur = await sdk.windows.getOutputCamera(outputId);
+        if (dragScrollSeq.get(outputId) !== token) return;
+        const spec: TweenSpec = {
+          type: "tween",
+          target: { kind: "output-camera", outputId },
+          from: cur,
+          to: { x: target.x, y: target.y, zoom: 1 },
+          duration: DRAG_SCROLL_MS,
+          easing: "linear" as EasingSpec,
+        };
+        await sdk.animations.run(spec);
+      } catch { /* denied; settle instantly below */ }
+      if (dragScrollSeq.get(outputId) !== token) return;
+    }
+    // Settle against LIVE scroll state -- later steps may have advanced
+    // it while the tween flew.
+    const settle = camPosFor(outputId, shown);
+    lastCamByOutput.set(outputId, settle);
+    await sdk.windows.setOutputCamera(outputId, settle.x, settle.y);
+  }
+
   // Move a docked camera to its (re-clamped) scroll position within the
-  // shown island: a short tween (denied tweens -- grabs -- fall back to
-  // the instant write), then one settled write. Overridden / flying
-  // outputs are left alone; their owner re-docks through camPosFor, which
-  // reads the same scroll state.
+  // shown island: a short tween (denied tweens -- camera-pan grabs, DnD
+  // -- fall back to the instant write), then one settled write.
+  // Overridden / flying outputs are left alone; their owner re-docks
+  // through camPosFor, which reads the same scroll state.
   async function applyScroll(outputId: number): Promise<void> {
     if (override.has(outputId) || flying.has(outputId)) return;
     const shown = state.shownByOutput.get(outputId);
@@ -2511,6 +2583,49 @@ async function activate(
         e instanceof Error ? e.message : String(e)}`);
     });
   }
+  // The strip's drag auto-pan: while a move grab drags within an
+  // elastic strip, the cursor entering the band along the docked view's
+  // left/right edge pans the strip -- speed ramps from 0 at the band's
+  // inner boundary to dragPanRate at the edge, integrated over the
+  // wall-clock time between motion events. Purely a function of the
+  // cursor's CURRENT position: leaving the band stops the pan on the
+  // next event, with no backlog to drain (the seat's world-anchored
+  // grab math re-pins the window through whatever camera each pan
+  // lands, so the pan and the drag compose).
+  function edgePan(surfaceId: number, x: number): void {
+    const now = Date.now();
+    const dt = lastDragPanMs > 0 ? Math.min(now - lastDragPanMs, 100) : 0;
+    lastDragPanMs = now;
+    if (dragPanRate <= 0 || dt <= 0) return;
+    const handle = state.surfaceToHandle.get(surfaceId);
+    if (handle === undefined || !isElastic(handle)) return;
+    const rec = state.byHandle.get(handle);
+    if (!rec || override.has(rec.outputId)) return;
+    if (state.shownByOutput.get(rec.outputId) !== handle) return;
+    const g = outputGeom.get(rec.outputId);
+    const isl = islandRectFor(rec.outputId, handle);
+    if (!g || !isl) return;
+    const wa = workareaOf(rec.outputId, g);
+    const maxScroll = Math.max(0, isl.width - wa.width);
+    if (maxScroll <= 0) return;
+    const prev = scrollByHandle.get(handle) ?? 0;
+    // The docked view's window onto the strip, in world coords.
+    const viewLeft = isl.x + prev;
+    const viewRight = viewLeft + wa.width;
+    let step = 0;
+    if (x < viewLeft + EDGE_PAN_BAND) {
+      const depth = Math.min(1, (viewLeft + EDGE_PAN_BAND - x) / EDGE_PAN_BAND);
+      step = -depth * dragPanRate * dt / 1000;
+    } else if (x > viewRight - EDGE_PAN_BAND) {
+      const depth = Math.min(1, (x - (viewRight - EDGE_PAN_BAND)) / EDGE_PAN_BAND);
+      step = depth * dragPanRate * dt / 1000;
+    }
+    if (step === 0) return;
+    const s = Math.min(maxScroll, Math.max(0, prev + step));
+    if (s === prev) return;
+    scrollByHandle.set(handle, s);
+    void applyDragScroll(rec.outputId);
+  }
   // A lifted window's held slot follows the cursor: crossing a column
   // midpoint reorders the member live, so the gap in the tiling always
   // shows where the drop would land. Only within the window's own
@@ -2521,8 +2636,16 @@ async function activate(
     const p = payload as {
       surfaceId?: unknown; lifted?: unknown; x?: unknown; y?: unknown;
     };
-    if (p.lifted !== true || typeof p.surfaceId !== "number"
+    if (typeof p.surfaceId !== "number"
       || typeof p.x !== "number" || typeof p.y !== "number") return;
+    // Any move grab (lifted or floating) suppresses the reveal chase
+    // and drives the edge pan.
+    if (activeDragSurface !== p.surfaceId) {
+      activeDragSurface = p.surfaceId;
+      lastDragPanMs = 0;
+    }
+    edgePan(p.surfaceId, p.x);
+    if (p.lifted !== true) return;
     const surfaceId = p.surfaceId;
     const x = p.x;
     const y = p.y;
@@ -2560,6 +2683,7 @@ async function activate(
     const lifted = p.lifted === true;
     const dropX = p.x;
     const dropY = p.y;
+    if (activeDragSurface === surfaceId) activeDragSurface = null;
     if (!lifted) {
       const from = state.surfaceToHandle.get(surfaceId);
       if (from === undefined) return;

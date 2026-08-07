@@ -2290,6 +2290,76 @@ test('world: drag-moved reorders a lifted window\'s held slot live', async () =>
   }, { world: true, layout: { mode: 'columns', column: 0.25, gap: 0 } });
 });
 
+test('elastic: the drag auto-pan follows the cursor at the view edge, without backlog', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { sink, pluginBus, addWindow, animCalls } = h;
+    // Three 400px columns -> strip 1200, workarea 800, scroll range 400.
+    for (const id of [101, 102, 103]) { addWindow(id); await settle(); }
+    pluginBus.emit('window.change',
+      { surfaceId: 103, activated: true, changed: ['activated'] });
+    await settle();
+    sink.cameraCalls.length = 0;
+
+    // Cursor mid-view: no pan, the first event only starts the clock.
+    pluginBus.emit('window.drag-moved',
+      { surfaceId: 103, lifted: true, x: 400, y: 300 });
+    await settle();
+    assert.equal(sink.cameraCalls.length, 0, 'mid-view drag does not pan');
+
+    // Cursor inside the right edge band (view [0, 800]): the next event
+    // integrates dragPanRate over the elapsed wall clock (dt clamps at
+    // 100ms), so the step is bounded by 150 world px.
+    pluginBus.emit('window.drag-moved',
+      { surfaceId: 103, lifted: true, x: 795, y: 300 });
+    await settle();
+    pluginBus.emit('window.drag-moved',
+      { surfaceId: 103, lifted: true, x: 795, y: 300 });
+    await settle();
+    const step = sink.cameraCalls.at(-1);
+    assert.ok(step, 'edge-band motion pans');
+    assert.ok(step.x > 0 && step.x <= 300,
+      `pan integrates the rate over wall clock (got x=${step.x})`);
+    // The chase glides: a replacing LINEAR tween (the camera
+    // interpolates per frame), not applyScroll's discrete ease.
+    const chase = animCalls.at(-1);
+    assert.equal(chase?.easing, 'linear');
+    assert.equal(chase?.target?.kind, 'output-camera');
+
+    // Leaving the band stops the pan on the next event -- no backlog
+    // keeps draining after the cursor retreats.
+    const panned = sink.cameraCalls.length;
+    pluginBus.emit('window.drag-moved',
+      { surfaceId: 103, lifted: true, x: 400, y: 300 });
+    await settle();
+    pluginBus.emit('window.drag-moved',
+      { surfaceId: 103, lifted: true, x: 400, y: 300 });
+    await settle();
+    assert.equal(sink.cameraCalls.length, panned,
+      'retreating from the band pans no further');
+
+    // While the drag is live, the reveal leaves the dragged window's
+    // rect alone (the edge pan owns the camera).
+    const poked = {
+      surfaceId: 103, tiling: 'managed',
+      oldOuter: { x: 800, y: 0, width: 400, height: 600 },
+      newOuter: { x: 1100, y: 0, width: 400, height: 600 },
+    };
+    pluginBus.emit('stack.relayout', { reason: 'state-changed', windows: [poked] });
+    await settle();
+    assert.equal(sink.cameraCalls.length, panned,
+      'no reveal chase of the dragged window');
+
+    // After the drop, the same relayout reveals discretely again.
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: true, lifted: true, x: 795, y: 300 });
+    await settle();
+    pluginBus.emit('stack.relayout', { reason: 'state-changed', windows: [poked] });
+    await settle();
+    assert.equal(sink.cameraCalls.at(-1).x, 400,
+      'undragged reveal jumps straight to the clamp');
+  }, { canvas: { world: true, elastic: true }, layout: { mode: 'columns' } });
+});
+
 // ---- bookmark evaporation fallback ----------------------------------------
 
 test('world: an island bookmark survives evaporation via its captured name', async () => {

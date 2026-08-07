@@ -979,13 +979,17 @@ if (!state) throw new Error("animation evaluator: compositor state not initializ
 const evaluator = createEvaluator(compositor);
 const protocolState = state;
 const animationsBroker = createAnimationsBroker(evaluator, {
-  // Camera flights are denied while an interactive move/resize grab or a
-  // DnD drag is in progress: the grab maps pointer glass->world every
-  // motion event, and a camera moving underneath would drag the grabbed
-  // window across the world with it. Callers fall back to an instant dock.
+  // Camera animations are denied while a camera-pan grab (the grab IS a
+  // camera writer; two writers would fight) or a DnD drag (its per-motion
+  // hit-tests map glass->world; a camera sliding underneath changes
+  // what's under a stationary pointer) is in progress. Move/resize grabs
+  // do NOT deny: their motion math is world-anchored (reads the live
+  // camera per event), so a camera animating underneath composes -- the
+  // strip's drag auto-pan tweens the camera mid-grab and depends on it.
+  // Denied callers fall back to an instant dock.
   cameraGate: () => {
     const seat = protocolState.seat;
-    if (seat?.grab) return "interactive grab active";
+    if (seat?.grab?.kind === "camera-pan") return "camera-pan grab active";
     if (seat?.drag) return "drag in progress";
     return null;
   },
