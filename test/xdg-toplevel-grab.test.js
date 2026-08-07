@@ -79,6 +79,25 @@ test('move: transitions the window into the floating tiling lane', async () => {
   assert.equal(s.wm.getWindowState(1).tiling, 'floating');
 });
 
+test('move: a managed window inside an explicit island lifts instead of floating', async () => {
+  const s = setupToplevelHandler();
+  const r = addToplevel(s, 1);
+  // An explicit island containing the window means a workspace plugin
+  // owns the drop policy, which is what makes lifting safe.
+  s.wm.setIslands([{ id: 7, contextOutputId: 0, rect: null, members: [1] }]);
+  s.handler.move(r, null, 99);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const ws = s.wm.getWindowState(1);
+  assert.equal(ws.tiling, 'managed', 'stays in the managed lane');
+  assert.equal(ws.lifted, true, 'lifted for the drag');
+  assert.equal(s.grabCalls.length, 1);
+  assert.equal(s.grabCalls[0].lifted, true, 'grab carries the lifted flag');
+  // The grab rect is seeded from the start rect so the first layout pass
+  // resolves the window at its current position.
+  assert.deepEqual(s.wm.getFloatingRect(1), s.grabCalls[0].startRect);
+});
+
 test('move: stale serial is dropped', async () => {
   const s = setupToplevelHandler();
   const r = addToplevel(s, 1);

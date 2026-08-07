@@ -55,17 +55,14 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
   // input event; stale serials are silently dropped (matches the
   // protocol convention used for cursor + popup grabs).
   //
-  // Transitions the window to 'floating' presentation if it isn't
-  // already (the grab only manipulates floating geometry), captures the
-  // current outer rect as the grab's startRect, then calls
-  // seat.beginGrab. The seat's motion path drives the floating rect
-  // until the client (typically) releases the pointer button -- which
-  // also triggers wl_pointer.button.release; clients are expected to
-  // observe their own button-up and call... actually no: per
-  // xdg-shell, the compositor ENDS the grab when the user releases the
-  // button. We need to install a button-release listener that calls
-  // endGrab. The simplest path: have the seat itself end the grab on
-  // the matching button-up.
+  // Puts the window's geometry under grab control -- a managed move
+  // inside an explicit island lifts the window in place (it keeps its
+  // slot; the workspace plugin's drop policy clears the flag), anything
+  // else transitions to 'floating' -- captures the current outer rect as
+  // the grab's startRect, then calls seat.beginGrab. The seat's motion
+  // path drives the grab rect, and per xdg-shell the compositor ends the
+  // grab when the user releases the button: the seat itself ends the
+  // grab on the matching button-up (endOnButtonUp).
   async function beginInteractiveGrab(
     resource: Resource,
     serial: number,
@@ -85,11 +82,19 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
     const startRect = ctx.state.wm.outerRectOf(id);
     if (!startRect) return;
 
-    // Transition to the floating lane if needed. Interactive
-    // move/resize is a compositor decision (user-input), not a client
-    // request, so it writes `tiling` directly.
+    // Interactive move/resize is a compositor decision (user-input),
+    // not a client request, so it writes the state axes directly. A
+    // managed move inside an explicit island lifts in place; everything
+    // else takes the floating lane (mirrors the window.grab-requested
+    // launcher in main.ts).
     const ws = ctx.state.wm.getWindowState(id);
-    if (ws && ws.tiling !== "floating") {
+    const lift = kind === "move"
+      && ws?.tiling === "managed" && ws.sizeMode === "none"
+      && ctx.state.wm.islandOf(id) !== null;
+    if (lift) {
+      ctx.state.wm.setFloatingRect(id, startRect);
+      await ctx.state.wm.propose(id, { lifted: true }, "user-input");
+    } else if (ws && ws.tiling !== "floating") {
       await ctx.state.wm.propose(id, { tiling: "floating" }, "user-input");
     }
     if (!ctx.state.seat) return;
@@ -100,6 +105,7 @@ export default function makeToplevel(ctx: Ctx): XdgToplevelHandler {
         anchorX: pos.x, anchorY: pos.y,
         startRect,
         wasManaged: ws?.tiling === "managed",
+        lifted: lift,
         endOnButtonUp: true,
       });
     } else {

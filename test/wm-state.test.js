@@ -49,10 +49,27 @@ test('windowState: new window starts with default fields', () => {
     wantsMinimized: false, wantsModal: false,
   });
   assert.equal(s.modal, false);
+  assert.equal(s.lifted, false);
   assert.equal(s.layoutMode, null);
   assert.equal(s.layoutData, undefined);
   assert.deepEqual(s.constraints, { minSize: null, maxSize: null });
   assert.equal(s.parent, null);
+});
+
+test('propose: lifted commits on a managed window; the floating lane clears it', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 800, height: 600 }, scale: 1 }]);
+  addMapped(wm, 1);
+  let s = await wm.propose(1, { lifted: true }, 'user-input');
+  assert.equal(s.lifted, true);
+  assert.equal(s.tiling, 'managed', 'lifting does not change lanes');
+
+  // Entering the floating lane drops the slot -- the flag cannot survive.
+  s = await wm.propose(1, { tiling: 'floating' }, 'user-input');
+  assert.equal(s.lifted, false);
+
+  // Lifting a floating window is a no-op (there is no slot to hold).
+  s = await wm.propose(1, { lifted: true }, 'user-input');
+  assert.equal(s.lifted, false);
 });
 
 test('getWindowState: unknown window returns null', () => {

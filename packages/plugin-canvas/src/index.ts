@@ -525,6 +525,38 @@ async function activate(
     void publishWorld();
   });
 
+  // Last-known outer rect + tiling lane per window, fed by every layout
+  // pass. Backs the per-motion drop-index computation during a lifted
+  // drag, where a windows.list round trip per pointer event would be far
+  // too slow. Entries drop on DESTROYED batch entries and on unmap.
+  const memberOuterCache = new Map<number, {
+    outer: { x: number; y: number; width: number; height: number };
+    tiling: string;
+  }>();
+  sdk.events.subscribe("stack.relayout", (_name, payload) => {
+    if (!worldMode || !payload || typeof payload !== "object") return;
+    const wins = (payload as { windows?: unknown }).windows;
+    if (!Array.isArray(wins)) return;
+    for (const w of wins) {
+      if (!isObj(w)) continue;
+      const e = w as {
+        surfaceId?: unknown; newOuter?: unknown; tiling?: unknown;
+      };
+      if (typeof e.surfaceId !== "number") continue;
+      if (e.newOuter === null) { memberOuterCache.delete(e.surfaceId); continue; }
+      if (!isObj(e.newOuter)) continue;
+      const o = e.newOuter as {
+        x?: unknown; y?: unknown; width?: unknown; height?: unknown;
+      };
+      if (typeof o.x !== "number" || typeof o.y !== "number"
+        || typeof o.width !== "number" || typeof o.height !== "number") continue;
+      memberOuterCache.set(e.surfaceId, {
+        outer: { x: o.x, y: o.y, width: o.width, height: o.height },
+        tiling: typeof e.tiling === "string" ? e.tiling : "managed",
+      });
+    }
+  });
+
   // Elastic strips: after each layout pass, if the focused window's rect
   // moved (retile, new column at the strip's head), keep it inside the
   // docked view. stack.relayout carries the fresh post-layout rects, so
@@ -2380,43 +2412,41 @@ async function activate(
   // re-parents the window to the island under the CURSOR (the seat
   // reports the pointer's world position through the content camera, so
   // drops land where you're pointing while fitted/roaming too). Tiled
-  // stays tiled: a window that was managed before the grab floated it
-  // re-tiles wherever it drops -- into another island (cross-island
-  // move), at the drop position within its own island's order
-  // (rearrange), or back into its old slot (void drop; nothing to point
-  // at). Floating is an explicit verb (window.toggle-floating), never a
-  // drag side effect. A window the user floated stays floating wherever
-  // it's dropped; only its membership follows the cursor.
+  // stays tiled: a managed window is LIFTED for the drag -- it keeps its
+  // slot in the tiling while the grab drives its rect, the slot follows
+  // the cursor within its own island (window.drag-moved reorders live),
+  // and the drop clears the flag to snap it in -- into another island
+  // (cross-island move), at the drop position within its own island's
+  // order (rearrange), or back into its held slot (void drop; nothing to
+  // point at). Floating is an explicit verb (window.toggle-floating),
+  // never a drag side effect. A window the user floated stays floating
+  // wherever it's dropped; only its membership follows the cursor.
   //
   // The drop-position -> member-index mapping is a heuristic: land at
   // the hit window's slot (its left half -- the dragged window shoves it
   // over) or just past it (right half). Horizontal-flow-oriented, which
   // matches the bundled layouts (master-stack, elastic columns); a
   // layout-owned drop-index query is future work.
-  function dropIndexFor(
+  type TileRect = {
+    surfaceId: number;
+    outer: { x: number; y: number; width: number; height: number };
+  };
+  function dropIndexFromTiles(
     members: ReadonlyArray<number>, surfaceId: number,
-    snaps: ReadonlyArray<WindowSnapshotLike>, x: number, y: number,
+    tiled: ReadonlyArray<TileRect>, x: number, y: number,
   ): number | null {
-    const tiled = snaps.filter((s) =>
-      s.surfaceId !== surfaceId && members.includes(s.surfaceId)
-      && s.windowState?.tiling === "managed" && s.windowState.visible
-      && s.windowState.sizeMode === "none"
-      && s.outer && s.outer.width > 0);
     if (tiled.length === 0) return null;
-    const contains = (s: WindowSnapshotLike): boolean => {
-      const o = s.outer as { x: number; y: number; width: number; height: number };
-      return x >= o.x && x < o.x + o.width && y >= o.y && y < o.y + o.height;
-    };
-    const dist = (s: WindowSnapshotLike): number => {
-      const o = s.outer as { x: number; y: number; width: number; height: number };
-      const dx = x - (o.x + o.width / 2);
-      const dy = y - (o.y + o.height / 2);
+    const contains = (t: TileRect): boolean =>
+      x >= t.outer.x && x < t.outer.x + t.outer.width
+      && y >= t.outer.y && y < t.outer.y + t.outer.height;
+    const dist = (t: TileRect): number => {
+      const dx = x - (t.outer.x + t.outer.width / 2);
+      const dy = y - (t.outer.y + t.outer.height / 2);
       return dx * dx + dy * dy;
     };
     const hit = tiled.find(contains)
       ?? tiled.reduce((a, b) => (dist(a) <= dist(b) ? a : b));
-    const o = hit.outer as { x: number; y: number; width: number };
-    const before = x < o.x + o.width / 2;
+    const before = x < hit.outer.x + hit.outer.width / 2;
     const hitIdx = members.indexOf(hit.surfaceId);
     const dragIdx = members.indexOf(surfaceId);
     // moveToIndex is the FINAL index (post-removal splice): the hit's
@@ -2424,61 +2454,164 @@ async function activate(
     const h = hitIdx - (dragIdx >= 0 && dragIdx < hitIdx ? 1 : 0);
     return before ? h : h + 1;
   }
+  function dropIndexFor(
+    members: ReadonlyArray<number>, surfaceId: number,
+    snaps: ReadonlyArray<WindowSnapshotLike>, x: number, y: number,
+  ): number | null {
+    const tiled: TileRect[] = [];
+    for (const s of snaps) {
+      if (s.surfaceId === surfaceId || !members.includes(s.surfaceId)) continue;
+      if (s.windowState?.tiling !== "managed" || !s.windowState.visible
+        || s.windowState.sizeMode !== "none"
+        || s.windowState.lifted === true) continue;
+      if (!s.outer || s.outer.width <= 0) continue;
+      tiled.push({ surfaceId: s.surfaceId, outer: s.outer });
+    }
+    return dropIndexFromTiles(members, surfaceId, tiled, x, y);
+  }
+  // Drop-index computation for the per-motion path: sources rects from
+  // memberOuterCache (fed by stack.relayout) instead of a windows.list
+  // round trip, which would be far too slow at pointer-motion rate. The
+  // cache carries no visibility, so a minimized member can linger as a
+  // stale target -- the authoritative drop-time pass uses live snapshots.
+  function dropIndexFromCache(
+    members: ReadonlyArray<number>, surfaceId: number, x: number, y: number,
+  ): number | null {
+    const tiled: TileRect[] = [];
+    for (const id of members) {
+      if (id === surfaceId || sizeModeMembers.has(id)) continue;
+      const c = memberOuterCache.get(id);
+      if (!c || c.tiling !== "managed" || c.outer.width <= 0) continue;
+      tiled.push({ surfaceId: id, outer: c.outer });
+    }
+    return dropIndexFromTiles(members, surfaceId, tiled, x, y);
+  }
+  // The island under a world point, across every output's arrangement.
+  function islandAt(
+    x: number, y: number,
+  ): { handle: WorkspaceHandle; outputId: number } | null {
+    for (const [outputId, row] of rowRectsByOutput) {
+      for (const [h, r] of row) {
+        if (x >= r.x && x < r.x + r.width
+          && y >= r.y && y < r.y + r.height) {
+          return { handle: h, outputId };
+        }
+      }
+    }
+    return null;
+  }
+  // Drag mutations (live reorders, the drop) run serialized on one
+  // chain: a reorder still in flight when the button lifts must land
+  // before the drop pass reads the member order.
+  let dragChain: Promise<void> = Promise.resolve();
+  let dragReorderBusy = false;
+  function enqueueDrag(fn: () => Promise<void>): void {
+    dragChain = dragChain.then(fn, fn).catch((e) => {
+      sdk.log(`canvas: drag mutation failed: ${
+        e instanceof Error ? e.message : String(e)}`);
+    });
+  }
+  // A lifted window's held slot follows the cursor: crossing a column
+  // midpoint reorders the member live, so the gap in the tiling always
+  // shows where the drop would land. Only within the window's own
+  // island -- hovering another island (or the void) leaves the gap
+  // where it was; membership only changes at drop.
+  sdk.events.subscribe("window.drag-moved", (_name, payload) => {
+    if (!worldMode || !payload || typeof payload !== "object") return;
+    const p = payload as {
+      surfaceId?: unknown; lifted?: unknown; x?: unknown; y?: unknown;
+    };
+    if (p.lifted !== true || typeof p.surfaceId !== "number"
+      || typeof p.x !== "number" || typeof p.y !== "number") return;
+    const surfaceId = p.surfaceId;
+    const x = p.x;
+    const y = p.y;
+    if (dragReorderBusy) return;
+    const from = state.surfaceToHandle.get(surfaceId);
+    if (from === undefined) return;
+    const over = islandAt(x, y);
+    if (!over || over.handle !== from) return;
+    const rec = state.byHandle.get(from);
+    if (!rec) return;
+    const idx = dropIndexFromCache(rec.members, surfaceId, x, y);
+    if (idx === null || idx === rec.members.indexOf(surfaceId)) return;
+    dragReorderBusy = true;
+    enqueueDrag(async () => {
+      try {
+        const cur = state.byHandle.get(from);
+        if (!cur || !cur.members.includes(surfaceId)) return;
+        const r = reg.reorder(state, surfaceId, { moveToIndex: idx });
+        state = r.state;
+        await applyEffects(r.sideEffects);
+      } finally {
+        dragReorderBusy = false;
+      }
+    });
+  });
   sdk.events.subscribe("window.drag-dropped", (_name, payload) => {
     if (!worldMode || !payload || typeof payload !== "object") return;
     const p = payload as {
-      surfaceId?: unknown; wasManaged?: unknown; x?: unknown; y?: unknown;
+      surfaceId?: unknown; wasManaged?: unknown; lifted?: unknown;
+      x?: unknown; y?: unknown;
     };
     if (typeof p.surfaceId !== "number"
       || typeof p.x !== "number" || typeof p.y !== "number") return;
     const surfaceId = p.surfaceId;
+    const lifted = p.lifted === true;
     const dropX = p.x;
     const dropY = p.y;
-    const from = state.surfaceToHandle.get(surfaceId);
-    if (from === undefined) return;
-    // The island under the drop point, across every output's arrangement.
-    let target: { handle: WorkspaceHandle; outputId: number } | null = null;
-    for (const [outputId, row] of rowRectsByOutput) {
-      for (const [h, r] of row) {
-        if (dropX >= r.x && dropX < r.x + r.width
-          && dropY >= r.y && dropY < r.y + r.height) {
-          target = { handle: h, outputId };
-          break;
-        }
-      }
-      if (target) break;
+    if (!lifted) {
+      const from = state.surfaceToHandle.get(surfaceId);
+      if (from === undefined) return;
+      // Floating windows only follow the cursor's island; dropping on
+      // the own island or on void leaves everything as the drag put it.
+      const target = islandAt(dropX, dropY);
+      if (p.wasManaged !== true && (!target || target.handle === from)) return;
     }
-    // Floating windows only follow the cursor's island; dropping on the
-    // own island or on void leaves everything as the drag put it.
-    if (p.wasManaged !== true && (!target || target.handle === from)) return;
-    void (async () => {
-      if (target && target.handle !== from) {
-        const idx = reg.findIndex(state, target.handle, target.outputId);
-        if (idx === null) return;
-        const r = reg.moveWindow(
-          state, surfaceId, idx, target.outputId, outputNameOf(target.outputId));
-        state = r.state;
-        await applyEffects(r.sideEffects);
-      }
-      if (p.wasManaged !== true) return;
-      // Rearrange by drop position within the (possibly new) island's
-      // order, then snap back into the tiling.
-      const handle = state.surfaceToHandle.get(surfaceId);
-      const rec = handle !== undefined ? state.byHandle.get(handle) : undefined;
-      if (rec) {
-        const idx = dropIndexFor(
-          rec.members, surfaceId, await sdk.windows.list(), dropX, dropY);
-        if (idx !== null) {
-          const r = reg.reorder(state, surfaceId, { moveToIndex: idx });
+    enqueueDrag(async () => {
+      try {
+        const from = state.surfaceToHandle.get(surfaceId);
+        if (from === undefined) return;
+        const target = islandAt(dropX, dropY);
+        if (target && target.handle !== from) {
+          const idx = reg.findIndex(state, target.handle, target.outputId);
+          if (idx === null) return;
+          const r = reg.moveWindow(
+            state, surfaceId, idx, target.outputId, outputNameOf(target.outputId));
           state = r.state;
           await applyEffects(r.sideEffects);
         }
+        if (p.wasManaged !== true) return;
+        // Rearrange by drop position within the (possibly new) island's
+        // order, then snap back into the tiling.
+        const handle = state.surfaceToHandle.get(surfaceId);
+        const rec = handle !== undefined ? state.byHandle.get(handle) : undefined;
+        if (rec) {
+          const idx = dropIndexFor(
+            rec.members, surfaceId, await sdk.windows.list(), dropX, dropY);
+          if (idx !== null && idx !== rec.members.indexOf(surfaceId)) {
+            const r = reg.reorder(state, surfaceId, { moveToIndex: idx });
+            state = r.state;
+            await applyEffects(r.sideEffects);
+          }
+        }
+        if (!lifted) {
+          await sdk.windows.propose(surfaceId, { tiling: "managed" }, "user-input");
+        }
+      } finally {
+        // A lifted window must always land back in its slot, whatever
+        // the drop hit (or failed to hit) above.
+        if (lifted) {
+          try {
+            await sdk.windows.propose(surfaceId, { lifted: false }, "user-input");
+          } catch { /* window unmapped mid-drop */ }
+        }
       }
-      await sdk.windows.propose(surfaceId, { tiling: "managed" }, "user-input");
-    })();
+    });
   });
   sdk.windows.onUnmap((ev) => {
     sizeModeMembers.delete(ev.surfaceId);
+    memberOuterCache.delete(ev.surfaceId);
     for (const [o, id] of activeByOutput) {
       if (id === ev.surfaceId) activeByOutput.delete(o);
     }

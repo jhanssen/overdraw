@@ -677,6 +677,9 @@ function isProposePayload(d: unknown): d is {
   if (p.modal !== undefined) {
     if (typeof p.modal !== "boolean") return false;
   }
+  if (p.lifted !== undefined) {
+    if (typeof p.lifted !== "boolean") return false;
+  }
   if (p.clientRequests !== undefined) {
     if (typeof p.clientRequests !== "object" || p.clientRequests === null) return false;
     const cr = p.clientRequests as { [k: string]: unknown };

@@ -1540,10 +1540,16 @@ export interface PointerGrabMove {
   // Window outer rect at grab start.
   startRect: { x: number; y: number; width: number; height: number };
   // True when the window was in the managed (tiled) lane before the
-  // grab floated it. Carried on the drop event so the workspace
-  // plugin's membership-on-drag policy can re-tile the window into the
-  // island it lands on (a window floated by the user stays floating).
+  // grab. Carried on the drop event so the workspace plugin's
+  // membership-on-drag policy can re-tile the window into the island it
+  // lands on (a window floated by the user stays floating).
   wasManaged?: boolean;
+  // True when the grab lifted the window in place (WindowState.lifted)
+  // instead of floating it: the window keeps its managed slot while the
+  // grab drives its rect. Carried on drag-moved/drag-dropped so the
+  // workspace plugin can live-reorder the held slot and clear the flag
+  // at drop.
+  lifted?: boolean;
   // When true, the seat auto-ends the grab on the next pointer-button
   // release. Used by xdg_toplevel.move/.resize (button-driven grabs);
   // hotkey-initiated grabs leave this false because their release is

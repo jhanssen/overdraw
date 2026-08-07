@@ -1316,14 +1316,19 @@ validated + resolved + consumed by the runtime + hotkey plugin.
   are visible while fitted/roaming.
   Membership-on-drag is LANDED: a move grab's drop (window.drag-dropped,
   pointer world position + pre-grab lane) re-parents the window to the
-  island under the cursor. Tiled stays tiled: a previously-tiled
-  window re-tiles wherever it drops -- another island (move), the drop
-  position within its own island's order (rearrange; registry
-  `reorder` gained `{ moveToIndex }`), or its old slot (void drop).
-  Floating is an explicit verb (`window.toggle-floating` in
-  core-actions, launcher in main.ts), never a drag side effect;
-  user-floated windows stay floating and only their membership follows
-  the cursor. Island bookmarks survive
+  island under the cursor. Tiled stays tiled, via LIFTING: a managed
+  window inside an explicit island keeps its slot for the drag
+  (`WindowState.lifted`; the layout driver keeps it in the compute and
+  applies the grab rect instead of the slot rect, so peers hold
+  position and the elastic strip keeps its width), the held slot
+  follows the cursor within its own island (`window.drag-moved` +
+  registry `reorder { moveToIndex }`), and the drop clears the flag --
+  snapping into another island (move), the cursor position in its own
+  order (rearrange), or its held slot (void / in-place drop, a no-op
+  for every sibling). Floating is an explicit verb
+  (`window.toggle-floating` in core-actions, launcher in main.ts),
+  never a drag side effect; user-floated windows stay floating and
+  only their membership follows the cursor. Island bookmarks survive
   evaporation via their captured name (create-on-reference fallback).
   Drag-pan is LANDED: a `camera-pan` seat grab kind pans the camera
   1:1 from pointer motion (transient writes, no client delivery;

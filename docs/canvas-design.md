@@ -922,15 +922,23 @@ tests only.
    ALSO LANDED -- **membership on drag** (§3's third membership
    trigger): a move grab's release emits `window.drag-dropped` with
    the pointer's WORLD position (through the content camera, so drops
-   land where the cursor points while fitted/roaming) and whether the
-   window was tiled before the grab floated it. TILED STAYS TILED: a
-   previously-tiled window re-tiles wherever it drops -- into another
-   island (re-parent), at the drop position within its own island's
-   member order (rearrange past a neighbor; `reorder`'s
-   `{ moveToIndex }` op, index from a horizontal-flow half-plane
-   heuristic against the hit window's rect -- a layout-owned
-   drop-index query is future work), or back into its old slot (void
-   drop). Floating is an explicit verb (`window.toggle-floating`,
+   land where the cursor points while fitted/roaming), whether the
+   window was tiled before the grab, and whether the grab LIFTED it.
+   TILED STAYS TILED, via lifting: a managed window inside an
+   explicit island keeps its slot for the drag (`WindowState.lifted`
+   -- the layout driver keeps the window in the compute so peers hold
+   position and the elastic strip keeps its measured width, while
+   applying the grab rect the seat streams instead of the slot rect).
+   During the drag the seat emits `window.drag-moved` per motion; the
+   canvas plugin live-reorders the held slot within the window's own
+   island (`reorder`'s `{ moveToIndex }` op, index from a
+   horizontal-flow half-plane heuristic against cached member rects
+   -- a layout-owned drop-index query is future work), so the gap in
+   the tiling always previews the landing slot. The drop clears the
+   flag: the window snaps into another island (re-parent), the drop
+   position in its own order (rearrange), or its held slot (void /
+   in-place drop -- a sibling-no-op, nothing else moves or animates).
+   Floating is an explicit verb (`window.toggle-floating`,
    core-actions), never a drag side effect; a window the user floated
    stays floating wherever it's dropped, only its membership follows
    the cursor. Island bookmarks also survive evaporation now: they

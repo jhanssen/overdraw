@@ -10,7 +10,8 @@
 //     fullscreen; any number may coexist -- which one shows is a stacking
 //     concern); an invisible (visible === false) window is omitted from
 //     the result; a floating (tiling === "floating") window uses its
-//     stored floatingRect.
+//     stored floatingRect; a lifted managed window keeps its slot in the
+//     compute while drawing at its grab rect.
 //   - Build LayoutInputs per island from its `managed`, non-fullscreen,
 //     visible members + the island's tile region (implicit islands derive
 //     it from the output minus reserved zones), invoke compute() on the
@@ -92,8 +93,13 @@ export interface LayoutSnapshotWindow extends LayoutWindow {
   tiling: Tiling;
   sizeMode: SizeMode;
   visible: boolean;
-  // The rect to place a floating window at. Used only when
-  // tiling === "floating". Absent otherwise.
+  // Mid interactive move (managed lane): the window stays in the compute
+  // so it keeps occupying its slot, but the slot rect is dropped at merge
+  // in favor of the grab rect stored in floatingRect.
+  lifted?: boolean;
+  // The rect to place the window at when its geometry doesn't come from
+  // the compute: the floating lane's stored rect, or a lifted window's
+  // grab rect.
   floatingRect?: Rect;
 }
 
@@ -240,6 +246,16 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
           // restores the arrangement without a reflow); its slot rect is
           // dropped at merge in favor of the override.
           if (w.sizeMode === "fullscreen") continue;
+          // A lifted window (mid interactive move) works like the
+          // maximized member: it stays in the compute so its slot holds
+          // open under the drag (peers keep their rects; an elastic
+          // strip keeps its measured width), while the applied rect is
+          // the grab rect the seat streams into floatingRect.
+          if (w.lifted && !overrides.has(w.id)) {
+            const outer = w.floatingRect ?? w.currentRect ?? outputRect;
+            resolvedRects.push({ id: w.id, outer });
+            overrides.set(w.id, outer);
+          }
           managed.push({
             id: w.id,
             appId: w.appId,

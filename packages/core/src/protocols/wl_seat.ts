@@ -805,6 +805,17 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       (y - g.anchorY) / view.zoom,
       ws?.constraints ?? null);
     ctx.state.wm?.setFloatingRect(g.surfaceId, rect);
+    // Stream the pointer's world position to the workspace plugin so a
+    // lifted window's held slot can follow the cursor (live reorder).
+    // Emitted for every move grab; subscribers filter on `lifted`.
+    if (g.kind === "move") {
+      ctx.state.pluginBus?.emit("window.drag-moved", {
+        surfaceId: g.surfaceId,
+        lifted: g.lifted === true,
+        x: seatViewToWorldX(view, x),
+        y: seatViewToWorldY(view, y),
+      });
+    }
   }
 
   // Route one normalized input event.
@@ -1312,15 +1323,17 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       ctx.state.installGrabCursor?.(null);
       // A move grab that ends is a DROP: report where (the pointer's
       // world position through the content camera -- drops land where
-      // the cursor is, correct while fitted/roaming) and whether the
-      // window was tiled before the grab floated it. The workspace
-      // plugin's membership-on-drag policy consumes this (re-parent to
-      // the island under the cursor; re-tile if it was managed).
+      // the cursor is, correct while fitted/roaming), whether the
+      // window was tiled before the grab, and whether the grab lifted
+      // it in place. The workspace plugin's membership-on-drag policy
+      // consumes this (re-parent to the island under the cursor;
+      // re-tile if it was managed; clear `lifted`).
       if (ended?.kind === "move") {
         const view = contentViewAt(lastX, lastY);
         ctx.state.pluginBus?.emit("window.drag-dropped", {
           surfaceId: ended.surfaceId,
           wasManaged: ended.wasManaged === true,
+          lifted: ended.lifted === true,
           x: seatViewToWorldX(view, lastX),
           y: seatViewToWorldY(view, lastY),
         });

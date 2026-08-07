@@ -1179,9 +1179,9 @@ function activeOutputId(): number {
 // window.begin-move / .begin-resize / .end-grab actions emit on the bus;
 // here we apply the grab to the seat. The action handlers run in plugin
 // context which doesn't have direct seat access, so the bus is the seam.
-// Each request transitions the window to 'floating' presentation if
-// needed (the grab can only manipulate floating geometry) and then
-// installs the grab on the seat.
+// Each request puts the window's geometry under grab control -- lifting
+// it in place (managed move) or transitioning it to the floating lane --
+// and then installs the grab on the seat.
 pluginBus.subscribe("window.grab-requested", async (_n, payload) => {
   if (!state || !state.seat || !state.wm) return;
   if (!payload || typeof payload !== "object") return;
@@ -1192,15 +1192,29 @@ pluginBus.subscribe("window.grab-requested", async (_n, payload) => {
   if (typeof p.surfaceId !== "number") return;
   const surfaceId = p.surfaceId;
 
-  // Capture the window's current outer (the start rect) BEFORE
-  // proposing the floating transition; the propose may schedule a
-  // relayout that's a no-op for floating (the rect carries over),
-  // but we want a deterministic snapshot.
+  // Capture the window's current outer (the start rect) BEFORE any
+  // lane/lift transition; the propose may schedule a relayout, but we
+  // want a deterministic snapshot.
   const startOuter = state.wm.outerRectOf(surfaceId);
   if (!startOuter) return;
 
+  // A managed window under a move grab is LIFTED, not floated: it keeps
+  // its slot in the tiling (peers hold position, the strip keeps its
+  // width) while the grab drives its on-screen rect, and the workspace
+  // plugin's drop policy clears the flag. Lifting requires that drop
+  // policy: only windows inside an explicit island have one, so
+  // everything else (resize grabs, floating-lane windows, sizeMode
+  // overrides, classic per-output islands) takes the floating lane.
   const ws = state.wm.getWindowState(surfaceId);
-  if (ws && ws.tiling !== "floating") {
+  const lift = p.kind === "move"
+    && ws?.tiling === "managed" && ws.sizeMode === "none"
+    && state.wm.islandOf(surfaceId) !== null;
+  if (lift) {
+    // Seed the grab rect before the lift commits so the first layout
+    // pass already resolves the window at its current position.
+    state.wm.setFloatingRect(surfaceId, startOuter);
+    await state.wm.propose(surfaceId, { lifted: true }, "user-input");
+  } else if (ws && ws.tiling !== "floating") {
     await state.wm.propose(surfaceId, { tiling: "floating" }, "user-input");
   }
 
@@ -1219,6 +1233,7 @@ pluginBus.subscribe("window.grab-requested", async (_n, payload) => {
       anchorX: pos.x, anchorY: pos.y,
       startRect: startOuter,
       wasManaged: ws?.tiling === "managed",
+      lifted: lift,
       endOnButtonUp: true,
     });
   } else {

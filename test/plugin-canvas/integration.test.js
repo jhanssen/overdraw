@@ -2189,6 +2189,107 @@ test('world: tiled stays tiled -- a drag-floated window snaps back into the tili
   }, { world: true });
 });
 
+test('world: a lifted drop always clears the flag -- own island, void, cross-island', async () => {
+  await withCanvasPlugin(async (h) => {
+    const { rt, wm, pluginBus, addWindow } = h;
+    await setupTwoIslands(h);   // 101 on ws1, 102 on ws2
+    addWindow(103);
+    await settle();
+
+    // Own-island drop: lane + membership unchanged, flag cleared.
+    await wm.propose(103, { lifted: true }, 'user-input');
+    assert.equal(wm.getWindowState(103)?.lifted, true, 'lift committed');
+    assert.equal(wm.getWindowState(103)?.tiling, 'managed',
+      'lifting keeps the managed lane');
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: true, lifted: true, x: 100, y: 300 });
+    await settle();
+    assert.equal(wm.getWindowState(103)?.lifted, false,
+      'own-island drop unlifts');
+    assert.equal(wm.getWindowState(103)?.tiling, 'managed');
+    assert.deepEqual([...(await call(rt, 'list', [0]))[0].members].sort(),
+      [101, 103], 'membership unchanged by an own-island drop');
+
+    // Void drop (nothing under the cursor): the slot was held, so the
+    // window just snaps back; the flag still clears.
+    await wm.propose(103, { lifted: true }, 'user-input');
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: true, lifted: true, x: -5000, y: 300 });
+    await settle();
+    assert.equal(wm.getWindowState(103)?.lifted, false, 'void drop unlifts');
+    assert.equal(wm.getWindowState(103)?.tiling, 'managed');
+
+    // Cross-island drop: re-parents, stays managed, flag cleared.
+    await wm.propose(103, { lifted: true }, 'user-input');
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 103, wasManaged: true, lifted: true, x: PITCH + 100, y: 300 });
+    await settle();
+    assert.equal(wm.getWindowState(103)?.lifted, false, 'cross-island drop unlifts');
+    assert.equal(wm.getWindowState(103)?.tiling, 'managed');
+    assert.deepEqual((await call(rt, 'list', [0]))[1].members, [102, 103],
+      'joined the target island');
+  }, { world: true });
+});
+
+test('world: drag-moved reorders a lifted window\'s held slot live', async () => {
+  await withCanvasPlugin(async (h) => {
+    // Columns mode: members append at the tail, so the map order below
+    // reads left to right ([101, 102, 103]).
+    const { rt, wm, pluginBus, addWindow } = h;
+    for (const id of [101, 102, 103]) { addWindow(id); await settle(); }
+
+    // Feed the member-rect cache the way production does: a layout
+    // pass's stack.relayout batch. Three 200px columns left to right.
+    pluginBus.emit('stack.relayout', { reason: 'reorder', windows: [
+      { surfaceId: 101, oldOuter: null, tiling: 'managed',
+        newOuter: { x: 0, y: 0, width: 200, height: 600 } },
+      { surfaceId: 102, oldOuter: null, tiling: 'managed',
+        newOuter: { x: 200, y: 0, width: 200, height: 600 } },
+      { surfaceId: 103, oldOuter: null, tiling: 'managed',
+        newOuter: { x: 400, y: 0, width: 200, height: 600 } },
+    ] });
+    await settle();
+
+    await wm.propose(102, { lifted: true }, 'user-input');
+    // Drag over the right half of 103's column: the held slot moves to
+    // the tail.
+    pluginBus.emit('window.drag-moved',
+      { surfaceId: 102, lifted: true, x: 550, y: 300 });
+    await settle();
+    assert.deepEqual((await call(rt, 'list', [0]))[0].members, [101, 103, 102],
+      'slot follows the cursor past the last column');
+
+    // Back over the left half of 101's column: slot moves to the head.
+    pluginBus.emit('window.drag-moved',
+      { surfaceId: 102, lifted: true, x: 50, y: 300 });
+    await settle();
+    assert.deepEqual((await call(rt, 'list', [0]))[0].members, [102, 101, 103],
+      'slot follows the cursor back to the head');
+
+    // Points outside the own island (the void) leave the order alone.
+    pluginBus.emit('window.drag-moved',
+      { surfaceId: 102, lifted: true, x: -5000, y: 300 });
+    await settle();
+    assert.deepEqual((await call(rt, 'list', [0]))[0].members, [102, 101, 103],
+      'void motion does not reorder');
+
+    // A non-lifted move grab (floating drag) never reorders.
+    pluginBus.emit('window.drag-moved',
+      { surfaceId: 102, lifted: false, x: 550, y: 300 });
+    await settle();
+    assert.deepEqual((await call(rt, 'list', [0]))[0].members, [102, 101, 103],
+      'floating drags do not touch the member order');
+
+    // Drop in place: order survives, flag clears.
+    pluginBus.emit('window.drag-dropped',
+      { surfaceId: 102, wasManaged: true, lifted: true, x: 50, y: 300 });
+    await settle();
+    assert.deepEqual((await call(rt, 'list', [0]))[0].members, [102, 101, 103]);
+    assert.equal(wm.getWindowState(102)?.lifted, false);
+    assert.equal(wm.getWindowState(102)?.tiling, 'managed');
+  }, { world: true, layout: { mode: 'columns', column: 0.25, gap: 0 } });
+});
+
 // ---- bookmark evaporation fallback ----------------------------------------
 
 test('world: an island bookmark survives evaporation via its captured name', async () => {

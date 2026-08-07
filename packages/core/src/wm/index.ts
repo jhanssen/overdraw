@@ -180,6 +180,7 @@ export function defaultWindowState(): WindowState {
     sizeMode: "none",
     visible: true,
     modal: false,
+    lifted: false,
     clientRequests: {
       wantsMaximized: false,
       wantsFullscreen: false,
@@ -247,6 +248,7 @@ export interface WindowStateProposal {
   sizeMode?: SizeMode;
   visible?: boolean;
   modal?: boolean;
+  lifted?: boolean;
   clientRequests?: Partial<ClientRequests>;
   layoutMode?: string | null;
   layoutData?: unknown;
@@ -542,6 +544,7 @@ function cloneState(s: WindowState): WindowState {
     sizeMode: s.sizeMode,
     visible: s.visible,
     modal: s.modal,
+    lifted: s.lifted,
     clientRequests: { ...s.clientRequests },
     layoutMode: s.layoutMode,
     layoutData: s.layoutData,
@@ -563,6 +566,10 @@ function validateState(v: unknown): WindowState | null {
   if (o.sizeMode !== "none" && o.sizeMode !== "maximized" && o.sizeMode !== "fullscreen") return null;
   if (typeof o.visible !== "boolean") return null;
   if (typeof o.modal !== "boolean") return null;
+  // Interceptors written before `lifted` existed may return a state
+  // without it; normalize to false rather than reject.
+  if (o.lifted !== undefined && typeof o.lifted !== "boolean") return null;
+  o.lifted = o.lifted === true;
   const cr = o.clientRequests;
   if (typeof cr !== "object" || cr === null) return null;
   const crr = cr as { [k: string]: unknown };
@@ -592,7 +599,8 @@ function validateState(v: unknown): WindowState | null {
 
 // Fields whose change requires a layout pass.
 const GEOMETRY_FIELDS: ReadonlyArray<keyof WindowState> = [
-  "tiling", "sizeMode", "visible", "layoutMode", "layoutData", "constraints",
+  "tiling", "sizeMode", "visible", "lifted", "layoutMode", "layoutData",
+  "constraints",
 ];
 
 // Fields whose change requires a stacking pass (z-recompute + raise of any
@@ -609,6 +617,7 @@ function diffState(prev: WindowState, next: WindowState): Array<keyof WindowStat
   if (prev.sizeMode !== next.sizeMode) out.push("sizeMode");
   if (prev.visible !== next.visible) out.push("visible");
   if (prev.modal !== next.modal) out.push("modal");
+  if (prev.lifted !== next.lifted) out.push("lifted");
   if (!clientRequestsEqual(prev.clientRequests, next.clientRequests)) out.push("clientRequests");
   if (prev.layoutMode !== next.layoutMode) out.push("layoutMode");
   // layoutData identity-compare; plugins are expected to replace, not mutate.
@@ -646,6 +655,7 @@ function mergeProposal(current: WindowState, p: WindowStateProposal): WindowStat
   if (p.sizeMode !== undefined) next.sizeMode = p.sizeMode;
   if (p.visible !== undefined) next.visible = p.visible;
   if (p.modal !== undefined) next.modal = p.modal;
+  if (p.lifted !== undefined) next.lifted = p.lifted;
   if (p.clientRequests !== undefined) {
     if (p.clientRequests.wantsMaximized !== undefined) {
       next.clientRequests.wantsMaximized = p.clientRequests.wantsMaximized;
@@ -1746,6 +1756,7 @@ export function createWm(
           maxSize: w.windowState.constraints.maxSize ?? undefined,
         },
         currentRect: { ...w.outer },
+        ...(w.windowState.lifted ? { lifted: true } : {}),
         ...(w.floatingRect ? { floatingRect: { ...w.floatingRect } } : {}),
       });
     }
@@ -2428,6 +2439,12 @@ export function createWm(
         const phase: PolicyPhase = win.pendingInitialCommit ? "pre-content" : "post-content";
         candidate = resolveDecisions(current, candidate, phase);
 
+        // `lifted` is a managed-lane state: a window entering (or in) the
+        // floating lane cannot hold a slot, so the flag drops.
+        if (candidate.tiling === "floating" && candidate.lifted) {
+          candidate = { ...candidate, lifted: false };
+        }
+
         const changed = diffState(current, candidate);
         if (changed.length === 0) return cloneState(current);
 
@@ -2802,6 +2819,7 @@ function snapshotOf(win: Window): WindowSnapshot {
       sizeMode: win.windowState.sizeMode,
       visible: win.windowState.visible,
       modal: win.windowState.modal,
+      lifted: win.windowState.lifted,
       clientRequests: { ...win.windowState.clientRequests },
       layoutMode: win.windowState.layoutMode,
       layoutData: win.windowState.layoutData,

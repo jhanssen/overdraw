@@ -168,6 +168,8 @@ export type WindowStateBagChangedEvent = {
 //                     an unfocused non-member (fullscreen, or maximized
 //                     floating) draws below the tiled tier.
 //   - `visible`    -- whether the window is drawn at all (false ≡ minimized).
+//   - `lifted`     -- mid interactive move: the window keeps its managed
+//                     slot while its on-screen rect follows the grab.
 //   - `modal`      -- this window blocks interaction with its parent chain
 //                     (focus is tethered; input on the parent is gated).
 //                     A modal child of an absent parent (orphan) is treated
@@ -206,6 +208,12 @@ export type WindowState = {
   sizeMode: SizeMode;
   visible: boolean;
   modal: boolean;
+  // Mid interactive move: the window keeps its managed slot (peers hold
+  // position; an elastic strip keeps its measured width) while its
+  // on-screen rect follows the grab. Managed lane only -- entering the
+  // floating lane clears it. The drop policy (workspace plugin) clears
+  // the flag, which snaps the window into its slot.
+  lifted: boolean;
   // Client wishes (read by the policy seam; not by the renderer):
   clientRequests: ClientRequests;
   layoutMode: string | null;

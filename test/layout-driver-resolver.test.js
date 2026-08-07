@@ -250,3 +250,67 @@ test('floating window: uses its floatingRect; plugin not called', async () => {
   assert.deepEqual(target.calls[0].result.rects[0].outer,
     { x: 100, y: 50, width: 300, height: 200 });
 });
+
+test('lifted window: stays in the compute (slot held) but applies its grab rect', async () => {
+  const target = captureTarget();
+  let computeWindows = null;
+  const driver = createLayoutDriver({
+    snapshot: () => snap([
+      managedWin(1),
+      { id: 2, role: 'toplevel', lifted: true,
+        floatingRect: { x: 250, y: 40, width: 300, height: 200 } },
+      managedWin(3),
+    ]),
+    target,
+    compute: async (inputs) => {
+      computeWindows = inputs.windows.map((w) => w.id);
+      return { rects: inputs.windows.map((w, i) => ({
+        id: w.id, outer: { x: i * 100, y: 0, width: 100, height: 600 } })) };
+    },
+  });
+  driver.schedule('mapped');
+  await driver.settled();
+  // The lifted window occupies its slot: the plugin sees all three, so
+  // its peers' rects are what a three-member layout produces.
+  assert.deepEqual(computeWindows, [1, 2, 3]);
+  const byId = new Map(target.calls[0].result.rects.map((r) => [r.id, r.outer]));
+  assert.deepEqual(byId.get(1), { x: 0, y: 0, width: 100, height: 600 });
+  assert.deepEqual(byId.get(3), { x: 200, y: 0, width: 100, height: 600 });
+  // ...but its own slot rect is dropped in favor of the grab rect.
+  assert.deepEqual(byId.get(2), { x: 250, y: 40, width: 300, height: 200 });
+});
+
+test('lifted window with no floatingRect yet: falls back to currentRect', async () => {
+  const target = captureTarget();
+  const driver = createLayoutDriver({
+    snapshot: () => snap([{
+      id: 1, role: 'toplevel', lifted: true,
+      currentRect: { x: 10, y: 20, width: 400, height: 300 },
+    }]),
+    target,
+    compute: async (inputs) =>
+      ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 9, y: 9, width: 9, height: 9 } })) }),
+  });
+  driver.schedule('mapped');
+  await driver.settled();
+  assert.deepEqual(target.calls[0].result.rects[0].outer,
+    { x: 10, y: 20, width: 400, height: 300 });
+});
+
+test('lifted + exclusive: the sizeMode override wins; no duplicate entry', async () => {
+  const target = captureTarget();
+  const driver = createLayoutDriver({
+    snapshot: () => snap([{
+      id: 1, role: 'toplevel', sizeMode: 'maximized', lifted: true,
+      floatingRect: { x: 250, y: 40, width: 300, height: 200 },
+    }]),
+    target,
+    compute: async (inputs) =>
+      ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 9, y: 9, width: 9, height: 9 } })) }),
+  });
+  driver.schedule('mapped');
+  await driver.settled();
+  assert.equal(target.calls[0].result.rects.length, 1);
+  assert.deepEqual(target.calls[0].result.rects[0].outer,
+    { x: 0, y: 0, width: 1000, height: 600 });
+});
