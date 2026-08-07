@@ -30,6 +30,7 @@ import {
 import type {
   WindowRelayoutEvent,
   StackRelayoutEvent,
+  StackRelayoutApplyEvent,
   WindowState,
   Tiling,
   SizeMode,
@@ -898,6 +899,36 @@ export function createWm(
   // serial, target size, etc.) in pendingResizes.
   const surfaceTx: SurfaceTransactionBroker = opts?.surfaceTx
     ?? createSurfaceTransactionBroker(compositor);
+  // Between a WM tx batch going ready and its held geometry landing,
+  // give plugins one awaited look at the swap (stack.relayout-apply).
+  // The announce-time window.relayout fired a client round trip earlier,
+  // while every held surface still sat at its old rect -- a presnap
+  // transform installed then displaces the surface for the hold's
+  // duration. Primed here instead, the transforms go live in the same
+  // instant the batch installs. oldOuter is the rect each surface still
+  // shows; unchanged (move-retargeted no-op) entries are dropped.
+  surfaceTx.onBeforeApply((surfaceIds) => {
+    if (!pluginBus) return;
+    const entries: StackRelayoutApplyEvent["windows"] = [];
+    for (const id of surfaceIds) {
+      const p = pendingResizes.get(id);
+      const win = windows.find((w) => w.surfaceId === id);
+      if (!p || !win) continue;
+      const o = win.outer;
+      if (o.x === p.outer.x && o.y === p.outer.y
+          && o.width === p.outer.width && o.height === p.outer.height) continue;
+      entries.push({
+        surfaceId: id,
+        oldOuter: { ...o },
+        newOuter: { ...p.outer },
+        tiling: win.windowState.tiling,
+      });
+    }
+    if (entries.length === 0) return;
+    return pluginBus.emit(STACK_EVENT.relayoutApply,
+      { windows: entries } satisfies StackRelayoutApplyEvent,
+      { timeoutMs: INTERCEPTOR_TIMEOUT_MS }).then(() => undefined);
+  });
   // Per-surface backstop timers for the map-ack hold: if a client never acks
   // the tile-size configure, map it anyway after this so a buggy client can't
   // stay invisible forever.

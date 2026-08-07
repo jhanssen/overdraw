@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createWm } from '../packages/core/dist/wm/index.js';
+import { DynamicBus } from '../packages/core/dist/events/dynamic-bus.js';
 import { inlineMasterStackDriverFactory } from './wm-helpers.mjs';
 
 function mockCompositor() {
@@ -78,6 +79,53 @@ test('reorder holds geometry: configure sent, but rect not applied until commit'
   wm.notifyToplevelCommit(2, lastSerial(configures, 2));
   assert.deepEqual(rectOf(wm, 2), { x: 0, y: 0, width: 500, height: 600 }, '2 -> master');
   assert.deepEqual(rectOf(wm, 3), { x: 500, y: 0, width: 500, height: 300 }, '3 -> stack-top');
+});
+
+test('reorder apply emits stack.relayout-apply with still-shown rects before landing', async () => {
+  const comp = mockCompositor();
+  let serial = 0;
+  const configures = [];
+  const configure = {
+    configure: (id, _x, _y, w, h) => {
+      serial += 1; configures.push({ id, w, h, serial }); return serial;
+    },
+    configureMove: () => {},
+  };
+  const bus = new DynamicBus();
+  const wm = createWm(comp, OUT,
+    { configure, layoutDriverFactory: inlineMasterStackDriverFactory, pluginBus: bus });
+  await addMapped(wm, 1);
+  await addMapped(wm, 2);
+  await addMapped(wm, 3);
+  await wm.settled();
+  // Order [3, 2, 1]: 3 master (500x600), 2 stack-top (500x300).
+  configures.length = 0;
+  const captured = [];
+  let rectsAtEmit = null;
+  bus.intercept('stack.relayout-apply', (_name, ev) => {
+    captured.push(ev);
+    // The batch has not landed while handlers run: an animation plugin
+    // primes its presnap against the rects the surfaces still show.
+    rectsAtEmit = { 2: rectOf(wm, 2), 3: rectOf(wm, 3) };
+    return undefined;
+  });
+  assert.equal(wm.reorder(3, 'swap-next'), true);
+  await wm.settled();
+  wm.notifyToplevelCommit(3, lastSerial(configures, 3));
+  wm.notifyToplevelCommit(2, lastSerial(configures, 2));
+  // The gate defers the apply by the emit's microtasks.
+  await new Promise((r) => setImmediate(r));
+  assert.equal(captured.length, 1);
+  const byId = new Map(captured[0].windows.map((w) => [w.surfaceId, w]));
+  assert.deepEqual(byId.get(2).oldOuter, { x: 500, y: 0, width: 500, height: 300 },
+    'oldOuter is the rect the surface still shows');
+  assert.deepEqual(byId.get(2).newOuter, { x: 0, y: 0, width: 500, height: 600 },
+    'newOuter is the held target');
+  assert.deepEqual(rectsAtEmit[2], { x: 500, y: 0, width: 500, height: 300 },
+    'rect not yet applied while handlers run');
+  assert.deepEqual(rectOf(wm, 2), { x: 0, y: 0, width: 500, height: 600 },
+    'applied after handlers resolved');
+  assert.deepEqual(rectOf(wm, 3), { x: 500, y: 0, width: 500, height: 300 });
 });
 
 test('immediate relayout retargets an in-flight hold (floating peer must not clobber the stack)', async () => {

@@ -92,6 +92,16 @@ export interface SurfaceTransactionBroker {
   // during the hold to prevent the surface from being drawn on the new
   // output before its geometry has moved there.
   onAfterApply(cb: () => void): void;
+  // Register an async gate awaited between a batch going ready and its
+  // onApply callbacks running, receiving the surface ids about to
+  // apply. The holds are already off the books (a re-entrant evaluate
+  // cannot re-apply them) and every surface stays frozen through the
+  // gate, so the pre-hold appearance persists until it resolves. The WM
+  // uses this to let animation plugins prime compensating transforms in
+  // the same instant the held geometry lands; the caller bounds its own
+  // wait. A callback returning undefined (nothing to wait for) keeps
+  // the apply fully synchronous.
+  onBeforeApply(cb: (surfaceIds: ReadonlyArray<number>) => Promise<void> | void): void;
   // Test/diagnostic helpers.
   size(): number;
   tagsFor(surfaceId: number): ReadonlyArray<string>;
@@ -132,6 +142,7 @@ export function createSurfaceTransactionBroker(
 
   const holds = new Map<number, InternalHold>();
   const afterApplyCbs: Array<() => void> = [];
+  const beforeApplyCbs: Array<(ids: ReadonlyArray<number>) => Promise<void> | void> = [];
   let timer: unknown = null;
 
   // Forward the compositor's frozen-ready callback into evaluate. The
@@ -227,23 +238,46 @@ export function createSurfaceTransactionBroker(
   function doApply(list: InternalHold[]): void {
     // Atomically remove from the map first so anything triggered during
     // onApply (e.g. setSurfaceLayout side effects, downstream events)
-    // sees the holds gone and won't recurse.
+    // sees the holds gone and won't recurse. A surface unmapping while
+    // a before-apply gate is pending finds no hold to cancel; its
+    // requirement's onApply is expected to tolerate a gone surface.
     for (const h of list) holds.delete(h.surfaceId);
     if (holds.size === 0 && timer !== null) { clearTimer(timer); timer = null; }
-    for (const h of list) {
-      for (const r of h.reqs) {
-        try { r.onApply?.(); }
-        catch (e) { log.warn("core", `surface-tx onApply (${r.tag}) threw: ${String(e)}`); }
+    const finish = (): void => {
+      for (const h of list) {
+        for (const r of h.reqs) {
+          try { r.onApply?.(); }
+          catch (e) { log.warn("core", `surface-tx onApply (${r.tag}) threw: ${String(e)}`); }
+        }
+        sink.thawSurface?.(h.surfaceId);
       }
-      sink.thawSurface?.(h.surfaceId);
+      // Post-apply hooks fire AFTER all onApply + thaw -- callers use this
+      // to push deferred side effects atomically with the apply (e.g. a
+      // queued setOutputStack that was withheld during the hold).
+      for (const cb of afterApplyCbs) {
+        try { cb(); }
+        catch (e) { log.warn("core", `surface-tx onAfterApply threw: ${String(e)}`); }
+      }
+    };
+    if (beforeApplyCbs.length === 0) { finish(); return; }
+    // A gate returning undefined (nothing to wait for) keeps the apply
+    // fully synchronous; only actual promises defer it.
+    const ids = list.map((h) => h.surfaceId);
+    const gates: Array<Promise<unknown>> = [];
+    for (const cb of beforeApplyCbs) {
+      try {
+        const r = cb(ids);
+        if (r) {
+          gates.push(r.catch((e) => {
+            log.warn("core", `surface-tx onBeforeApply rejected: ${String(e)}`);
+          }));
+        }
+      } catch (e) {
+        log.warn("core", `surface-tx onBeforeApply threw: ${String(e)}`);
+      }
     }
-    // Post-apply hooks fire AFTER all onApply + thaw -- callers use this
-    // to push deferred side effects atomically with the apply (e.g. a
-    // queued setOutputStack that was withheld during the hold).
-    for (const cb of afterApplyCbs) {
-      try { cb(); }
-      catch (e) { log.warn("core", `surface-tx onAfterApply threw: ${String(e)}`); }
-    }
+    if (gates.length === 0) { finish(); return; }
+    void Promise.all(gates).then(finish);
   }
 
   return {
@@ -291,6 +325,7 @@ export function createSurfaceTransactionBroker(
 
     has(surfaceId) { return holds.has(surfaceId); },
     onAfterApply(cb) { afterApplyCbs.push(cb); },
+    onBeforeApply(cb) { beforeApplyCbs.push(cb); },
     size() { return holds.size; },
     tagsFor(surfaceId) {
       const h = holds.get(surfaceId);

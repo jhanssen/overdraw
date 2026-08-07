@@ -277,6 +277,14 @@ returns:
 ```ts
 // Modify example: an intercept-relayout plugin pre-snaps each
 // window's transform before core pushes the new rect.
+//
+// Caveat: reorder / param-changed relayouts do NOT push the rect when
+// the interceptor resolves -- the WM's resize transaction holds the
+// geometry until clients re-render, so a presnap primed here would
+// displace the still-unmoved surface for the hold's duration. Those
+// passes get a second awaited event, `stack.relayout-apply`, fired as
+// the ready batch is about to land (entries carry the rect each
+// surface still shows plus the held target); prime transforms there.
 sdk.events.intercept<RelayoutEvent>("window.relayout", async (ev) => {
   await sdk.windows.setTransform(ev.surfaceId, computeFromOldToNew(ev));
   // returns void -> defer: core awaits, then proceeds to push new rect.

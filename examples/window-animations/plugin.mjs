@@ -9,7 +9,9 @@
 //   RETILED (both rects populated): a window's rect changed. The
 //     compensating "presnap" transform makes the surface visually
 //     stay at oldOuter even though the WM has installed newOuter;
-//     the animation moves it from presnap to identity.
+//     the animation moves it from presnap to identity. Reorder /
+//     param-changed rects are held by the WM's resize transaction and
+//     animate from stack.relayout-apply instead, when they land.
 //   DESTROYED (newOuter === null): a window unmapped. The closing-
 //     driver minted a phantom for its last visible state; we animate
 //     the phantom out (slide off for tiled, fade for floating) and
@@ -133,29 +135,16 @@ export default async function init(sdk) {
     // output). Compensate visually with a presnap transform that
     // makes the surface look like it's still at oldOuter even
     // though its placement is now newOuter, then tween to identity.
+    //
+    // Reorder / param-changed geometry is HELD by the WM's resize
+    // transaction until clients re-render -- the surface still shows
+    // oldOuter, so a presnap now would displace it (a window moving
+    // right would flash LEFT by the move distance). Those retiles
+    // animate from stack.relayout-apply below, in the same instant
+    // their held rects land.
     if (ev.oldOuter !== null && ev.newOuter !== null) {
-      // Degenerate / no-change: skip.
-      if (ev.oldOuter.x === ev.newOuter.x
-          && ev.oldOuter.y === ev.newOuter.y
-          && ev.oldOuter.width === ev.newOuter.width
-          && ev.oldOuter.height === ev.newOuter.height) {
-        return undefined;
-      }
-      const sx = ev.oldOuter.width / ev.newOuter.width;
-      const sy = ev.oldOuter.height / ev.newOuter.height;
-      const tx = ev.oldOuter.x - ev.newOuter.x;
-      const ty = ev.oldOuter.y - ev.newOuter.y;
-      try {
-        await sdk.windows.setTransform(id,
-          { translateX: tx, translateY: ty, scaleX: sx, scaleY: sy });
-        void sdk.animations.run(tween(target.windowTransform(id), {
-          from: { translateX: tx, translateY: ty, scaleX: sx, scaleY: sy },
-          to:   { translateX: 0,  translateY: 0,  scaleX: 1,  scaleY: 1 },
-          duration: DURATION_MS, easing: EASING,
-        }));
-      } catch (e) {
-        sdk.log(`window-animations: RETILED setup failed for ${id}: ${e && e.message ? e.message : e}`);
-      }
+      if (ev.reason === "reorder" || ev.reason === "param-changed") return undefined;
+      await presnap(id, ev.oldOuter, ev.newOuter);
       return undefined;
     }
 
@@ -163,6 +152,42 @@ export default async function init(sdk) {
     // handle).
     return undefined;
   });
+
+  // RETILE (transaction-held): a ready batch's held rects are about to
+  // land atomically; oldOuter is the rect each surface still shows.
+  // Priming every presnap before returning means the whole batch slides
+  // from its pre-swap arrangement in one coordinated motion.
+  sdk.events.intercept("stack.relayout-apply", async (_name, ev) => {
+    const wins = Array.isArray(ev?.windows) ? ev.windows : [];
+    await Promise.all(wins.map((w) => presnap(w.surfaceId, w.oldOuter, w.newOuter)));
+    return undefined;
+  });
+
+  // Shared presnap: skip no-change rects, set the compensating
+  // transform, then tween to identity.
+  async function presnap(id, oldOuter, newOuter) {
+    if (oldOuter.x === newOuter.x
+        && oldOuter.y === newOuter.y
+        && oldOuter.width === newOuter.width
+        && oldOuter.height === newOuter.height) {
+      return;
+    }
+    const sx = oldOuter.width / newOuter.width;
+    const sy = oldOuter.height / newOuter.height;
+    const tx = oldOuter.x - newOuter.x;
+    const ty = oldOuter.y - newOuter.y;
+    try {
+      await sdk.windows.setTransform(id,
+        { translateX: tx, translateY: ty, scaleX: sx, scaleY: sy });
+      void sdk.animations.run(tween(target.windowTransform(id), {
+        from: { translateX: tx, translateY: ty, scaleX: sx, scaleY: sy },
+        to:   { translateX: 0,  translateY: 0,  scaleX: 1,  scaleY: 1 },
+        duration: DURATION_MS, easing: EASING,
+      }));
+    } catch (e) {
+      sdk.log(`window-animations: RETILED setup failed for ${id}: ${e && e.message ? e.message : e}`);
+    }
+  }
 
   // OPEN animation. window.opening fires at first content, with the opening
   // gate engaged and the window held out of the draw stack. We set the presnap

@@ -77,6 +77,16 @@ export const WINDOW_EVENT = {
 // stream.
 export const STACK_EVENT = {
   relayout: "stack.relayout",
+  // Awaited pre-action event: a resize-transaction batch (reorder /
+  // param-changed geometry held until clients re-render) is about to
+  // land. Fires after every hold in the batch is ready and BEFORE the
+  // rects install; the WM awaits handlers (bounded by the interceptor
+  // timeout), so an animation plugin can prime compensating transforms
+  // that go live in the same instant as the swap. Entries carry the
+  // rect the surface still shows (oldOuter -- the announce-time
+  // window.relayout fired a client round trip earlier) and the held
+  // target (newOuter). See StackRelayoutApplyEvent.
+  relayoutApply: "stack.relayout-apply",
 } as const;
 
 // `type` (not `interface`) so the payloads carry an implicit index signature and
@@ -363,6 +373,22 @@ export type StackRelayoutEvent = {
   }>;
 };
 
+// Fired as a ready resize-transaction batch is about to install its held
+// geometry (STACK_EVENT.relayoutApply). The WM awaits handlers before
+// the rects land, so a presnap transform primed here is live in the same
+// instant as the swap. oldOuter is the rect each surface still SHOWS at
+// this moment -- for a held window that is the pre-reorder rect, not
+// whatever the announce-time relayout reported. Entries whose held rect
+// equals the shown rect are omitted.
+export type StackRelayoutApplyEvent = {
+  windows: Array<{
+    surfaceId: number;
+    oldOuter: WindowRect;
+    newOuter: WindowRect;
+    tiling: Tiling;
+  }>;
+};
+
 // Emitted after a mapped toplevel has unmapped (client
 // destroyed it or disconnected). `phantomSurfaceId` is a fresh
 // compositor surface entry the core minted to display a snapshot
@@ -453,5 +479,6 @@ export type _UnmapIsCloneable = AssignableToCloneable<WindowUnmapEvent>;
 export type _ChangeIsCloneable = AssignableToCloneable<WindowChangeEvent>;
 export type _RelayoutIsCloneable = AssignableToCloneable<WindowRelayoutEvent>;
 export type _StackRelayoutIsCloneable = AssignableToCloneable<StackRelayoutEvent>;
+export type _StackRelayoutApplyIsCloneable = AssignableToCloneable<StackRelayoutApplyEvent>;
 export type _ClosingIsCloneable = AssignableToCloneable<WindowClosingEvent>;
 export type _OpeningIsCloneable = AssignableToCloneable<WindowOpeningEvent>;

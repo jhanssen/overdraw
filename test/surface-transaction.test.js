@@ -73,6 +73,37 @@ test('begin freezes; ready-then-evaluate thaws and runs onApply', () => {
   assert.ok(!b.has(7));
 });
 
+test('onBeforeApply: a promise gate defers onApply + thaw until it resolves', async () => {
+  const sink = makeSink();
+  const b = createSurfaceTransactionBroker(sink);
+  let applied = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const seenIds = [];
+  b.onBeforeApply((ids) => { seenIds.push([...ids]); return gate; });
+  b.begin(7, { tag: 'test', ready: () => true, onApply: () => { applied++; } });
+  // The hold is off the books (a re-entrant evaluate cannot re-apply)
+  // but the apply is gated: not applied, still frozen.
+  assert.ok(!b.has(7));
+  assert.equal(applied, 0);
+  assert.deepEqual(sink.calls, [['freeze', 7]]);
+  assert.deepEqual(seenIds, [[7]]);
+  release();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(applied, 1);
+  assert.deepEqual(sink.calls, [['freeze', 7], ['thaw', 7]]);
+});
+
+test('onBeforeApply: an undefined-returning gate keeps the apply synchronous', () => {
+  const sink = makeSink();
+  const b = createSurfaceTransactionBroker(sink);
+  let applied = 0;
+  b.onBeforeApply(() => undefined);
+  b.begin(7, { tag: 'test', ready: () => true, onApply: () => { applied++; } });
+  assert.equal(applied, 1, 'applied inside begin, no microtask deferral');
+  assert.deepEqual(sink.calls, [['freeze', 7], ['thaw', 7]]);
+});
+
 test('onStart fires synchronously inside begin (the first time only)', () => {
   const sink = makeSink();
   const b = createSurfaceTransactionBroker(sink);
