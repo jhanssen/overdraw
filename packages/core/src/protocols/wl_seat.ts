@@ -793,16 +793,20 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       return;
     }
     const ws = ctx.state.wm?.getWindowState(g.surfaceId) ?? null;
-    // The floating rect lives in world coordinates; pointer travel is
-    // glass. Convert the deltas through the viewing camera (translation
-    // cancels, leaving /zoom) so the window tracks the hand 1:1 on
-    // glass even while zoomed out (fit/roam). The camera is static for
-    // the grab's duration -- the animations broker's cameraGate denies
-    // camera moves during grabs -- so the transform is stable.
+    // The grab rect lives in world coordinates; deltas are computed
+    // WORLD-to-world (pointer through the live camera vs. the anchor's
+    // stamped world position, beginGrab). With a static camera this
+    // reduces to glassDelta/zoom (1:1 tracking on glass while zoomed
+    // out), and when the camera moves mid-grab -- the elastic strip's
+    // reveal-scroll pans while a drag pushes past the docked view's
+    // edge -- the window follows the world under the hand, so a long
+    // strip stays reachable end to end.
     const view = contentViewAt(x, y);
+    const wx = seatViewToWorldX(view, x);
+    const wy = seatViewToWorldY(view, y);
     const rect = computeGrabRect(g,
-      (x - g.anchorX) / view.zoom,
-      (y - g.anchorY) / view.zoom,
+      g.anchorWorldX !== undefined ? wx - g.anchorWorldX : (x - g.anchorX) / view.zoom,
+      g.anchorWorldY !== undefined ? wy - g.anchorWorldY : (y - g.anchorY) / view.zoom,
       ws?.constraints ?? null);
     ctx.state.wm?.setFloatingRect(g.surfaceId, rect);
     // Stream the pointer's world position to the workspace plugin so a
@@ -812,8 +816,8 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       ctx.state.pluginBus?.emit("window.drag-moved", {
         surfaceId: g.surfaceId,
         lifted: g.lifted === true,
-        x: seatViewToWorldX(view, x),
-        y: seatViewToWorldY(view, y),
+        x: wx,
+        y: wy,
       });
     }
   }
@@ -1302,6 +1306,17 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     grab: null,
     beginGrab(g) {
       if (!seat0 || seat0.grab) return;
+      // Stamp the anchor's world position so grab motion can compute
+      // world deltas through whatever camera is live at each event --
+      // the camera is NOT static for a grab's duration (the elastic
+      // strip's reveal-scroll pans while a drag pushes past the docked
+      // view's edge), and a glass-delta-only transform would cap the
+      // window's world travel at one viewport width.
+      if (g.kind === "move" || g.kind === "resize") {
+        const v = contentViewAt(g.anchorX, g.anchorY);
+        g.anchorWorldX = seatViewToWorldX(v, g.anchorX);
+        g.anchorWorldY = seatViewToWorldY(v, g.anchorY);
+      }
       seat0.grab = g;
       // Release the pointer focus during the grab: motion events drive
       // geometry, not client wl_pointer; the focused client shouldn't

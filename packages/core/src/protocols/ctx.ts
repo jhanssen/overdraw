@@ -1537,6 +1537,13 @@ export interface PointerGrabMove {
   // Pointer position at grab start.
   anchorX: number;
   anchorY: number;
+  // The anchor's WORLD position through the content camera, stamped by
+  // beginGrab. Grab motion computes world deltas from these so the
+  // window stays pinned under the hand even when the camera moves
+  // mid-grab (the elastic strip's reveal-scroll pans while a drag
+  // pushes past the docked view's edge).
+  anchorWorldX?: number;
+  anchorWorldY?: number;
   // Window outer rect at grab start.
   startRect: { x: number; y: number; width: number; height: number };
   // True when the window was in the managed (tiled) lane before the
@@ -1562,6 +1569,9 @@ export interface PointerGrabResize {
   surfaceId: number;
   anchorX: number;
   anchorY: number;
+  // World-space anchor, stamped by beginGrab (see PointerGrabMove).
+  anchorWorldX?: number;
+  anchorWorldY?: number;
   startRect: { x: number; y: number; width: number; height: number };
   edges: ResizeEdges;
   endOnButtonUp?: boolean;
