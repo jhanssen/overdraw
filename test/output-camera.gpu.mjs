@@ -110,6 +110,48 @@ test("camera pans world content; layer surface stays anchored; identity restores
   }
 });
 
+test("surface transform translate is world-space: it maps through the camera zoom",
+  { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT });
+  try {
+    const blue = 0xff2040c0;
+    const blueBgra = argbToBgra(blue);
+    const t = c.spawnClient(["--fill-configured", "--color", blue.toString(16)]);
+    await t.ready;
+    await c.waitFor(c.query, (s) => s.windows.length === 1, { what: "toplevel" });
+    const id = (await c.query()).windows[0].surfaceId;
+
+    // Zoom 0.5, no pan: world 0..256 renders at glass 0..128.
+    setCamera(c, 0, 0, 0, 0.5);
+    let px = await readUntil(c,
+      (p) => pixelMatches(pixelAt(p, OUT.width, 60, 64), blueBgra, 4)
+        && pixelMatches(pixelAt(p, OUT.width, 200, 64), BLACK, 4));
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 60, 64), blueBgra, 4),
+      `zoomed content at glass 60; got ${pixelAt(px, OUT.width, 60, 64)}`);
+
+    // Translate 100 WORLD px right: at zoom 0.5 the content must shift 50
+    // glass px (occupying glass 50..178) -- an animation presnap computed
+    // from layout rects covers the same world distance at any zoom. Under
+    // glass-space translate it would shift 100 glass px (100..228) and
+    // glass 60 would read void.
+    c.state.compositor.setSurfaceTransform(id,
+      { translateX: 100, translateY: 0, scaleX: 1, scaleY: 1 });
+    px = await readUntil(c,
+      (p) => pixelMatches(pixelAt(p, OUT.width, 40, 64), BLACK, 4)
+        && pixelMatches(pixelAt(p, OUT.width, 60, 64), blueBgra, 4));
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 40, 64), BLACK, 4),
+      `void before the shifted edge; got ${pixelAt(px, OUT.width, 40, 64)}`);
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 60, 64), blueBgra, 4),
+      `world-space shift lands at glass 50..178; got ${pixelAt(px, OUT.width, 60, 64)}`);
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 170, 64), blueBgra, 4),
+      `shifted content right portion; got ${pixelAt(px, OUT.width, 170, 64)}`);
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, 200, 64), BLACK, 4),
+      `void past the shifted content; got ${pixelAt(px, OUT.width, 200, 64)}`);
+  } finally {
+    await c.teardown();
+  }
+});
+
 test("camera transforms pointer hit-testing; layer hits stay glass-space",
   { skip }, async () => {
   const c = await setupCompositor({ headless: OUT });

@@ -3265,9 +3265,11 @@ export class JsCompositor implements CompositorSink {
     // extent stay aligned. When no layout (subsurface, popup) and
     // window-geometry is set (CSD client), fall back to the geometry
     // size. Otherwise the surface's intrinsic logical size.
-    // Camera zoom scales the drawn extent along with the position (fx
-    // translate/margins stay glass-space: they are output-anchored effects
-    // and zoom is a transient optical state).
+    // Camera zoom scales the drawn extent along with the position. The
+    // fx TRANSLATE is world-space -- callers derive offsets from layout
+    // rects (a retile presnap, an open/close slide), so it must cover
+    // the same world distance at any zoom -- and maps through camZ
+    // below. Margins stay glass-space (output-anchored bands).
     const pw = (overrideP?.w
       ?? (s.layoutW || (geom ? geom.width : intrinsicW))) * camZ;
     const ph = (overrideP?.h
@@ -3277,9 +3279,10 @@ export class JsCompositor implements CompositorSink {
     // placement
     data[0] = px / ow; data[1] = py / oh;
     data[2] = pw / ow; data[3] = ph / oh;
-    // transform: translate (normalized output coords); scale (unitless)
-    data[4] = fx.translateX / ow; data[5] = fx.translateY / oh;
-    data[6] = fx.scaleX;          data[7] = fx.scaleY;
+    // transform: translate (world px -> camera-zoomed, normalized output
+    // coords); scale (unitless)
+    data[4] = fx.translateX * camZ / ow; data[5] = fx.translateY * camZ / oh;
+    data[6] = fx.scaleX;                 data[7] = fx.scaleY;
     // margin: top/right/bottom/left (normalized output coords)
     data[8]  = fx.marginTop    / oh;
     data[9]  = fx.marginRight  / ow;
