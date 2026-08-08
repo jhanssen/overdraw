@@ -91,9 +91,10 @@ static struct wl_buffer* makeBuffer(struct gbm_device* gbm) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <socket> [frames]\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s <socket> [frames] [early]\n", argv[0]); return 2; }
     int frames = argc >= 3 ? atoi(argv[2]) : 40;
     if (frames < 1) frames = 1;
+    int destroy_early = argc >= 4 && strcmp(argv[3], "early") == 0;
 
     struct wl_display* display = wl_display_connect(argv[1]);
     if (!display) { fprintf(stderr, "[cycle] connect failed\n"); return 1; }
@@ -123,6 +124,13 @@ int main(int argc, char** argv) {
     // (the cache-invalidation trigger that releases the import per rule A).
     // A real client with a 2-3 buffer pool destroys old buffers when the pool
     // rolls over; this stresses the same path with N distinct buffers.
+    //
+    // "early" mode destroys the previous buffer IMMEDIATELY after the new
+    // commit, before the new buffer's async import can have bound -- the
+    // shape Qt produces when a resize drops the old-size pool. The
+    // compositor must keep showing the destroyed buffer's content until the
+    // replacement is drawable (imports hold their own dmabuf fds), not
+    // blank the surface for the import latency.
     struct wl_buffer* prev = NULL;
     for (int i = 0; i < frames; ++i) {
         struct wl_buffer* buf = makeBuffer(gbm);
@@ -130,6 +138,7 @@ int main(int argc, char** argv) {
         wl_surface_attach(surface, buf, 0, 0);
         wl_surface_damage(surface, 0, 0, W, H);
         wl_surface_commit(surface);
+        if (destroy_early && prev) { wl_buffer_destroy(prev); prev = NULL; }
         wl_display_roundtrip(display);
         usleep(25 * 1000);  // let a compositor frame sample + complete
         if (prev) wl_buffer_destroy(prev);

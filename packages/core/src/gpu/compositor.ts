@@ -1134,6 +1134,16 @@ export class JsCompositor implements CompositorSink {
   // async addon callback resolves; cleared by releaseImport. Cache lifetime is
   // the wl_buffer lifetime (rule A): cycling clients hit cache on re-attach.
   private dmabufImports = new Map<number, DmabufImport>();
+  // Imports whose release fired while a surface still DISPLAYED them: a
+  // client may destroy a wl_buffer its surface has nothing to replace yet
+  // (Qt drops its old-size pool on resize while the new size's import is
+  // still in flight). The import's fds are ours, so the texture stays
+  // valid; parking it here keeps the surface drawing its last-good
+  // content instead of blanking for the import latency. Drained by
+  // drainZombieImports once no surface samples the texture (the
+  // replacement bound, or the surface went away). Bounded: at most one
+  // displayed buffer per surface.
+  private zombieImports = new Map<number, DmabufImport>();
   // bufferId -> descriptor for importBuffer intents whose async callback has
   // not yet fired. Also lists surfaces waiting to bind once the wrap arrives.
   private dmabufPending = new Map<number, DmabufDescriptor>();
@@ -2311,6 +2321,9 @@ export class JsCompositor implements CompositorSink {
       }
     }
     this.surfaces.delete(id);
+    // The removed surface may have been the last sampler of a parked
+    // zombie import.
+    this.drainZombieImports();
   }
 
   // Upload a committed shm buffer into the surface's sampled texture.
@@ -2590,6 +2603,9 @@ export class JsCompositor implements CompositorSink {
     this.rebuildBindGroup(s, imp.view);
     s.present = true;
     s.contentEpoch++;
+    // The surface moved off whatever it displayed before; a parked
+    // zombie import it was keeping alive may now be freeable.
+    this.drainZombieImports();
     this.imported.push({ id, width: imp.width, height: imp.height });
     // Repaint only the client's damaged region (set at commit time), or the
     // whole surface when no damage was provided.
@@ -2756,12 +2772,49 @@ export class JsCompositor implements CompositorSink {
       return;
     }
     this.dmabufImports.delete(bufferId);
+    // Still some surface's displayed texture: park as a zombie instead of
+    // tearing down. The surface has nothing newer to show (its
+    // replacement's import is in flight -- or the client simply keeps
+    // showing a destroyed buffer, which the spec leaves "undefined" and
+    // every compositor renders as last-good content); freeing the import
+    // under it would blank the surface for the import latency, once per
+    // resize step for clients that drop their old-size pool on resize.
+    if (this.importDisplayed(bufferId, imp)) {
+      this.zombieImports.set(bufferId, imp);
+      return;
+    }
+    this.teardownImport(bufferId, imp);
+  }
+
+  // True while some surface samples exactly this import. Texture identity
+  // disambiguates a recycled wl resource id: a fresh buffer under the same
+  // numeric id binding a NEW import must not keep the old zombie alive.
+  private importDisplayed(bufferId: number, imp: DmabufImport): boolean {
+    for (const s of this.surfaces.values()) {
+      if (s.currentBufferId === bufferId && s.texture === imp.tex) return true;
+    }
+    return false;
+  }
+
+  // Free parked imports that no surface samples anymore. Cheap (zombies
+  // are rare and bounded by the surface count); called after a surface
+  // binds a new import and when a surface is removed.
+  private drainZombieImports(): void {
+    if (this.zombieImports.size === 0) return;
+    for (const [bufferId, imp] of [...this.zombieImports]) {
+      if (this.importDisplayed(bufferId, imp)) continue;
+      this.zombieImports.delete(bufferId);
+      this.teardownImport(bufferId, imp);
+    }
+  }
+
+  private teardownImport(bufferId: number, imp: DmabufImport): void {
     // Detach from any surfaces still pointing at this import. Without this, a
     // surface whose bufferDestroyed fired (or whose buffer was the destroyed
     // wl_buffer at the moment its own surfaceRemoved drained) keeps a stale
     // GPUTexture reference; the next frame would try to sample a freed import.
     for (const s of this.surfaces.values()) {
-      if (s.currentBufferId === bufferId) {
+      if (s.currentBufferId === bufferId && s.texture === imp.tex) {
         s.currentBufferId = 0;
         s.texture = null;
         s.view = null;
