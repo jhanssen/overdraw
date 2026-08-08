@@ -1939,6 +1939,10 @@ export class JsCompositor implements CompositorSink {
       outW: s.layoutW, outH: s.layoutH,
       placements: new Map([[id, { x: 0, y: 0, w: s.layoutW, h: s.layoutH }]]),
       effects: false,  // the freeze bakes the window's own pixels only
+      // Preserve the surface's own alpha: a translucent surface baked
+      // over opaque black would re-draw darker and non-translucent for
+      // the hold's duration.
+      transparentClear: true,
     });
     this.device.queue.submit([enc.finish()]);
     this.addon.writeEndAccess(imp.importId);
@@ -3587,6 +3591,15 @@ export class JsCompositor implements CompositorSink {
     // target unconditionally -- the preceding segment already cleared /
     // black-filled -- while keeping the scissor clip if one is set.
     resume?: boolean;
+    // Clear the target to TRANSPARENT black instead of opaque black.
+    // Offscreen single-surface bakes (the freeze snapshot) need the
+    // surface's own alpha preserved: over premultiplied blending,
+    // surface-over-transparent IS the surface's premultiplied rgba, so
+    // the snapshot recomposites over any backdrop exactly like the live
+    // surface. Baking over opaque black instead pre-blends translucent
+    // pixels with black and stamps alpha 1 -- the snapshot then draws
+    // darker and non-translucent.
+    transparentClear?: boolean;
     // Blurred-backdrop quads drawn before the drawList: each pseudo-surface
     // samples a blur-chain output via the caller-supplied cropUV (the
     // surface's on-screen rect in output UV). `id` is the REAL surface's id
@@ -3612,7 +3625,7 @@ export class JsCompositor implements CompositorSink {
         view: args.targetView,
         loadOp: partial || args.resume ? "load" : "clear",
         storeOp: "store",
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        clearValue: { r: 0, g: 0, b: 0, a: args.transparentClear ? 0 : 1 },
       }],
     });
     if (args.scissor) {
@@ -3880,6 +3893,7 @@ export class JsCompositor implements CompositorSink {
     placements?: Map<number, { x: number; y: number; w: number; h: number }>;
     cropUV?: Map<number, { u0: number; v0: number; u1: number; v1: number }>;
     effects?: boolean;
+    transparentClear?: boolean;
   }): void {
     const { encoder: enc, targetView: view, drawList, output: out, scissor } = args;
     const base = {
@@ -3887,6 +3901,7 @@ export class JsCompositor implements CompositorSink {
       outW: args.outW, outH: args.outH,
       scissor, output: out,
       placements: args.placements, cropUV: args.cropUV,
+      transparentClear: args.transparentClear,
     };
     let plan: Array<{ id: number; s: Surface;
       renderer: BackdropEffectRenderer;
