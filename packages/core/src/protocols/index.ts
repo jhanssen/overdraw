@@ -701,8 +701,8 @@ export async function installProtocols(
         // emit window.map with role: 'layer-shell'. width/height from the
         // imported buffer are ignored for placement -- the rect was decided
         // by placeLayerSurface against anchor / size / margin. appId/title
-        // are null for layer surfaces (the protocol carries a `namespace`
-        // identifier instead, not surfaced on this event today).
+        // are null for layer surfaces; the protocol's `namespace` identifier
+        // is carried instead so subscribers can match on it.
         s.mapped = true;
         const ls = s.layerSurface;
         const rect = ls.rect;
@@ -713,6 +713,7 @@ export async function installProtocols(
             rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
             appId: null, title: null,
             role: "layer-shell",
+            namespace: ls.namespace,
           });
         }
         // Mark the record mapped + push the layer stack. markLayerSurfaceMapped

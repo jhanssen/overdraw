@@ -146,8 +146,9 @@ export type WindowMapRole = "toplevel" | "layer-shell";
 // placement (output px). `appId`/`title` are the toplevel's, resolved at emit
 // time; either may be null (a client may set_app_id after its first commit --
 // the window.change event then carries the update). For layer-shell surfaces,
-// both are null (layer-shell carries a `namespace` instead of app_id/title;
-// not surfaced on this event).
+// both are null; identity comes from `namespace` instead (the layer-shell
+// protocol's identifier, e.g. "waybar" -- fixed at get_layer_surface time, so
+// unlike appId it is always present at map and never changes).
 //
 // `role` discriminates toplevel vs layer-shell so subscribers (status bars,
 // workspace plugins, etc.) can branch without looking up the surface
@@ -162,6 +163,9 @@ export type WindowMapEvent = {
   appId: string | null;
   title: string | null;
   role?: WindowMapRole;
+  // Layer-shell only (role: "layer-shell"); absent on toplevel maps. Same
+  // value the layer.relayout / layer.resize-announce events carry.
+  namespace?: string;
 };
 
 // Emitted when a mapped toplevel is destroyed/unmapped.
