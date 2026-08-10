@@ -1,0 +1,17 @@
+{
+  "name": "@overdraw/plugin-animations-default",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bundled window/layer animation plugin: open/close slides and fades, retile presnaps (immediate and transaction-held), and the two-phase layer-resize glide. Ships with overdraw and claims 'window-opening', 'window-closing', and 'window-animations' at priority 0 (the floor of the priority chain). User configs may override by claiming the same namespaces with a higher-priority plugin; a displaced claim registers no handlers, so there is no double-animation.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@overdraw/plugin-sdk-types": "*",
+    "@overdraw/sdk-anim": "*"
+  }
+}

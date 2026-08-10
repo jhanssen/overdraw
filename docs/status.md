@@ -1064,6 +1064,17 @@ live winner (replacement is a boot-time decision).
   from `config.actions`.
 - `@overdraw/plugin-cursor-actions`: `cursor.set-shape`,
   `cursor.hide`, etc.
+- `@overdraw/plugin-animations-default` (namespaces `'window-opening'`,
+  `'window-closing'`, `'window-animations'`): open/close slides and
+  fades, retile presnaps (immediate `window.relayout` +
+  transaction-held `stack.relayout-apply`), and the two-phase
+  layer-resize glide (`layer.resize-announce` + `layer.relayout`,
+  compose:"relative" chases). Config via the `animations` slice
+  (`enabled`, `window.{duration,easing}`, `layer.{enabled,duration,
+  easing}`; easing = CSS preset or cubic-bezier points). A user plugin
+  claiming any of the three namespaces displaces that seam wholesale
+  (handlers register only in the activation callback, so a displaced
+  claim animates nothing) -- see `examples/window-animations/`.
 
 **SDK surface (built):**
 - `sdk.gpu.createOverlay` (cross-process wire + dmabuf rings for

@@ -181,6 +181,17 @@ export const BUNDLED_PLUGINS: ReadonlyArray<BundledPluginSpec> = [
     module: "@overdraw/plugin-decoration-default",
     configFrom: (config) => config.decoration,
   },
+  {
+    // Window/layer animations. Claims window-opening / window-closing
+    // (which is what activates those drivers) and window-animations (the
+    // retile + layer-glide seams) at the priority floor; a user plugin
+    // claiming the same namespaces displaces the corresponding seams.
+    // Load order is immaterial: claims activate at load-batch end and
+    // every event it consumes fires at runtime.
+    name: "animations-default",
+    module: "@overdraw/plugin-animations-default",
+    configFrom: (config) => config.animations,
+  },
 ];
 
 // Convert a spec to the runtime's ResolvedPlugin shape. The restart fields

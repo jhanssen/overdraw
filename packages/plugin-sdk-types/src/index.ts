@@ -138,6 +138,13 @@ export interface PluginWindowsLike {
           reason?: string): Promise<unknown>;
   onMap(cb: (ev: { surfaceId: number; outputId: number }) => void): void;
   onUnmap(cb: (ev: { surfaceId: number }) => void): void;
+  // Release the opening-animation content gate engaged by the
+  // window-opening driver for a freshly-mapped window (the window is
+  // held out of the draw stack until this call or the driver backstop).
+  releaseOpeningGate(id: number): Promise<void>;
+  // Destroy a closing-animation phantom surface minted by the
+  // window-closing driver. Idempotent against the driver's backstop.
+  destroyPhantom(id: number): Promise<void>;
   // Reserve a band around the window's content (decoration providers).
   setInsets(id: number, insets: InsetsLike): Promise<InsetGrantLike | null>;
   setShape(id: number, shape: SurfaceShapeLike): Promise<void>;

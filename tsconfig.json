@@ -8,6 +8,7 @@
     { "path": "./packages/plugin-focus-default" },
     { "path": "./packages/animation-types" },
     { "path": "./packages/sdk-anim" },
+    { "path": "./packages/plugin-animations-default" },
     { "path": "./packages/transition-types" },
     { "path": "./packages/cursor-types" },
     { "path": "./packages/intercept-types" },

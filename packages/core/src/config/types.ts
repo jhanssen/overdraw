@@ -124,6 +124,15 @@ export interface OverdrawConfig {
   // `import type { LayoutPluginConfig } from "@overdraw/layout-types"`
   // and write `layout: cfg satisfies LayoutPluginConfig`.
   layout?: unknown;
+  // Bundled-plugin config slice for the animations plugin
+  // (@overdraw/plugin-animations-default). Same verbatim pass-through
+  // pattern; the plugin owns the schema: optional `enabled` (default
+  // true; false disables every animation), `window`
+  // ({duration?, easing?} for open/close/retile, default 200ms
+  // ease-out) and `layer` ({enabled?, duration?, easing?} for the
+  // layer-resize glide, default 380ms easeOutQuint). An easing is a
+  // CSS preset name or {x1, y1, x2, y2} cubic-bezier points.
+  animations?: unknown;
   // Opt into the canvas workspace provider (docs/canvas-design.md): when
   // set (any object, {} for defaults), @overdraw/plugin-canvas loads in
   // place of @overdraw/plugin-workspace-default as the 'workspace'
@@ -301,6 +310,8 @@ export interface ResolvedConfig {
   decoration: unknown;
   // Same verbatim pass-through to the bundled layout plugin.
   layout: unknown;
+  // Same verbatim pass-through to the bundled animations plugin.
+  animations: unknown;
   // Canvas opt-in slice (undefined = default workspace plugin; any object
   // = @overdraw/plugin-canvas replaces it and owns this schema).
   canvas: unknown;

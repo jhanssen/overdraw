@@ -149,6 +149,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
   const decoration: unknown = cfg.decoration;
   // Verbatim pass-through; the bundled layout plugin owns the schema.
   const layout: unknown = cfg.layout;
+  const animations: unknown = cfg.animations;
   // Canvas opt-in: when set (any object), plugin-canvas replaces the
   // default workspace plugin and owns this slice's schema.
   const canvas: unknown = cfg.canvas;
@@ -290,7 +291,7 @@ function normalize(raw: unknown, path: string): ResolvedConfig {
 
   return {
     output, card, scale, outputsByKey,
-    focus, hotkeys, decoration, layout, canvas, actions, plugins, xwayland, autostart,
+    focus, hotkeys, decoration, layout, animations, canvas, actions, plugins, xwayland, autostart,
     windowRules, cursor, directScanout,
     sourcePath: path,
   };
