@@ -85,6 +85,44 @@ export function createEvaluator(
     return `${t.kind}:${t.kind === "output-camera" ? t.outputId : t.windowId}`;
   }
 
+  // The last value this evaluator applied per target, backing
+  // compose:"relative" tweens (retarget-from-current). Only
+  // evaluator-driven writes are tracked; a target never animated
+  // composes against its kind's identity.
+  const lastApplied = new Map<string, readonly number[]>();
+  function write(target: TargetRef, components: readonly number[]): void {
+    lastApplied.set(targetKey(target), components);
+    applyValue(sink, target, components);
+  }
+
+  // Identity per kind, in canonical component order.
+  function identityFor(t: TargetRef): readonly number[] {
+    switch (t.kind) {
+      case "window-transform": return [0, 0, 1, 1];
+      case "window-opacity": return [1];
+      case "window-output-margin": return [0, 0, 0, 0];
+      case "output-camera": return [0, 0, 1];
+    }
+  }
+
+  // Whether a component composes additively (translate/margin/offsets)
+  // or multiplicatively (scale/zoom/opacity), per kind + index.
+  function composeComponent(t: TargetRef, i: number, cur: number, offset: number): number {
+    switch (t.kind) {
+      case "window-transform": return i < 2 ? cur + offset : cur * offset;
+      case "window-opacity": return cur * offset;
+      case "window-output-margin": return cur + offset;
+      case "output-camera": return i < 2 ? cur + offset : cur * offset;
+    }
+  }
+
+  function resolveFrom(spec: TweenSpec): number[] {
+    const from = coerceValue(spec.target, spec.from);
+    if (spec.compose !== "relative") return from;
+    const cur = lastApplied.get(targetKey(spec.target)) ?? identityFor(spec.target);
+    return from.map((f, i) => composeComponent(spec.target, i, cur[i] ?? 0, f));
+  }
+
   // Cancel-on-replacement: if a leaf is already active on this target,
   // resolve its Promise cleanly + remove it from the map. Idempotent.
   function preemptTarget(t: TargetRef): void {
@@ -98,11 +136,11 @@ export function createEvaluator(
   function startTween(spec: TweenSpec): Promise<void> {
     if (spec.duration <= 0 || !Number.isFinite(spec.duration)) {
       // Zero-duration: snap to `to` immediately. Avoids divide-by-zero.
-      applyValue(sink, spec.target, coerceValue(spec.target, spec.to));
+      write(spec.target, coerceValue(spec.target, spec.to));
       preemptTarget(spec.target);
       return Promise.resolve();
     }
-    const from = coerceValue(spec.target, spec.from);
+    const from = resolveFrom(spec);
     const to = coerceValue(spec.target, spec.to);
     if (from.length !== to.length) {
       throw new Error("tween: from/to component count mismatch");
@@ -110,7 +148,7 @@ export function createEvaluator(
     preemptTarget(spec.target);
     // Apply `from` at registration so the surface renders the start value
     // on any frame composited before the first tick steps the leaf.
-    applyValue(sink, spec.target, from);
+    write(spec.target, from);
     return new Promise<void>((resolve) => {
       const leaf: TweenLeaf = {
         kind: "tween",
@@ -128,7 +166,7 @@ export function createEvaluator(
           for (let i = 0; i < this.from.length; i++) {
             out[i] = this.from[i] + (this.to[i] - this.from[i]) * eased;
           }
-          applyValue(sink, this.target, out);
+          write(this.target, out);
           return t >= 1;
         },
       };
@@ -150,7 +188,7 @@ export function createEvaluator(
     };
     preemptTarget(spec.target);
     // Same eager-apply as tween: the start value lands before the first tick.
-    applyValue(sink, spec.target, from);
+    write(spec.target, from);
     return new Promise<void>((resolve) => {
       const springs = from.map((f, i) => new SpringState(f, to[i], params));
       const leaf: SpringLeaf = {
@@ -166,7 +204,7 @@ export function createEvaluator(
             out[i] = this.springs[i].value;
             if (!done) allDone = false;
           }
-          applyValue(sink, this.target, out);
+          write(this.target, out);
           return allDone;
         },
       };

@@ -481,3 +481,57 @@ test('coerceValue: rejects non-positive camera zoom', () => {
     from: { zoom: 1 }, to: { zoom: 0 }, duration: 100,
   }), /positive/);
 });
+
+// ---- compose: "relative" (retarget-from-current chases) -------------------
+
+test('compose relative: never-animated target composes against identity', async () => {
+  const sink = mockSink();
+  const ev = createEvaluator(sink);
+  void ev.run({
+    type: 'tween',
+    target: { kind: 'window-transform', windowId: 7 },
+    from: { translateX: -20, translateY: 0, scaleX: 0.5, scaleY: 0.5 },
+    to: { translateX: 0, translateY: 0, scaleX: 1, scaleY: 1 },
+    duration: 100, easing: 'linear', compose: 'relative',
+  });
+  // Registration applies the composed from: identity + offset.
+  const first = sink.calls.at(-1);
+  assert.equal(first.method, 'transform');
+  assert.equal(first.t.translateX, -20, 'translate adds onto identity 0');
+  assert.equal(first.t.scaleX, 0.5, 'scale multiplies onto identity 1');
+});
+
+test('compose relative: mid-flight retarget continues from the current value', async () => {
+  const sink = mockSink();
+  const ev = createEvaluator(sink);
+  void ev.run({
+    type: 'tween',
+    target: { kind: 'window-transform', windowId: 7 },
+    from: { translateX: -100, translateY: 0, scaleX: 0.5, scaleY: 1 },
+    to: { translateX: 0, translateY: 0, scaleX: 1, scaleY: 1 },
+    duration: 100, easing: 'linear',
+  });
+  // Half-way: translateX ~= -50, scaleX ~= 0.75.
+  drive(ev, 0, 50);
+  const mid = sink.calls.at(-1).t;
+  assert.ok(Math.abs(mid.translateX + 50) < 2, `mid tx ~ -50, got ${mid.translateX}`);
+  // Retarget with a new step's delta: from must compose with the
+  // CURRENT value (translate adds, scale multiplies), not restart at
+  // the raw offset -- the visible position is continuous.
+  void ev.run({
+    type: 'tween',
+    target: { kind: 'window-transform', windowId: 7 },
+    from: { translateX: -30, translateY: 0, scaleX: 0.8, scaleY: 1 },
+    to: { translateX: 0, translateY: 0, scaleX: 1, scaleY: 1 },
+    duration: 100, easing: 'linear', compose: 'relative',
+  });
+  const retarget = sink.calls.at(-1).t;
+  assert.ok(Math.abs(retarget.translateX - (mid.translateX - 30)) < 0.01,
+    `retarget tx = current + offset; got ${retarget.translateX}`);
+  assert.ok(Math.abs(retarget.scaleX - mid.scaleX * 0.8) < 0.01,
+    `retarget sx = current * offset; got ${retarget.scaleX}`);
+  // And it still settles at identity.
+  drive(ev, 50, 150);
+  const final = sink.calls.at(-1).t;
+  assert.ok(Math.abs(final.translateX) < 0.01 && Math.abs(final.scaleX - 1) < 0.01);
+});

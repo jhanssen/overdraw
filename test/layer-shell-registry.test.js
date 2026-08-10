@@ -14,9 +14,9 @@ import makeLayerShell, {
   markLayerSurfaceMapped,
   teardownLayerSurface,
   isLayerSurfaceInitialCommit,
+  pushLayerDisplayRect,
 } from "../packages/core/dist/protocols/zwlr_layer_shell_v1.js";
 import { createReservedZoneRegistry } from "../packages/core/dist/wm/reserved-zones.js";
-import { createSurfaceTransactionBroker } from "../packages/core/dist/surface-transaction.js";
 
 // Anchor bits from the protocol enum.
 const A = { top: 1, bottom: 2, left: 4, right: 8 };
@@ -282,90 +282,113 @@ test("apply after first configure: size change -> new configure", () => {
   assert.equal(calls[1].h, 40);
 });
 
-// ---- resize hold (mapped size changes) -----------------------------------
-// A mapped surface's size change holds the layout push through the shared
-// surface-transaction broker until the client renders at the configured
-// size -- pushing immediately would stretch the old-size buffer into the
-// new rect for a client round trip (per animation frame, for a client
-// that animates its size: heavy flicker).
+// ---- displayed rect follows the committed buffer --------------------------
+// A configure asks the client to change size; the DISPLAYED rect re-runs
+// the anchor math over the buffer the client actually COMMITTED, so an
+// old buffer is never stretched into a new rect -- and a client that
+// animates its size (per-frame set_size; threaded-Qt quickshell) has
+// each committed buffer shown at its own rect the moment it is
+// drawable. A configured-size catch-up gate cannot converge against a
+// moving target and stalls every step at its deadline.
 
-function setupMappedWithBroker() {
+function setupMapped() {
   const ctx = mockCtx();
   const ls = makeLayerSurface(ctx);
   const created = createLayerSurface(ctx, 100);
   const comp = ctx.state.compositor;
-  const ready = { at: false };
-  comp.surfaceReadyAt = () => ready.at;
-  ctx.state.surfaceTx = createSurfaceTransactionBroker(comp);
+  const buf = { size: null };
+  comp.surfaceLogicalSize = () => buf.size;
   ls.set_size(created.resource, 0, 30);
   ls.set_anchor(created.resource, A.top | A.left | A.right);
   applyLayerSurfaceInitial(ctx, created.layerSurface);
   ls.ack_configure(created.resource, created.layerSurface.lastConfigureSerial);
+  buf.size = { w: 1000, h: 30 };
   markLayerSurfaceMapped(ctx.state, created.layerSurface);
   comp.layouts.length = 0;
-  return { ctx, ls, comp, ready, ...created };
+  return { ctx, ls, comp, buf, ...created };
 }
 
-test("mapped size change: layout push held until ack + drawable buffer", () => {
-  const { ctx, ls, comp, ready, layerSurface, resource } = setupMappedWithBroker();
-  // Hover-expand: 30 -> 300.
+test("mapped size change: display keeps the buffer's rect until the client renders", () => {
+  const { ctx, ls, comp, buf, layerSurface, resource } = setupMapped();
   ls.set_size(resource, 0, 300);
   applyLayerSurfacePending(ctx, layerSurface);
   const c = configureCalls(ctx.events).at(-1);
   assert.equal(c.h, 300, "configure carries the new size");
-  assert.equal(comp.layouts.length, 0, "layout held before the client catches up");
-  assert.equal(layerSurface.resizeHoldActive, true);
-  // Ack alone is not enough: no drawable buffer at the new size yet.
+  // The commit-time push ran with the OLD buffer still current: the
+  // display stays at the buffer's 30px placement (no stretch).
+  assert.ok(comp.layouts.length >= 1);
+  assert.equal(comp.layouts.at(-1).h, 30, "display follows the old buffer");
+  // The client renders at the new size; the import-bind refresh follows
+  // immediately (index.ts drives this from the imported-surface drain).
   ls.ack_configure(resource, c.serial);
-  assert.equal(comp.layouts.length, 0, "still held after ack");
-  // The new-size buffer becomes drawable.
-  ready.at = true;
-  ctx.state.surfaceTx.evaluate();
-  assert.equal(comp.layouts.length, 1, "applied once the buffer is ready");
-  assert.equal(comp.layouts[0].h, 300);
-  assert.equal(layerSurface.resizeHoldActive, false);
+  buf.size = { w: 1000, h: 300 };
+  pushLayerDisplayRect(ctx.state, layerSurface);
+  assert.equal(comp.layouts.at(-1).h, 300, "display follows the new buffer");
 });
 
-test("mapped size change: further resizes fold into the in-flight hold", () => {
-  const { ctx, ls, comp, ready, layerSurface, resource } = setupMappedWithBroker();
+test("animated resize: display follows the buffer, not the newest configure", () => {
+  const { ctx, ls, comp, buf, layerSurface, resource } = setupMapped();
+  // Step N configured and rendered...
   ls.set_size(resource, 0, 100);
   applyLayerSurfacePending(ctx, layerSurface);
-  // Animation continues before the client caught up: retarget.
-  ls.set_size(resource, 0, 200);
+  buf.size = { w: 1000, h: 100 };
+  // ...but the animation has already configured step N+1.
+  ls.set_size(resource, 0, 110);
   applyLayerSurfacePending(ctx, layerSurface);
-  assert.equal(comp.layouts.length, 0, "single hold, nothing pushed");
-  const c = configureCalls(ctx.events).at(-1);
-  assert.equal(c.h, 200);
-  ls.ack_configure(resource, c.serial);
-  ready.at = true;
-  ctx.state.surfaceTx.evaluate();
-  assert.equal(comp.layouts.length, 1, "one push for the coalesced resizes");
-  assert.equal(comp.layouts[0].h, 200, "the LATEST rect lands");
-  assert.equal(layerSurface.resizeHoldActive, false);
+  assert.equal(configureCalls(ctx.events).at(-1).h, 110);
+  pushLayerDisplayRect(ctx.state, layerSurface);
+  assert.equal(comp.layouts.at(-1).h, 100,
+    "the drawable step-N buffer displays at its own rect, not step N+1's");
 });
 
-test("mapped position-only change applies immediately (no hold)", () => {
-  const { ctx, ls, comp, layerSurface, resource } = setupMappedWithBroker();
-  // Same size, different edge: the rect moves but needs no re-render.
-  ls.set_size(resource, 0, 30);
+test("anchor move with an unchanged buffer repositions immediately", () => {
+  const { ctx, ls, comp, layerSurface, resource } = setupMapped();
   ls.set_anchor(resource, A.bottom | A.left | A.right);
   applyLayerSurfacePending(ctx, layerSurface);
-  assert.equal(layerSurface.resizeHoldActive, undefined);
-  assert.equal(comp.layouts.length, 1, "position change pushes immediately");
-  assert.equal(comp.layouts[0].y, 570);
+  assert.equal(comp.layouts.at(-1).y, 570, "bottom-anchored at buffer height");
+  assert.equal(comp.layouts.at(-1).h, 30);
 });
 
-test("teardown mid-hold cancels it without a layout push", () => {
-  const { ctx, ls, comp, layerSurface, resource } = setupMappedWithBroker();
+test("mapped display change runs through the awaited layer.relayout seam", async () => {
+  const { ctx, ls, comp, buf, layerSurface, resource } = setupMapped();
+  const emits = [];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  ctx.state.pluginBus = {
+    emit(name, payload) {
+      emits.push({ name, payload });
+      return gate;   // the seam awaits handlers before installing
+    },
+  };
   ls.set_size(resource, 0, 300);
   applyLayerSurfacePending(ctx, layerSurface);
-  assert.equal(layerSurface.resizeHoldActive, true);
-  teardownLayerSurface(ctx.state, layerSurface);
-  assert.equal(layerSurface.resizeHoldActive, false);
-  assert.equal(comp.layouts.length, 0, "no stale push after teardown");
-  assert.equal(ctx.state.surfaceTx.size(), 0);
+  // The size-changing configure ANNOUNCES immediately (the glide's
+  // early phase), carrying the still-displayed rect and the asked size.
+  const announces = emits.filter((e) => e.name === "layer.resize-announce");
+  assert.equal(announces.length, 1);
+  assert.equal(announces[0].payload.fromRect.height, 30);
+  assert.equal(announces[0].payload.toRect.height, 300);
+  // The pending apply re-pushed the (unchanged, buffer-sized) rect
+  // directly; only the SIZE-changing push below rides the seam.
+  comp.layouts.length = 0;
+  buf.size = { w: 1000, h: 300 };
+  pushLayerDisplayRect(ctx.state, layerSurface);
+  await Promise.resolve();  // the seam's chain starts on a microtask
+  const relayouts = emits.filter((e) => e.name === "layer.relayout");
+  assert.equal(relayouts.length, 1);
+  assert.equal(relayouts[0].payload.oldRect.height, 30);
+  assert.equal(relayouts[0].payload.newRect.height, 300);
+  assert.equal(relayouts[0].payload.namespace, "test");
+  assert.equal(comp.layouts.length, 0,
+    "rect held until the seam's handlers resolve");
+  release();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(comp.layouts.at(-1).h, 300, "rect lands after the seam");
+  // An unchanged re-push installs directly, no further emit.
+  pushLayerDisplayRect(ctx.state, layerSurface);
+  assert.equal(emits.filter((e) => e.name === "layer.relayout").length, 1);
+  assert.equal(comp.layouts.at(-1).h, 300);
 });
-
 // ---- reserved-zone registration -----------------------------------------
 
 test("zone > 0 with a valid edge registers a reservation", () => {

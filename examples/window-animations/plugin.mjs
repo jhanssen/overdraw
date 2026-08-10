@@ -163,6 +163,51 @@ export default async function init(sdk) {
     return undefined;
   });
 
+  // LAYER GLIDE: two phases (see LAYER_EVENT docs). The ANNOUNCE starts
+  // gliding toward a size-changing configure's rect before the client
+  // renders, keeping the frame in phase with the incoming buffers (the
+  // buffer draws near 1:1; text stays crisp while the edge glides). The
+  // LAND re-bases the in-flight glide onto the new rect when the buffer
+  // arrives -- compose:"relative" keeps the visual continuous through
+  // both phases.
+  const LAYER_MS = 380;
+  const LAYER_EASING = { kind: "cubic-bezier", x1: 0.23, y1: 1, x2: 0.32, y2: 1 };
+  sdk.events.subscribe("layer.resize-announce", async (_name, ev) => {
+    const o = ev.fromRect, n = ev.toRect;
+    if (!o || !n || o.width <= 0 || o.height <= 0) return;
+    try {
+      await sdk.animations.start(tween(target.windowTransform(ev.surfaceId), {
+        from: { translateX: 0, translateY: 0, scaleX: 1, scaleY: 1 },
+        to: {
+          translateX: n.x - o.x, translateY: n.y - o.y,
+          scaleX: n.width / o.width, scaleY: n.height / o.height,
+        },
+        duration: LAYER_MS, easing: LAYER_EASING,
+        compose: "relative",
+      }));
+    } catch (e) {
+      sdk.log(`window-animations: layer announce glide failed for ${ev.surfaceId}: ${e && e.message ? e.message : e}`);
+    }
+  });
+  sdk.events.intercept("layer.relayout", async (_name, ev) => {
+    const o = ev.oldRect, n = ev.newRect;
+    if (!o || !n || n.width <= 0 || n.height <= 0) return undefined;
+    try {
+      await sdk.animations.start(tween(target.windowTransform(ev.surfaceId), {
+        from: {
+          translateX: o.x - n.x, translateY: o.y - n.y,
+          scaleX: o.width / n.width, scaleY: o.height / n.height,
+        },
+        to: { translateX: 0, translateY: 0, scaleX: 1, scaleY: 1 },
+        duration: LAYER_MS, easing: LAYER_EASING,
+        compose: "relative",
+      }));
+    } catch (e) {
+      sdk.log(`window-animations: layer glide failed for ${ev.surfaceId}: ${e && e.message ? e.message : e}`);
+    }
+    return undefined;
+  });
+
   // Shared presnap: skip no-change rects, set the compensating
   // transform, then tween to identity.
   async function presnap(id, oldOuter, newOuter) {

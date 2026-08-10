@@ -1340,11 +1340,13 @@ export interface LayerSurfaceRecord {
   // zone (if any) is registered. Set when zone > 0 produces a valid edge;
   // cleared otherwise. Used to clear/update without scanning.
   reservedZoneId?: string;
-  // True while a size change's layout push is held by the shared
-  // surface-transaction broker (until the client renders at the
-  // configured size). Later rect changes fold into the hold via
-  // rec.rect; the hold's onApply/onCancel clears the flag.
-  resizeHoldActive?: boolean;
+  // The rect last installed on the compositor for DISPLAY (follows the
+  // committed buffer; rec.rect is the configure-side placement). Changes
+  // while mapped run through the awaited layer.relayout seam.
+  displayRect?: { x: number; y: number; width: number; height: number };
+  // Serializes display-rect pushes through the awaited seam so rapid
+  // buffer-size steps land in commit order.
+  displayPushChain?: Promise<void>;
   // Cleared on destroy / wl_surface teardown to short-circuit any in-flight
   // sweep that still holds a reference (the sweep pattern used elsewhere).
   destroyed: boolean;

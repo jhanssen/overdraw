@@ -87,6 +87,14 @@ export interface TweenSpec {
   readonly to: unknown;       // same
   readonly duration: number;  // ms; must be > 0
   readonly easing?: EasingSpec;  // default "linear"
+  // "relative": `from` is composed with the target's CURRENT value
+  // (additive components add, e.g. translate; multiplicative components
+  // multiply, e.g. scale) instead of replacing it. This is the
+  // animated-variable retarget semantic: a chase that re-targets while a
+  // prior tween is mid-flight continues from wherever the value is now,
+  // with `from` expressing the step's delta. A target that was never
+  // animated composes against its identity. Default "absolute".
+  readonly compose?: "absolute" | "relative";
 }
 export interface SpringSpec {
   readonly type: "spring";

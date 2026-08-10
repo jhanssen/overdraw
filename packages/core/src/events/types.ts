@@ -89,6 +89,45 @@ export const STACK_EVENT = {
   relayoutApply: "stack.relayout-apply",
 } as const;
 
+// Layer-shell events. Layer surfaces live outside the WM, so they have
+// their own (small) event vocabulary.
+export const LAYER_EVENT = {
+  // Awaited pre-action event: a mapped layer surface's DISPLAYED rect is
+  // about to change (the client committed a buffer at a new size, or a
+  // reflow moved it). The compositor awaits handlers (bounded) before
+  // installing the rect, so an animation plugin can prime a compensating
+  // transform -- e.g. tween the surface between a client's coarse
+  // animation steps (compose:"relative" chases), the way Hyprland's
+  // animated layer geometry smooths a 20Hz quickshell resize.
+  relayout: "layer.relayout",
+  // Observe-only event fired when a size-changing configure goes out to
+  // a MAPPED layer surface (the announce): the client was just asked to
+  // become toRect while its displayed rect is still fromRect. An
+  // animation plugin starts its glide HERE -- toward the announced rect,
+  // from the current value -- so the frame moves in phase with the
+  // incoming buffers (the way Hyprland's animated layer geometry leads
+  // the client's render); the later layer.relayout (the buffer landing)
+  // re-bases the same tween onto the new rect without a visual jump.
+  resizeAnnounce: "layer.resize-announce",
+} as const;
+
+export type LayerRelayoutEvent = {
+  surfaceId: number;
+  // The layer surface's client-chosen namespace ("panel", "bar", ...).
+  namespace: string;
+  oldRect: WindowRect;
+  newRect: WindowRect;
+};
+
+export type LayerResizeAnnounceEvent = {
+  surfaceId: number;
+  namespace: string;
+  // The rect the surface currently displays.
+  fromRect: WindowRect;
+  // The placement the configure just asked the client to become.
+  toRect: WindowRect;
+};
+
 // `type` (not `interface`) so the payloads carry an implicit index signature and
 // stay assignable to Cloneable (interfaces do not). The guards below enforce it.
 export type WindowRect = {
@@ -480,5 +519,7 @@ export type _ChangeIsCloneable = AssignableToCloneable<WindowChangeEvent>;
 export type _RelayoutIsCloneable = AssignableToCloneable<WindowRelayoutEvent>;
 export type _StackRelayoutIsCloneable = AssignableToCloneable<StackRelayoutEvent>;
 export type _StackRelayoutApplyIsCloneable = AssignableToCloneable<StackRelayoutApplyEvent>;
+export type _LayerRelayoutIsCloneable = AssignableToCloneable<LayerRelayoutEvent>;
+export type _LayerResizeAnnounceIsCloneable = AssignableToCloneable<LayerResizeAnnounceEvent>;
 export type _ClosingIsCloneable = AssignableToCloneable<WindowClosingEvent>;
 export type _OpeningIsCloneable = AssignableToCloneable<WindowOpeningEvent>;

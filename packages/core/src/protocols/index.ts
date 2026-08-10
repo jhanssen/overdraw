@@ -33,7 +33,7 @@ import { OUTPUT_DEFAULT, OUTPUT_FALLBACK, FALLBACK_OUTPUT_NAME } from "./ctx.js"
 import type { FocusDriver, FocusApplyTarget } from "./focus-driver.js";
 import { titleAppId } from "../query.js";
 import { WINDOW_EVENT } from "../events/types.js";
-import { markLayerSurfaceMapped, installLayerShellOutputTeardown } from "./zwlr_layer_shell_v1.js";
+import { markLayerSurfaceMapped, installLayerShellOutputTeardown, pushLayerDisplayRect } from "./zwlr_layer_shell_v1.js";
 import type { CompositorBus } from "../events/window-bus.js";
 import { flushWindowChanges } from "./window-changes.js";
 
@@ -599,7 +599,17 @@ export async function installProtocols(
     let mappedPopup = false;
     for (const { id, width, height } of imported) {
       const s = state.surfacesById?.get(id);
-      if (!s || s.mapped) continue;
+      if (!s) continue;
+      if (s.mapped) {
+        // A mapped layer surface's DISPLAYED rect follows its committed
+        // buffer, whose logical size only becomes current when the async
+        // import binds -- re-run the placement now (a client animating
+        // its size commits a new-size buffer per frame).
+        if (s.role === "layer_surface" && s.layerSurface) {
+          pushLayerDisplayRect(state, s.layerSurface);
+        }
+        continue;
+      }
       if (s.role === "xdg_toplevel") {
         s.mapped = true;
         mappedAny = true;

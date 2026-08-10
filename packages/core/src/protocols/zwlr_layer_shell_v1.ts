@@ -46,6 +46,7 @@ import type {
 import { resolveOutputArg } from "./output-resolve.js";
 import type { Resource } from "../types.js";
 
+import { LAYER_EVENT, type LayerRelayoutEvent, type LayerResizeAnnounceEvent } from "../events/types.js";
 import {
   placeLayerSurface,
   resolveExclusiveEdge,
@@ -175,54 +176,80 @@ function applyLayerSurface(ctx: Ctx, rec: LayerSurfaceRecord, opts: { firstConfi
     || prevRect.height !== placement.rect.height;
   if (opts.firstConfigure || sizeChanged) {
     sendConfigure(ctx, rec, placement.rect.width, placement.rect.height);
+    if (!opts.firstConfigure) announceResize(state, rec, placement.rect);
   }
 
-  pushLayerRect(state, rec, {
-    sizeChanged,
-    hadRect: !!prevRect && !opts.firstConfigure,
-  });
+  pushLayerDisplayRect(state, rec);
 }
 
-// Install rec.rect on the compositor. A MAPPED surface's size change is
-// HELD through the shared surface-transaction broker until the client
-// renders at the configured size (ack + a drawable buffer at the new
-// logical dims): pushing immediately would draw the old-size buffer
-// stretched into the new rect for a client round trip, and a client that
-// animates its size (a hover-expanding panel) re-sizes every frame --
-// one stretched frame per step reads as heavy flicker. The broker
-// freezes the surface (old appearance at the old rect) and its deadline
-// force-applies if the client is slow. Position-only changes and
-// pre-map placements need no re-render and apply immediately. While a
-// hold is in flight, later changes fold into it: ready()/onApply read
-// rec.configured*/rec.rect live.
-function pushLayerRect(
+// Install the surface's DISPLAYED rect on the compositor. The display
+// follows the buffer the client actually COMMITTED: when the drawable
+// buffer's logical size differs from the configured placement, the
+// anchor math re-runs over the buffer's size. A configure asks the
+// client to change size; until it renders at the new size, the old
+// buffer keeps its matching old-size placement (never stretched into
+// the new rect) -- and a client that animates its size every frame
+// (threaded-Qt quickshell) has each committed buffer displayed at ITS
+// rect the moment it becomes drawable, with no catch-up gate: a
+// configured-size gate can never converge against a moving target and
+// stalls every step at the gate's deadline. wlroots semantics.
+//
+// Called on every commit-driven apply and again from the imported-
+// surface drain (a dmabuf's logical size is only current once its async
+// import binds).
+export function pushLayerDisplayRect(
   state: CompositorState, rec: LayerSurfaceRecord,
-  opts: { sizeChanged: boolean; hadRect: boolean },
 ): void {
-  const r = rec.rect;
-  if (!r) return;
-  if (rec.resizeHoldActive) return;
-  const broker = state.surfaceTx;
-  if (!opts.sizeChanged || !opts.hadRect || !rec.mapped || !broker) {
-    state.compositor.setSurfaceLayout(rec.surface.id, r.x, r.y, r.width, r.height);
+  if (rec.destroyed) return;
+  let rect = rec.rect;
+  if (!rect) return;
+  const sz = rec.mapped
+    ? state.compositor.surfaceLogicalSize?.(rec.surface.id) : null;
+  if (sz && sz.w > 0 && sz.h > 0
+      && (sz.w !== rect.width || sz.h !== rect.height)) {
+    const outputRect = outputRectFor(state, rec.output);
+    const effective = effectiveRectExcluding(state, rec);
+    rect = placeLayerSurface({
+      outputRect, effectiveRect: effective,
+      width: sz.w, height: sz.h,
+      anchor: rec.applied.anchor,
+      margin: rec.applied.margin,
+      exclusiveZone: rec.applied.exclusiveZone,
+    }).rect;
+  }
+  const prev = rec.displayRect;
+  const changed = !prev || prev.x !== rect.x || prev.y !== rect.y
+    || prev.width !== rect.width || prev.height !== rect.height;
+  rec.displayRect = rect;
+  const bus = state.pluginBus;
+  if (!changed || !prev || !rec.mapped || !bus) {
+    // Unchanged re-push, pre-map placement, or no plugin runtime:
+    // install directly.
+    state.compositor.setSurfaceLayout(
+      rec.surface.id, rect.x, rect.y, rect.width, rect.height);
     return;
   }
-  rec.resizeHoldActive = true;
-  broker.begin(rec.surface.id, {
-    tag: "layer-resize",
-    ready: () => {
-      if (rec.destroyed) return true;
-      if (!rec.acked) return false;
-      return state.compositor.surfaceReadyAt?.(
-        rec.surface.id, rec.configuredWidth, rec.configuredHeight) ?? true;
-    },
-    onApply: () => {
-      rec.resizeHoldActive = false;
-      if (rec.destroyed || !rec.rect) return;
-      state.compositor.setSurfaceLayout(rec.surface.id,
-        rec.rect.x, rec.rect.y, rec.rect.width, rec.rect.height);
-    },
-    onCancel: () => { rec.resizeHoldActive = false; },
+  // A mapped surface's display rect is changing: give the animation
+  // plugin one awaited look first (layer.relayout, mirroring
+  // window.relayout) so a compensating transform lands in the same
+  // breath as the rect -- a compose:"relative" chase tween there turns a
+  // client's coarse resize steps into continuous motion. Pushes chain
+  // per record so rapid steps land in commit order; a push superseded
+  // while awaiting skips its install (the newer push owns it).
+  const ev: LayerRelayoutEvent = {
+    surfaceId: rec.surface.id,
+    namespace: rec.namespace,
+    oldRect: { ...prev },
+    newRect: { ...rect },
+  };
+  const target = rect;
+  rec.displayPushChain = (rec.displayPushChain ?? Promise.resolve()).then(async () => {
+    try {
+      await bus.emit(LAYER_EVENT.relayout, ev, { timeoutMs: 100 });
+    } catch { /* interceptor failure must not strand the rect */ }
+    if (rec.destroyed || rec.displayRect !== target) return;
+    state.compositor.setSurfaceLayout(
+      rec.surface.id, target.x, target.y, target.width, target.height);
   });
 }
 
@@ -283,8 +310,9 @@ function reflowOtherLayerSurfaces(ctx: Ctx, changed: LayerSurfaceRecord): void {
     // If a sibling's size changed, send it a fresh configure too.
     if (sizeChanged) {
       sendConfigure(ctx, rec, placement.rect.width, placement.rect.height);
+      announceResize(state, rec, placement.rect);
     }
-    pushLayerRect(state, rec, { sizeChanged, hadRect: !!prev });
+    pushLayerDisplayRect(state, rec);
   }
 }
 
@@ -296,6 +324,30 @@ function sendConfigure(ctx: Ctx, rec: LayerSurfaceRecord, w: number, h: number):
   rec.configuredHeight = h;
   rec.acked = false;
   ctx.events.zwlr_layer_surface_v1.send_configure(rec.resource, serial, w, h);
+}
+
+// Announce a size-changing configure on a mapped surface: the animation
+// plugin starts its glide toward the announced placement HERE, before
+// the client has rendered -- the frame then moves in phase with the
+// incoming buffers, so the buffer is drawn near 1:1 for most of every
+// step (the later layer.relayout re-bases the tween when the buffer
+// lands). Observe-only, fire-and-forget.
+function announceResize(
+  state: CompositorState, rec: LayerSurfaceRecord,
+  toRect: { x: number; y: number; width: number; height: number },
+): void {
+  const bus = state.pluginBus;
+  const from = rec.displayRect;
+  if (!bus || !rec.mapped || !from) return;
+  if (from.x === toRect.x && from.y === toRect.y
+      && from.width === toRect.width && from.height === toRect.height) return;
+  const ev: LayerResizeAnnounceEvent = {
+    surfaceId: rec.surface.id,
+    namespace: rec.namespace,
+    fromRect: { ...from },
+    toRect: { ...toRect },
+  };
+  void bus.emit(LAYER_EVENT.resizeAnnounce, ev);
 }
 
 // ---- entry points used by wl_surface.commit ------------------------------
@@ -319,10 +371,6 @@ export function applyLayerSurfaceInitial(ctx: Ctx, rec: LayerSurfaceRecord): voi
 export function applyLayerSurfacePending(ctx: Ctx, rec: LayerSurfaceRecord): void {
   applyLayerSurface(ctx, rec, { firstConfigure: false });
   reflowOtherLayerSurfaces(ctx, rec);
-  // A buffer-bearing commit may satisfy an in-flight resize hold (the
-  // frozen-ready signal covers the async-import case; this covers a
-  // buffer that is drawable immediately).
-  if (rec.resizeHoldActive) ctx.state.surfaceTx?.evaluate();
   // Keyboard interactivity may have just changed; let the seat re-evaluate
   // the exclusive override. Cheap when nothing is exclusive (an O(n) walk
   // of layer surfaces with no allocations).
@@ -346,8 +394,6 @@ export function markLayerSurfaceMapped(state: CompositorState, rec: LayerSurface
 export function teardownLayerSurface(state: CompositorState, rec: LayerSurfaceRecord): void {
   if (rec.destroyed) return;
   rec.destroyed = true;
-  // Drop an in-flight resize hold (thaws; onCancel clears the flag).
-  if (rec.resizeHoldActive) state.surfaceTx?.cancel(rec.surface.id);
   // Clear reserved zone.
   if (rec.reservedZoneId && state.reservedZones) {
     state.reservedZones.clear(rec.reservedZoneId);
@@ -418,12 +464,7 @@ function reflowOtherLayerSurfacesForTeardown(state: CompositorState, changed: La
       exclusiveZone: rec.applied.exclusiveZone,
     });
     rec.rect = placement.rect;
-    // A surface mid resize-hold keeps its frozen appearance; the new
-    // rect folds into the hold's eventual apply.
-    if (rec.resizeHoldActive) continue;
-    state.compositor.setSurfaceLayout(
-      rec.surface.id, placement.rect.x, placement.rect.y,
-      placement.rect.width, placement.rect.height);
+    pushLayerDisplayRect(state, rec);
   }
 }
 
@@ -558,8 +599,6 @@ export function makeLayerSurface(ctx: Ctx): ZwlrLayerSurfaceV1Handler {
       if (!r) return;
       if (serial === r.lastConfigureSerial) {
         r.acked = true;
-        // A resize hold gates on this ack; re-check it.
-        if (r.resizeHoldActive) ctx.state.surfaceTx?.evaluate();
       }
     },
     destroy(resource) {

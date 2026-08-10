@@ -34,6 +34,9 @@ export interface TweenOpts {
   readonly to: unknown;
   readonly duration: number;
   readonly easing?: EasingSpec;
+  // See TweenSpec.compose: "relative" composes `from` with the target's
+  // current value (retarget-from-current chases).
+  readonly compose?: "absolute" | "relative";
 }
 
 export function tween(target: TargetRef, opts: TweenOpts): TweenSpec {
@@ -42,6 +45,7 @@ export function tween(target: TargetRef, opts: TweenOpts): TweenSpec {
     from: opts.from, to: opts.to,
     duration: opts.duration,
     ...(opts.easing !== undefined ? { easing: opts.easing } : {}),
+    ...(opts.compose !== undefined ? { compose: opts.compose } : {}),
   };
 }
 
