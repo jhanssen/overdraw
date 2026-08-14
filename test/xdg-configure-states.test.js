@@ -97,6 +97,24 @@ test('maximized window: states contains maximized', async () => {
   assert.deepEqual(s.getConfigure().states, [STATE_MAXIMIZED]);
 });
 
+test('zoomed managed window: states match a plain tile (zoom is invisible to the client)', async () => {
+  const s = setup();
+  s.wm.addWindow(1, { resource: {} });
+  await s.wm.propose(1, { sizeMode: 'zoomed' }, 'user-input');
+  configureToplevel(s.ctx, s.xs, 800, 600);
+  assert.deepEqual(s.getConfigure().states.slice().sort(),
+    [STATE_MAXIMIZED, ...TILED].slice().sort());
+});
+
+test('zoomed floating window: still tile states (configured size stays binding)', async () => {
+  const s = setup();
+  s.wm.addWindow(1, { resource: {} });
+  await s.wm.propose(1, { tiling: 'floating', sizeMode: 'zoomed' }, 'user-input');
+  configureToplevel(s.ctx, s.xs, 800, 600);
+  assert.deepEqual(s.getConfigure().states.slice().sort(),
+    [STATE_MAXIMIZED, ...TILED].slice().sort());
+});
+
 test('fullscreen window: states contains fullscreen', async () => {
   const s = setup();
   s.wm.addWindow(1, { resource: {} });

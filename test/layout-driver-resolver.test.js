@@ -188,6 +188,97 @@ test('reserved zones: exclusive=maximized + tileRegion both honor them', async (
     { x: 0, y: 30, width: 1000, height: 570 });
 });
 
+test('zoomed without a zoomedRect dep: falls back to the tile region', async () => {
+  const reservedZones = createReservedZoneRegistry();
+  reservedZones.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 99 });
+  const target = captureTarget();
+  const driver = createLayoutDriver({
+    snapshot: () => snap([{ id: 1, role: 'toplevel', sizeMode: 'zoomed' }]),
+    target,
+    reservedZones,
+    compute: async (inputs) =>
+      ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 9, y: 9, width: 9, height: 9 } })) }),
+  });
+  driver.schedule('mapped');
+  await driver.settled();
+  assert.deepEqual(target.calls[0].result.rects[0].outer,
+    { x: 0, y: 30, width: 1000, height: 570 });
+});
+
+test('zoomed with a zoomedRect dep: provider rect wins; region = tile region', async () => {
+  const reservedZones = createReservedZoneRegistry();
+  reservedZones.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 99 });
+  const target = captureTarget();
+  let zoomInputs = null;
+  const driver = createLayoutDriver({
+    snapshot: () => snap([{ id: 1, role: 'toplevel', sizeMode: 'zoomed' }]),
+    target,
+    reservedZones,
+    compute: async (inputs) =>
+      ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 9, y: 9, width: 9, height: 9 } })) }),
+    zoomedRect: async (inputs) => {
+      zoomInputs = inputs;
+      return { outer: { x: 10, y: 40, width: 980, height: 550 } };
+    },
+  });
+  driver.schedule('mapped');
+  await driver.settled();
+  assert.equal(zoomInputs.window.id, 1);
+  assert.deepEqual(zoomInputs.region, { x: 0, y: 30, width: 1000, height: 570 });
+  assert.deepEqual(target.calls[0].result.rects[0].outer,
+    { x: 10, y: 40, width: 980, height: 550 });
+});
+
+test('zoomedRect throwing (provider without the method): falls back to the region', async () => {
+  const target = captureTarget();
+  const driver = createLayoutDriver({
+    snapshot: () => snap([{ id: 1, role: 'toplevel', sizeMode: 'zoomed' }]),
+    target,
+    compute: async (inputs) =>
+      ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 9, y: 9, width: 9, height: 9 } })) }),
+    zoomedRect: async () => { throw new Error('no handler for zoomedRect'); },
+    log: () => {},
+  });
+  driver.schedule('mapped');
+  await driver.settled();
+  assert.deepEqual(target.calls[0].result.rects[0].outer,
+    { x: 0, y: 0, width: 1000, height: 600 });
+});
+
+test('zoomedRect returning null or garbage: falls back to the region', async () => {
+  const target = captureTarget();
+  for (const bad of [null, {}, { outer: { x: 'a', y: 0, width: 1, height: 1 } }]) {
+    target.calls.length = 0;
+    const driver = createLayoutDriver({
+      snapshot: () => snap([{ id: 1, role: 'toplevel', sizeMode: 'zoomed' }]),
+      target,
+      compute: async (inputs) =>
+        ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: { x: 9, y: 9, width: 9, height: 9 } })) }),
+      zoomedRect: async () => bad,
+    });
+    driver.schedule('mapped');
+    await driver.settled();
+    assert.deepEqual(target.calls[0].result.rects[0].outer,
+      { x: 0, y: 0, width: 1000, height: 600 });
+  }
+});
+
+test('maximized ignores the zoomedRect dep (edge-to-edge is its contract)', async () => {
+  const target = captureTarget();
+  let zoomCalls = 0;
+  const driver = createLayoutDriver({
+    snapshot: () => snap([{ id: 1, role: 'toplevel', sizeMode: 'maximized' }]),
+    target,
+    compute: async () => ({ rects: [] }),
+    zoomedRect: async () => { zoomCalls++; return null; },
+  });
+  driver.schedule('mapped');
+  await driver.settled();
+  assert.equal(zoomCalls, 0);
+  assert.deepEqual(target.calls[0].result.rects[0].outer,
+    { x: 0, y: 0, width: 1000, height: 600 });
+});
+
 test('exclusive=fullscreen ignores reserved zones (full output)', async () => {
   const reservedZones = createReservedZoneRegistry();
   reservedZones.set('bar', { outputId: 0, edge: 'top', thickness: 30, owner: 99 });

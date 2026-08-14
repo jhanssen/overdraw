@@ -49,12 +49,18 @@ glass coordinates (identity view), popup chains rooted at one anchor
 with it, and xwayland glass narration applies no camera to it. A
 maximized MANAGED window stays a tile member (keeps its slot; peers hold
 position; the active peer's z tie-break draws above it); a maximized
-floating window is a non-member and lowers like fullscreen. Any number
-of sizeMode windows coexist ("top z wins"); maximized alone is
-single-instance per island -- a new maximize demotes the previous one
-via propose() -- and in canvas world mode zoom is focus-transient: when
-another window on the SAME output takes activity, the zoomed member
-unzooms (the recompute restores its slot) instead of lingering as a strip-anchored cover.
+floating window is a non-member and lowers like fullscreen. sizeMode
+"zoomed" (window.toggle-zoom) is maximized's structural twin with
+different geometry: the layout provider's lone-window rect over the same
+island-scoped workarea region (LayoutAPI.zoomedRect; gap-inset, so it
+matches what a lone tile would get) instead of edge-to-edge, and the
+client sees plain tile states (it cannot tell zoom from being the only
+window). Any number of sizeMode windows coexist ("top z wins");
+maximized/zoomed are jointly single-instance per island -- a window
+entering either demotes the previous covering one via propose() -- and
+in canvas world mode both are focus-transient: when another window on
+the SAME output takes activity, the covering member drops to none (the
+recompute restores its slot) instead of lingering as a strip-anchored cover.
 WM stamps stackTier (-1/0/+1) and `active`; effectiveStackZ and the
 canvas collapse (also output-local via its own activeByOutput) consume
 them; the old focusReveal lift is gone. Keyboard-focus changes and
@@ -189,7 +195,7 @@ nothing, with no error. Worst-first.
 - **`WindowState` splits the orthogonal axes and separates client
   requests from compositor decisions.** `WindowState` carries four
   decision fields the compositor owns -- `tiling` (`managed |
-  floating`), `sizeMode` (`none | maximized | fullscreen`), `visible`
+  floating`), `sizeMode` (`none | maximized | zoomed | fullscreen`), `visible`
   (boolean), `modal` (boolean) -- plus a `clientRequests` sub-object
   (`wantsMaximized`, `wantsFullscreen`, `wantsMinimized`, `wantsModal`)
   that records the client's stated wishes. The renderer + the
@@ -214,10 +220,12 @@ nothing, with no error. Worst-first.
     responds with a configure event without the maximized state").
   - The layout-driver reads `sizeMode` and `visible` directly: every
     visible sizeMode window gets an override rect (glass for
-    fullscreen; island-scoped workarea for maximized) and its plugin
+    fullscreen; island-scoped workarea for maximized; the provider's
+    lone-window rect over that same region for zoomed, via
+    LayoutAPI.zoomedRect with the region as fallback) and its plugin
     slot rect (if any) is dropped at merge. Fullscreen windows are
-    excluded from the plugin compute (peers reflow); maximized managed
-    windows stay in it (slot preserved). Invisible windows are omitted
+    excluded from the plugin compute (peers reflow); maximized/zoomed
+    managed windows stay in it (slot preserved). Invisible windows are omitted
     from `rects[]` entirely. `LayoutResult.hidden` is gone.
     `wm.applyLayout` already iterates only the ids in `rects[]`, so
     omitted windows keep their geometry. Nothing is suppressed from

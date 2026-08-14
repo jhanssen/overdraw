@@ -235,6 +235,21 @@ test('a new maximize does NOT demote a fullscreen window', async () => {
   assert.equal(winOf(wm, 2).windowState.sizeMode, 'maximized');
 });
 
+test('maximized and zoomed are jointly single-instance per island', async () => {
+  const { wm } = makeWmWithWindows();
+  // A zoom demotes a maximized peer...
+  await wm.propose(1, { sizeMode: 'maximized' }, 'client-request');
+  await wm.propose(2, { sizeMode: 'zoomed' }, 'user-input');
+  await winOf(wm, 1).pendingMutation;
+  assert.equal(winOf(wm, 1).windowState.sizeMode, 'none');
+  assert.equal(winOf(wm, 2).windowState.sizeMode, 'zoomed');
+  // ...and a maximize demotes a zoomed peer.
+  await wm.propose(1, { sizeMode: 'maximized' }, 'client-request');
+  await winOf(wm, 2).pendingMutation;
+  assert.equal(winOf(wm, 1).windowState.sizeMode, 'maximized');
+  assert.equal(winOf(wm, 2).windowState.sizeMode, 'none');
+});
+
 test('lowered fullscreen window is input-transparent; focused it takes hits again', async () => {
   const { wm } = makeWmWithWindows();
   // Float window 2 into a small corner rect so most of the glass shows

@@ -118,16 +118,18 @@ export interface Window {
   // means the window is its OUTPUT's most recently keyboard-focused
   // window -- output-local, so focus on another output changes nothing:
   //   +1  sizeMode !== "none", visible, output-active: draws above every
-  //       tier ("top z wins" -- an active fullscreen/maximized window
-  //       covers the glass/workarea).
+  //       tier ("top z wins" -- an active fullscreen/maximized/zoomed
+  //       window covers the glass/workarea).
   //   -1  sizeMode !== "none", visible, not output-active, and NOT a
-  //       tile member (fullscreen any tiling, or maximized floating):
-  //       drops below the tiled tier so the rest of the island is
-  //       visible and usable, and windowAt makes it input-transparent.
-  //       The client keeps its state and rect; only stacking changes.
-  //    0  everything else -- including a non-active maximized MANAGED
-  //       window, which is a tile member (it keeps its slot) and stays
-  //       in the tiled tier; the active peer's tie-break draws above it.
+  //       tile member (fullscreen any tiling, or maximized/zoomed
+  //       floating): drops below the tiled tier so the rest of the
+  //       island is visible and usable, and windowAt makes it
+  //       input-transparent. The client keeps its state and rect; only
+  //       stacking changes.
+  //    0  everything else -- including a non-active maximized/zoomed
+  //       MANAGED window, which is a tile member (it keeps its slot) and
+  //       stays in the tiled tier; the active peer's tie-break draws
+  //       above it.
   stackTier?: -1 | 0 | 1;
   // True while this window is its output's active window. Breaks z ties
   // within a tier (the tiled tier shares one z), so the active tiled
@@ -564,7 +566,8 @@ function validateState(v: unknown): WindowState | null {
   if (typeof v !== "object" || v === null) return null;
   const o = v as { [k: string]: unknown };
   if (o.tiling !== "managed" && o.tiling !== "floating") return null;
-  if (o.sizeMode !== "none" && o.sizeMode !== "maximized" && o.sizeMode !== "fullscreen") return null;
+  if (o.sizeMode !== "none" && o.sizeMode !== "maximized"
+      && o.sizeMode !== "zoomed" && o.sizeMode !== "fullscreen") return null;
   if (typeof o.visible !== "boolean") return null;
   if (typeof o.modal !== "boolean") return null;
   // Interceptors written before `lifted` existed may return a state
@@ -1833,13 +1836,16 @@ export function createWm(
     ? layoutDriverFactory(target, snapshot)
     : { schedule: () => { /* no-op */ }, settled: () => Promise.resolve() };
 
-  // Maximized is single-instance per island: a window entering
-  // "maximized" demotes any other maximized window on the same output
-  // back to "none" (the layout recompute restores its slot). Fullscreen windows are
-  // untouched -- any number may coexist; stacking decides what shows.
-  // Runs through propose() so the demoted window gets the full pipeline
-  // (events, un-maximized configure, relayout).
-  function demoteMaximizedPeers(of: Window): void {
+  // Maximized/zoomed are jointly single-instance per island: a window
+  // entering either mode demotes any other maximized or zoomed window on
+  // the same output back to "none" (the layout recompute restores its
+  // slot). Fullscreen windows are untouched -- any number may coexist;
+  // stacking decides what shows. Runs through propose() so the demoted
+  // window gets the full pipeline (events, configure, relayout).
+  function coversIsland(m: SizeMode): boolean {
+    return m === "maximized" || m === "zoomed";
+  }
+  function demoteCoveringPeers(of: Window): void {
     const island = outputOf(of.surfaceId);
     // With a workspace plugin wired, every window NOT in outputContent
     // (hidden workspace, not yet placed) resolves to null -- treating
@@ -1851,7 +1857,7 @@ export function createWm(
     if (island === null && outputContent) return;
     for (const w of windows) {
       if (w === of) continue;
-      if (w.windowState.sizeMode !== "maximized") continue;
+      if (!coversIsland(w.windowState.sizeMode)) continue;
       if (outputOf(w.surfaceId) !== island) continue;
       void api.propose(w.surfaceId, { sizeMode: "none" }, "core");
     }
@@ -2386,11 +2392,11 @@ export function createWm(
           };
           pluginBus.emit(WINDOW_EVENT.committed, ev);
         }
-        // The stamp can introduce maximized; the async pass below then
-        // diffs to nothing and returns before its demote hook.
-        if (win.windowState.sizeMode === "maximized"
-            && preStamp.sizeMode !== "maximized") {
-          demoteMaximizedPeers(win);
+        // The stamp can introduce a covering mode; the async pass below
+        // then diffs to nothing and returns before its demote hook.
+        if (coversIsland(win.windowState.sizeMode)
+            && !coversIsland(preStamp.sizeMode)) {
+          demoteCoveringPeers(win);
         }
       }
       // Same race for client-declared constraints (set_min_size /
@@ -2532,8 +2538,8 @@ export function createWm(
             untetherFocusOnUnmodal(win, surfaceId);
           }
         }
-        if (candidate.sizeMode === "maximized" && current.sizeMode !== "maximized") {
-          demoteMaximizedPeers(win);
+        if (coversIsland(candidate.sizeMode) && !coversIsland(current.sizeMode)) {
+          demoteCoveringPeers(win);
         }
         return cloneState(candidate);
       } finally {
@@ -2611,12 +2617,12 @@ export function createWm(
             pluginBus.emit(WINDOW_EVENT.committed, ev);
           }
         }
-        // The maximized single-instance rule applies to rule/pre-content
-        // maximizes too: the regular propose() demote hook never sees
-        // this commit path.
-        if (win.windowState.sizeMode === "maximized"
-            && previous.sizeMode !== "maximized") {
-          demoteMaximizedPeers(win);
+        // The single-instance rule applies to rule/pre-content maximizes
+        // too: the regular propose() demote hook never sees this commit
+        // path.
+        if (coversIsland(win.windowState.sizeMode)
+            && !coversIsland(previous.sizeMode)) {
+          demoteCoveringPeers(win);
         }
 
         // Clear the flag BEFORE scheduling so the configure suppression

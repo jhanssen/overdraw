@@ -364,6 +364,18 @@ state = await installProtocols(addon, {
       // eslint-disable-next-line no-restricted-syntax
       return result as unknown as import("@overdraw/layout-types").LayoutResult;
     },
+    zoomedRect: async (inputs) => {
+      if (!runtime) throw new Error("layout: runtime not initialized");
+      await runtime.waitForNamespace("layout");
+      // eslint-disable-next-line no-restricted-syntax
+      const args = [inputs as unknown as import("./plugins/protocol.js").Json];
+      // Throws when the provider has no zoomedRect(); the driver treats
+      // that as "cover the region" (its fallback rect).
+      const result = await runtime.invokeNamespace("layout", "zoomedRect", args);
+      // eslint-disable-next-line no-restricted-syntax
+      return result as unknown as
+        { outer: import("@overdraw/layout-types").Rect } | null;
+    },
   }),
   focusDriverFactory: (target) => createFocusDriver({
     target,
@@ -1297,10 +1309,10 @@ pluginBus.subscribe("window.toggle-floating-requested", () => {
 });
 
 // The window.toggle-maximize action: flip the focused window's sizeMode.
-// none -> maximized zooms the window over its island's workarea (a
-// managed window keeps its layout slot; the WM demotes any other
-// maximized window on the island); maximized or fullscreen -> none
-// restores its lane rect via relayout (managed slot recompute; floating rect).
+// none -> maximized covers the island's workarea edge-to-edge (a managed
+// window keeps its layout slot; the WM demotes any other covering window
+// on the island); any covering mode -> none restores its lane rect via
+// relayout (managed slot recompute; floating rect).
 pluginBus.subscribe("window.toggle-maximize-requested", () => {
   if (!state?.seat || !state.wm) return;
   const focused = state.seat.kbFocus?.surfaceId;
@@ -1308,6 +1320,19 @@ pluginBus.subscribe("window.toggle-maximize-requested", () => {
   const ws = state.wm.getWindowState(focused);
   if (!ws) return;
   const next = ws.sizeMode === "none" ? "maximized" : "none";
+  void state.wm.propose(focused, { sizeMode: next }, "user-input");
+});
+
+// The window.toggle-zoom action: like toggle-maximize, but the zoomed
+// window shows the layout's lone-window rect (gap-inset) instead of the
+// bare workarea, and the client keeps its tiled state.
+pluginBus.subscribe("window.toggle-zoom-requested", () => {
+  if (!state?.seat || !state.wm) return;
+  const focused = state.seat.kbFocus?.surfaceId;
+  if (typeof focused !== "number") return;
+  const ws = state.wm.getWindowState(focused);
+  if (!ws) return;
+  const next = ws.sizeMode === "none" ? "zoomed" : "none";
   void state.wm.propose(focused, { sizeMode: next }, "user-input");
 });
 

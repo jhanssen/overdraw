@@ -245,7 +245,13 @@ export type WindowStateBagChangedEvent = {
 //                         renderer + the configure-states encoder NEVER read
 //                         these.
 export type Tiling = "managed" | "floating";
-export type SizeMode = "none" | "maximized" | "fullscreen";
+// "maximized" fills the workarea edge-to-edge (the EWMH-style state a
+// client's set_maximized requests). "zoomed" is compositor-side only: the
+// window gets the rect the layout would give a lone member of its island
+// (gap-inset), and the client is never told it left the tiled state.
+// Both are single-instance per island and structurally identical
+// elsewhere (slot-keeping, stacking, strip collapse).
+export type SizeMode = "none" | "maximized" | "zoomed" | "fullscreen";
 
 export type ClientRequests = {
   wantsMaximized: boolean;
@@ -292,7 +298,7 @@ export type ProposalReason =
 // Runtime vocabularies of the unions above, for validators that check a
 // wire value against the allowed set.
 export const TILINGS: ReadonlyArray<Tiling> = ["managed", "floating"];
-export const SIZE_MODES: ReadonlyArray<SizeMode> = ["none", "maximized", "fullscreen"];
+export const SIZE_MODES: ReadonlyArray<SizeMode> = ["none", "maximized", "zoomed", "fullscreen"];
 export const PROPOSAL_REASONS: ReadonlyArray<ProposalReason> = [
   "client-request", "plugin", "user-input", "window-rule", "core",
 ];

@@ -166,19 +166,34 @@ export default async function init(sdk: PluginSdkShape): Promise<void> {
     },
   });
 
-  // Zoom the keyboard-focused window: flip its sizeMode between maximized
-  // (fills the island-scoped workarea while staying a tile member; the
-  // canvas world collapses a multi-screen island to the workarea while
-  // the focused member holds a sizeMode; any previously maximized island
-  // peer is demoted) and none. Any sizeMode state -- including
-  // client-requested fullscreen -- toggles back to none.
+  // Maximize the keyboard-focused window: flip its sizeMode between
+  // maximized (fills the island-scoped workarea edge-to-edge while
+  // staying a tile member; the canvas world collapses a multi-screen
+  // island to the workarea while the focused member holds a sizeMode;
+  // any previously maximized/zoomed island peer is demoted) and none.
+  // Any sizeMode state -- including client-requested fullscreen --
+  // toggles back to none.
   sdk.actions.register({
     name: "window.toggle-maximize",
     description: "Toggle the keyboard-focused window between maximized " +
-      "(zoomed to fill the output's workarea while staying tiled) and its " +
-      "normal tile. Also un-fullscreens a fullscreen window. No params.",
+      "(fills the output's workarea edge-to-edge while staying tiled) and " +
+      "its normal tile. Also un-fullscreens a fullscreen window. No params.",
     handler: async (): Promise<null> => {
       sdk.events.emit("window.toggle-maximize-requested", {});
+      return null;
+    },
+  });
+
+  // Zoom: like maximize, but the window gets the rect the layout would
+  // give a lone island member (gap-inset lone tile), and the client keeps
+  // its tiled state -- it cannot tell zoom from being the only window.
+  sdk.actions.register({
+    name: "window.toggle-zoom",
+    description: "Toggle the keyboard-focused window between zoomed (the " +
+      "layout's lone-window rect over the workarea, gaps preserved) and " +
+      "its normal tile. Also un-fullscreens a fullscreen window. No params.",
+    handler: async (): Promise<null> => {
+      sdk.events.emit("window.toggle-zoom-requested", {});
       return null;
     },
   });

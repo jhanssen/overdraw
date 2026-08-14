@@ -89,8 +89,11 @@ function buildStatesArray(ctx: Ctx, xs: XdgSurfaceRecord, sizeUnknown: boolean):
         states.push(STATE.maximized);
       } else if (ws.sizeMode === "fullscreen") {
         states.push(STATE.fullscreen);
-      } else if (ws.tiling === "managed") {
-        // sizeMode-"none" tiled window: maximized + tiled-edges.
+      } else if (ws.tiling === "managed" || ws.sizeMode === "zoomed") {
+        // Tiled window, or a zoomed one (zoom is compositor-side
+        // geometry; the client sees exactly the tiled state, which also
+        // makes the configured size binding for a zoomed floating
+        // window): maximized + tiled-edges.
         states.push(STATE.maximized);
         if (tiledOk) {
           states.push(STATE.tiled_left, STATE.tiled_right,

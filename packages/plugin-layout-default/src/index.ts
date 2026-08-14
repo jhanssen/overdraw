@@ -18,7 +18,7 @@
 
 import type {
   LayoutAPI, LayoutInputs, LayoutResult, LayoutParamUpdate, LayoutParamSnapshot,
-  MeasureInputs, MeasureResult, SizeConstraints,
+  MeasureInputs, MeasureResult, SizeConstraints, ZoomedRectInputs, Rect,
 } from "@overdraw/layout-types";
 import type { PluginSdkShape } from "@overdraw/plugin-sdk-types";
 import {
@@ -227,6 +227,30 @@ function activate(sdk: PluginSdkShape, params: LayoutParams): LayoutAPI {
         (w, i) => widthOf(w.id, columns?.[i] ?? column) * wa.width);
       return columnsMeasure(widthsPx, wa, params.gap,
         inputs.windows.map((w) => widthBounds(w.constraints)));
+    },
+
+    async zoomedRect(inputs: ZoomedRectInputs): Promise<{ outer: Rect } | null> {
+      // The lone-window rect, through the same algorithms compute() uses.
+      // Pure: no lastSeed/colWidths writes -- a zoom must not disturb the
+      // window's tiled column sizing. A single column takes the whole
+      // region regardless of weight, so only the gap inset and the
+      // window's own size bounds shape the result.
+      const region = inputs.region;
+      const { mode } = islandParams(inputs.island?.layout);
+      const dims = { width: region.width, height: region.height };
+      const rects = mode === "columns"
+        ? columnsLayout([1], dims, params.gap,
+            [widthBounds(inputs.window.constraints)])
+        : masterStackLayout(1, dims, params);
+      if (rects.length !== 1) return null;
+      return {
+        outer: {
+          x: rects[0].x + region.x,
+          y: rects[0].y + region.y,
+          width: rects[0].width,
+          height: rects[0].height,
+        },
+      };
     },
   };
 

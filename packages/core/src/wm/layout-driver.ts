@@ -6,9 +6,10 @@
 //   - Coalesce relayout requests (at most one compute() in flight; subsequent
 //     invalidations queue and replace).
 //   - Resolve non-managed lanes in core: a window with sizeMode !== "none"
-//     gets an override rect (workarea for maximized, full output/glass for
-//     fullscreen; any number may coexist -- which one shows is a stacking
-//     concern); an invisible (visible === false) window is omitted from
+//     gets an override rect (workarea for maximized, the provider's
+//     lone-window rect for zoomed, full output/glass for fullscreen; any
+//     number may coexist -- which one shows is a stacking concern); an
+//     invisible (visible === false) window is omitted from
 //     the result; a floating (tiling === "floating") window uses its
 //     stored floatingRect; a lifted managed window keeps its slot in the
 //     compute while drawing at its grab rect.
@@ -33,6 +34,7 @@ import type {
   LayoutWindow,
   LayoutReason,
   Rect,
+  ZoomedRectInputs,
 } from "@overdraw/layout-types";
 import type { Tiling, SizeMode } from "../events/types.js";
 import type { ReservedZoneRegistry } from "./reserved-zones.js";
@@ -112,6 +114,13 @@ export interface LayoutApplyTarget {
 // this wraps runtime.invokeNamespace('layout', 'compute', [inputs]).
 export type ComputeFn = (inputs: LayoutInputs) => Promise<LayoutResult>;
 
+// Optional lone-window query for zoomed windows (LayoutAPI.zoomedRect).
+// In production this wraps runtime.invokeNamespace('layout', 'zoomedRect',
+// [inputs]); a provider without the method (the invoke throws) or a null
+// result falls back to the region edge-to-edge.
+export type ZoomedRectFn =
+  (inputs: ZoomedRectInputs) => Promise<{ outer: Rect } | null>;
+
 export interface LayoutDriver {
   schedule(reason: LayoutReason): void;
   settled(): Promise<void>;
@@ -121,6 +130,9 @@ export interface LayoutDriverDeps {
   snapshot(): LayoutSnapshot;
   target: LayoutApplyTarget;
   compute: ComputeFn;
+  // Lone-window geometry for zoomed windows. Optional: if absent, a
+  // zoomed window covers its region edge-to-edge like maximized.
+  zoomedRect?: ZoomedRectFn;
   // Reserved-zone registry. Optional: if absent, the driver treats the
   // full output rect as the tile region (no reservations).
   reservedZones?: ReservedZoneRegistry;
@@ -195,16 +207,19 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
         // position, so the plain outputRect covers the monitor at every
         // camera position and zoom, with no per-frame updates.
         //
-        // Maximized covers the usable glass, island-scoped: for an
-        // explicit island a workarea-sized region at the island origin
-        // (where the strip collapses to while the maximized member holds
-        // focus), clamped to the island rect so a maximize never spills
-        // into a sibling island; for the implicit island the tile region
-        // itself.
+        // Maximized and zoomed cover the usable glass, island-scoped: for
+        // an explicit island a workarea-sized region at the island origin
+        // (where the strip collapses to while the member holds focus),
+        // clamped to the island rect so the cover never spills into a
+        // sibling island; for the implicit island the tile region itself.
+        // Maximized shows that region edge-to-edge; zoomed asks the
+        // layout provider what a lone member of an island with that
+        // region would get (gap insets, constraints), falling back to
+        // the region when the provider has no zoomedRect().
         const overrides = new Map<number, Rect>();
         for (const w of bucket) {
           if (!w.visible || w.sizeMode === "none") continue;
-          const outer = w.sizeMode !== "fullscreen"
+          let outer = w.sizeMode !== "fullscreen"
             ? island.rect
               ? {
                   x: island.rect.x,
@@ -214,6 +229,41 @@ export function createLayoutDriver(deps: LayoutDriverDeps): LayoutDriver {
                 }
               : tileRegion
             : outputRect;
+          if (w.sizeMode === "zoomed" && deps.zoomedRect) {
+            const inputs: ZoomedRectInputs = {
+              output: { id: o.id, rect: outputRect, scale: o.scale },
+              region: outer,
+              island: {
+                id: island.id,
+                ...(island.layout !== undefined ? { layout: island.layout } : {}),
+              },
+              window: {
+                id: w.id,
+                appId: w.appId,
+                title: w.title,
+                role: w.role,
+                layoutMode: w.layoutMode,
+                layoutData: w.layoutData,
+                constraints: w.constraints,
+                currentRect: w.currentRect,
+              },
+            };
+            try {
+              const r = await deps.zoomedRect(inputs);
+              if (r?.outer
+                  && typeof r.outer.x === "number" && typeof r.outer.y === "number"
+                  && typeof r.outer.width === "number"
+                  && typeof r.outer.height === "number") {
+                outer = r.outer;
+              }
+            } catch (e: unknown) {
+              // A provider without zoomedRect() is supported (zoom covers
+              // the region); log at debug parity with measure so a broken
+              // one isn't silent.
+              const msg = e instanceof Error ? e.message : String(e);
+              log(`zoomedRect(island=${island.id}, id=${w.id}) unavailable: ${msg}`);
+            }
+          }
           resolvedRects.push({ id: w.id, outer });
           overrides.set(w.id, outer);
         }

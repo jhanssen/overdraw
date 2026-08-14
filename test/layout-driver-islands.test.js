@@ -160,6 +160,37 @@ test('exclusive window owns only its island; the sibling island still tiles', as
   assert.deepEqual(rects.find((r) => r.id === 1).outer, islandA.rect);
 });
 
+test('zoomed on an explicit island: region = island origin + workarea clamp', async () => {
+  const reservedZones = createReservedZoneRegistry();
+  reservedZones.set('bar', { outputId: 0, edge: 'top', thickness: 40, owner: 99 });
+  const target = captureTarget();
+  let zoomInputs = null;
+  // An elastic strip wider than the workarea: the zoom region clamps to
+  // workarea width at the island origin, never the full strip.
+  const island = { id: 10, contextOutputId: 0, rect: { x: 0, y: 0, width: 2500, height: 600 }, members: [1], layout: { mode: 'columns' } };
+  const driver = createLayoutDriver({
+    snapshot: () => snapWith([island], [{ ...managedWin(1), sizeMode: 'zoomed' }]),
+    target,
+    reservedZones,
+    compute: async (inputs) =>
+      ({ rects: inputs.windows.map((w) => ({ id: w.id, outer: inputs.tileRegion })) }),
+    zoomedRect: async (inputs) => {
+      zoomInputs = inputs;
+      const r = inputs.region;
+      return { outer: { x: r.x + 10, y: r.y + 10, width: r.width - 20, height: r.height - 20 } };
+    },
+  });
+  driver.schedule('mapped');
+  await driver.settled();
+  // Workarea is 1000x560 (top 40 reserved); the region sits at the island
+  // origin with workarea-clamped size, and the island's layout hint rides
+  // along so the provider resolves the island's declared mode.
+  assert.deepEqual(zoomInputs.region, { x: 0, y: 0, width: 1000, height: 560 });
+  assert.deepEqual(zoomInputs.island, { id: 10, layout: { mode: 'columns' } });
+  assert.deepEqual(target.calls[0].result.rects.find((r) => r.id === 1).outer,
+    { x: 10, y: 10, width: 980, height: 540 });
+});
+
 test('island referencing an unknown output is skipped; others apply', async () => {
   const target = captureTarget();
   const computeCalls = [];

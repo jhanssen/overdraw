@@ -214,6 +214,19 @@ export interface LayoutPluginConfig {
   gap?: number;
 }
 
+// What zoomedRect() sees: one window and the region a zoomed window may
+// cover (the island-scoped workarea; the driver resolves which region
+// zoom covers, the provider resolves how a lone window sits in it).
+export interface ZoomedRectInputs {
+  output: Output;
+  // The region the zoomed window may occupy. The provider returns the
+  // rect it would give this window as the lone member of an island with
+  // this rect (gap insets, size constraints applied).
+  region: Rect;
+  island: { id: number; layout?: unknown };
+  window: LayoutWindow;
+}
+
 // The contract a plugin claiming 'layout' implements. compute() is required;
 // setParams() is optional (a layout with no tunable parameters may omit it).
 //
@@ -230,4 +243,9 @@ export interface LayoutAPI {
   // publishing; providers without it leave elastic islands at the
   // workarea (growth is inert).
   measure?(inputs: MeasureInputs): Promise<MeasureResult>;
+  // The rect a lone member of an island with rect `region` would get --
+  // the geometry a zoomed (sizeMode "zoomed") window shows at. MUST be
+  // pure: no parameter state may change. Providers without it leave
+  // zoomed windows covering the region edge-to-edge.
+  zoomedRect?(inputs: ZoomedRectInputs): Promise<{ outer: Rect } | null>;
 }

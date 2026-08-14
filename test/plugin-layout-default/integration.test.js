@@ -103,6 +103,27 @@ test('setParams: master-fraction delta widens the master on the next compute', a
   });
 });
 
+test('zoomedRect: lone-window rect through the live provider, gap-inset', async () => {
+  await withRuntime({}, async (rt) => {
+    await rt.load([bundledToResolved(layoutPluginSpec, layoutPluginSpec.module)]);
+    await rt.waitForNamespace('layout');
+    await rt.invokeNamespace('layout', 'setParams', [{ gapDelta: 10 }]);
+    const base = {
+      output: { id: 0, rect: { x: 0, y: 0, width: 1200, height: 700 }, scale: 1 },
+      region: { x: 100, y: 50, width: 1000, height: 600 },
+      island: { id: 0 },
+      window: { id: 7, role: 'toplevel' },
+    };
+    // Master-stack: the single-window rect is the region inside the gap.
+    const ms = await rt.invokeNamespace('layout', 'zoomedRect', [base]);
+    assert.deepEqual(ms.outer, { x: 110, y: 60, width: 980, height: 580 });
+    // Columns mode: a lone column takes the whole region -- same rect.
+    const cols = await rt.invokeNamespace('layout', 'zoomedRect', [
+      { ...base, island: { id: 0, layout: { mode: 'columns' } } }]);
+    assert.deepEqual(cols.outer, { x: 110, y: 60, width: 980, height: 580 });
+  });
+});
+
 test('setParams: master fraction clamps to [0.05, 0.95]', async () => {
   await withRuntime({}, async (rt) => {
     await rt.load([bundledToResolved(layoutPluginSpec, layoutPluginSpec.module)]);

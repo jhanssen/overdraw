@@ -419,7 +419,7 @@ async function activate(
         const prevActive = rec ? activeByOutput.get(rec.outputId) : undefined;
         if (rec) activeByOutput.set(rec.outputId, p.surfaceId);
         if (rec && prevActive !== undefined && prevActive !== p.surfaceId
-            && sizeModeMembers.get(prevActive) === "maximized") {
+            && covering(sizeModeMembers.get(prevActive))) {
           void sdk.windows.propose(prevActive, { sizeMode: "none" });
         }
         // The collapse keys on activeByOutput: an activity change onto
@@ -517,6 +517,11 @@ async function activate(
   // member; see tiledMembers) and whether the departed member was
   // maximized (zoom is focus-transient in world mode; see below).
   const sizeModeMembers = new Map<number, string>();
+  // Maximized and zoomed share the covering-member behavior (collapse,
+  // focus-transient release, single-instance settling); fullscreen never
+  // does.
+  const covering = (m: string | undefined): boolean =>
+    m === "maximized" || m === "zoomed";
   sdk.events.subscribe("window.committed", (_name, payload) => {
     if (!worldMode || !payload || typeof payload !== "object") return;
     const p = payload as { surfaceId?: unknown; changed?: unknown;
@@ -1318,8 +1323,8 @@ async function activate(
       // nor EVER collapses it -- activating a fullscreen member must
       // leave the tiled columns exactly as they are, or cycling through
       // it would compress the strip into the workarea and back. Only an
-      // active MAXIMIZED member collapses (maximize covers the usable
-      // glass; the camera docks on it).
+      // active MAXIMIZED or ZOOMED member collapses (both cover the
+      // usable glass; the camera docks on it).
       if (ws.sizeMode === "fullscreen") continue;
       if (ws.sizeMode !== "none" && id === active) return null;
       if (ws.tiling === "managed") tiled.push(id);
@@ -1552,7 +1557,7 @@ async function activate(
         && activeByOutput.get(p.fromOutputId) === sid) {
       activeByOutput.delete(p.fromOutputId);
     }
-    if (sizeModeMembers.get(sid) !== "maximized") return;
+    if (!covering(sizeModeMembers.get(sid))) return;
     if (p.toOutputId !== p.fromOutputId) {
       await sdk.windows.propose(sid, { sizeMode: "none" });
       return;
@@ -1561,7 +1566,7 @@ async function activate(
     const rec = handle !== undefined ? state.byHandle.get(handle) : undefined;
     if (!rec) return;
     for (const m of [...rec.members]) {
-      if (m !== sid && sizeModeMembers.get(m) === "maximized") {
+      if (m !== sid && covering(sizeModeMembers.get(m))) {
         await sdk.windows.propose(m, { sizeMode: "none" });
       }
     }
@@ -2473,7 +2478,7 @@ async function activate(
       const prevActive = activeByOutput.get(outId);
       activeByOutput.set(outId, ev.surfaceId);
       if (prevActive !== undefined && prevActive !== ev.surfaceId
-          && sizeModeMembers.get(prevActive) === "maximized") {
+          && covering(sizeModeMembers.get(prevActive))) {
         void sdk.windows.propose(prevActive, { sizeMode: "none" });
       }
       focusedOutputIdCache = outId;

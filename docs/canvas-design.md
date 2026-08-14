@@ -862,9 +862,9 @@ tests only.
    session-scoped). An elastic island grows along its row -- one
    column of `column` × workarea width (default 0.5) per visible
    managed member; floating members take none, and a FOCUSED sizeMode
-   member collapses the strip to the workarea (maximize covers the
+   member collapses the strip to the workarea (maximize/zoom cover the
    usable glass, not the strip; unfocused, a fullscreen member leaves
-   the strip and a maximized managed member keeps its column). Members tile as equal full-height columns via a
+   the strip and a maximized/zoomed managed member keeps its column). Members tile as equal full-height columns via a
    per-island layout HINT (`LayoutIsland.layout`, passed through
    verbatim to `LayoutInputs.island.layout`; the bundled provider
    recognizes `{ mode: "columns" }`) -- a deliberate small step toward

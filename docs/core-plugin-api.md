@@ -684,9 +684,15 @@ registered in the `'layout'` namespace (with highest priority) decides tile
 positions.
 
 ```ts
-// What the layout plugin implements (via sdk.registerPlugin('layout', ...))
+// What the layout plugin implements (via sdk.registerPlugin('layout', ...)).
+// The optional methods and the canonical, current shapes (params, measure,
+// zoomedRect -- the lone-window rect a sizeMode "zoomed" window shows at)
+// live in @overdraw/layout-types.
 type LayoutAPI = {
   compute(inputs: LayoutInputs): Promise<LayoutResult>;
+  setParams?(update: LayoutParamUpdate): Promise<LayoutParamSnapshot>;
+  measure?(inputs: MeasureInputs): Promise<MeasureResult>;
+  zoomedRect?(inputs: ZoomedRectInputs): Promise<{ outer: Rect } | null>;
 };
 
 type LayoutInputs = {
