@@ -271,7 +271,7 @@ function updateReservedZone(state: CompositorState, rec: LayerSurfaceRecord): vo
     state.reservedZones.clear(myId);
     return;
   }
-  const thickness = computeReservedThickness(a.exclusiveZone);
+  const thickness = computeReservedThickness(a.exclusiveZone, a.margin[r.edge]);
   if (thickness === 0) {
     state.reservedZones.clear(myId);
     return;

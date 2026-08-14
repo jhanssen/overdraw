@@ -403,6 +403,21 @@ test("zone > 0 with a valid edge registers a reservation", () => {
   assert.deepEqual(eff, { x: 0, y: 30, width: 1000, height: 570 });
 });
 
+test("margin on the anchored edge extends the reservation (zone + margin)", () => {
+  // The waybar shape: top bar, height 34, zone 34, margin-top 6. The bar
+  // body occupies y in [6, 40); the reservation must cover all 40px.
+  const ctx = mockCtx({ withReservedZones: true });
+  const ls = makeLayerSurface(ctx);
+  const { layerSurface, resource } = createLayerSurface(ctx, 100);
+  ls.set_size(resource, 0, 34);
+  ls.set_anchor(resource, A.top | A.left | A.right);
+  ls.set_margin(resource, 6, 10, 0, 10);
+  ls.set_exclusive_zone(resource, 34);
+  applyLayerSurfaceInitial(ctx, layerSurface);
+  const eff = ctx.state.reservedZones.effectiveRect(0, { x: 0, y: 0, width: 1000, height: 600 });
+  assert.deepEqual(eff, { x: 0, y: 40, width: 1000, height: 560 });
+});
+
 test("zone <= 0 does not register a reservation", () => {
   const ctx = mockCtx({ withReservedZones: true });
   const ls = makeLayerSurface(ctx);

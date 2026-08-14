@@ -198,16 +198,15 @@ export function resolveExclusiveEdge(anchor: number, explicitEdge: number): Edge
 }
 
 // Thickness to reserve on `edge` for a layer surface with the given applied
-// `zone` (> 0) and `margin`. Per the spec, "the exclusive zone includes the
-// margin" -- meaning the zone is the TOTAL distance reserved from the edge,
-// inclusive of any margin on that edge. So a panel with margin top=4 and
-// zone=30 reserves 30px (the panel sits 4px inset and is 26px tall in the
-// 30px reservation).
-//
-// Today we return zone directly. A future revision that wants margin to
-// EXTEND reservation past the surface's body would change this.
-export function computeReservedThickness(zone: number): number {
-  return zone > 0 ? Math.floor(zone) : 0;
+// `zone` (> 0) and the margin on that edge. The zone is measured from the
+// surface's anchored edge, which the margin pushes inward, so the total
+// reservation from the output edge is zone + margin (the wlroots-family
+// reading of "the exclusive zone includes the margin"; clients size their
+// zone to the surface body and expect the compositor to add the margin --
+// a panel with height 34, zone 34, and margin top=6 occupies 40px from
+// the edge and expects all 40 reserved).
+export function computeReservedThickness(zone: number, marginOnEdge = 0): number {
+  return zone > 0 ? Math.floor(zone + Math.max(0, marginOnEdge)) : 0;
 }
 
 // ---- helpers --------------------------------------------------------------

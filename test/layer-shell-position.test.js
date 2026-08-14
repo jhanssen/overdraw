@@ -239,9 +239,20 @@ test("computeReservedThickness: positive zone -> zone", () => {
   assert.equal(computeReservedThickness(1), 1);
 });
 
-test("computeReservedThickness: zero/negative -> 0", () => {
+test("computeReservedThickness: margin on the anchored edge extends the reservation", () => {
+  // A bar with height 34 and margin 6 occupies 40px from the edge.
+  assert.equal(computeReservedThickness(34, 6), 40);
+  assert.equal(computeReservedThickness(30, 0), 30);
+});
+
+test("computeReservedThickness: negative margin is clamped", () => {
+  assert.equal(computeReservedThickness(30, -5), 30);
+});
+
+test("computeReservedThickness: zero/negative zone -> 0 (margin alone reserves nothing)", () => {
   assert.equal(computeReservedThickness(0), 0);
   assert.equal(computeReservedThickness(-1), 0);
+  assert.equal(computeReservedThickness(0, 10), 0);
 });
 
 // ---- anchor validity ----------------------------------------------------
