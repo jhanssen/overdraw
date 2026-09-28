@@ -316,6 +316,20 @@ function appendPopups(
 // straddling the output boundary at the wrong scale. The broker's
 // onAfterApply hook flushes the cached per-output stacks atomically with
 // the surface's new geometry.
+// Append the mapped popups whose chain roots at one of `roots` (toplevel
+// surface ids), each followed by its subsurface subtree. The per-output
+// stack filter and scene compose share this so a window's scene carries the
+// same popups its on-screen composite does.
+export function appendPopupsRootedAt(
+  state: CompositorState, stack: number[], roots: ReadonlySet<number>,
+): void {
+  appendPopups(state, stack, (pr) => {
+    if (pr.layerParent) return false;
+    const root = popupRootToplevelId(state, pr);
+    return root !== null && roots.has(root);
+  });
+}
+
 export function rebuildStackWithPopups(state: CompositorState): void {
   const wm = state.wm;
   if (!wm) return;

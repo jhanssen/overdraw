@@ -109,7 +109,8 @@ export function createInThreadCompose(
   hasOutput: (outputId: number) => boolean,
   sceneRegistry?: SceneRegistry,
   // Expand a window set into its full on-screen draw list (decoration +
-  // toplevel + subsurfaces). Without it, scene compose drops subsurfaces.
+  // toplevel + subsurfaces + popups rooted at those toplevels). Without it,
+  // scene compose drops subsurfaces and popups.
   flattenWindows?: (surfaceIds: ReadonlyArray<number>) => number[],
   // The output's global-logical rect + scale, for device-resolution compose.
   outputRegion?: (outputId: number) =>

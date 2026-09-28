@@ -34,7 +34,9 @@ export function makeComposeFlatteners(state: CompositorState): {
       const wins = surfaceIds
         .map((id) => wm.state.windows.find((w) => w.surfaceId === id))
         .filter((w): w is NonNullable<typeof w> => !!w);
-      return computeBaseStack(state, wins);
+      const stack = computeBaseStack(state, wins);
+      appendPopupsRootedAt(state, stack, new Set(wins.map((w) => w.surfaceId)));
+      return stack;
     },
     outputRegion: (outputId) => {
       const o = state.outputs?.get(outputId);
@@ -47,7 +49,7 @@ export function makeComposeFlatteners(state: CompositorState): {
     },
   };
 }
-import { rebuildStackWithPopups } from "./protocols/xdg_popup.js";
+import { appendPopupsRootedAt, rebuildStackWithPopups } from "./protocols/xdg_popup.js";
 
 // Children of a given parent wl_surface, in bottom-to-top draw order.
 // The order is maintained by wl_subcompositor.get_subsurface (appends each

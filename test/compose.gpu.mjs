@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { setupCompositor, canRunGpu, pixelAt, pixelMatches } from "./harness.mjs";
+import { setupCompositor, canRunGpu, buildBin, pixelAt, pixelMatches } from "./harness.mjs";
 
 const skip = canRunGpu() ? false : "needs GPU (no render node / dawn.node)";
 const OUT = { width: 320, height: 240 };
@@ -358,6 +358,66 @@ test("createInThreadCompose wraps the compositor compose methods", { skip }, asy
       await sdkCompose.scene({ outputId: 99, windows: [], mode: "snapshot" });
     } catch (e) { threw = true; assert.match(e.message, /outputId=99/); }
     assert.ok(threw, "unknown outputId throws");
+  } finally {
+    await c.teardown();
+  }
+});
+
+// A window's scene is how it appears on screen: an open popup rooted at a
+// listed toplevel rides along (clipped to the compose region like anything
+// else); a popup rooted elsewhere does not.
+test("compose.scene includes popups rooted at the listed windows", { skip }, async () => {
+  const c = await setupCompositor({ headless: OUT });
+  const { createInThreadCompose } = await import(
+    "../packages/core/dist/plugins/compose-sdk.js"
+  );
+  const { makeComposeFlatteners } = await import(
+    "../packages/core/dist/subsurfaces.js"
+  );
+  try {
+    const pColor = 0xff0000ff, uColor = 0xff00ff00;
+    const PW = 200, PH = 150, UW = 60, UH = 40;
+    const cl = c.spawnClient(
+      ["--parent", `${PW}x${PH}`, "--popup", `${UW}x${UH}`, "--anchor-rect", "10,100,20,20",
+       "--parent-color", pColor.toString(16), "--popup-color", uColor.toString(16)],
+      { bin: buildBin("popup-test-client"),
+        readyMarker: "[popup-client] popup configured" });
+    await cl.ready;
+    const snapWm = await c.waitFor(c.query, (s) => s.windows.length >= 1, { what: "parent window" });
+    const w = snapWm.windows[0];
+    // Anchor bottom_left of (10,100,20,20) -> popup top-left at parent + (10,120).
+    const ux = w.rect.x + 10 + (UW >> 1);
+    const uy = w.rect.y + 120 + (UH >> 1);
+    const bgraPopup = argbToBgra(uColor);
+    // Wait for the popup to reach the on-screen composite first.
+    let onScreen = null;
+    for (let i = 0; i < 60; i++) {
+      const px = await c.frameReadback();
+      if (px && pixelMatches(pixelAt(px, OUT.width, ux, uy), bgraPopup, 4)) { onScreen = px; break; }
+      await new Promise((r) => setTimeout(r, 16));
+    }
+    assert.ok(onScreen, "popup composites on screen");
+
+    const fl = makeComposeFlatteners(c.state);
+    const sdkCompose = createInThreadCompose(
+      c.jsCompositor, (id) => id === 0, undefined,
+      fl.flattenWindows, fl.outputRegion);
+    assert.ok(sdkCompose);
+
+    const snap = await sdkCompose.scene({
+      outputId: 0, windows: [w.surfaceId], mode: "snapshot",
+    });
+    const px = await readbackTexture(c.jsCompositor, snap.texture, snap.outW, snap.outH);
+    assert.ok(pixelMatches(pixelAt(px, OUT.width, ux, uy), bgraPopup, 4),
+      `snapshot shows the popup at its on-screen position; got ${pixelAt(px, OUT.width, ux, uy)}`);
+    await snap.release();
+
+    // A scene that lists no toplevel carries no popup either.
+    const empty = await sdkCompose.scene({ outputId: 0, windows: [], mode: "snapshot" });
+    const px2 = await readbackTexture(c.jsCompositor, empty.texture, empty.outW, empty.outH);
+    assert.ok(!pixelMatches(pixelAt(px2, OUT.width, ux, uy), bgraPopup, 4),
+      "a popup whose root is not listed stays out of the scene");
+    await empty.release();
   } finally {
     await c.teardown();
   }
