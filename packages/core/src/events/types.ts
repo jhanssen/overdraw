@@ -140,7 +140,7 @@ export type WindowRect = {
 // The kind of mapped surface. `toplevel` is the normal xdg_toplevel case;
 // `layer-shell` is a zwlr_layer_surface_v1 surface (status bars, wallpapers,
 // notifications). Matches the value set on LayoutWindow.role.
-export type WindowMapRole = "toplevel" | "layer-shell";
+export type WindowMapRole = "toplevel" | "layer-shell" | "mirror";
 
 // Emitted when a window maps (first content). `rect` is the core-decided
 // placement (output px). `appId`/`title` are the toplevel's, resolved at emit
@@ -166,6 +166,8 @@ export type WindowMapEvent = {
   // Layer-shell only (role: "layer-shell"); absent on toplevel maps. Same
   // value the layer.relayout / layer.resize-announce events carry.
   namespace?: string;
+  // Mirror only (role: "mirror"): the window this one shows a live copy of.
+  mirrorOf?: number;
 };
 
 // Emitted when a mapped toplevel is destroyed/unmapped.

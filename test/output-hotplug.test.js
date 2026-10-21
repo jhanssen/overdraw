@@ -557,6 +557,7 @@ test('JsCompositor.setOutputs([]) clears outputsGeom', () => {
     logicalX: 0, logicalY: 0, scale: 1.5,
   }]]);
   c.cameras = new Map([[0, { x: 10, y: 20, zoom: 2 }]]);
+  c.mirrors = new Map();
   c.hwCursorCaps = new Map();
   c.hwCursorActive = new Map();
   c.hwCursorLastSent = new Map();

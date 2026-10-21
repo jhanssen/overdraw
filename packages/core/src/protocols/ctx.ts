@@ -601,6 +601,17 @@ export interface CompositorSink {
   // Tear down a phantom created via createClosingPhantom. Removes
   // from the draw order; destroys the snapshot texture. Idempotent.
   destroyClosingPhantom?(phantomSurfaceId: number): void;
+  // Mirrors: a compositor-owned surface showing a live copy of another
+  // window's draw list. getDrawList is re-evaluated every frame. The
+  // entry is placed by the WM like any window (setSurfaceLayout sets its
+  // slot). Returns false when refused (source is a mirror; id taken).
+  createMirror?(args: {
+    mirrorId: number;
+    sourceId: number;
+    getDrawList: () => number[];
+    scale?: number;
+  }): boolean;
+  destroyMirror?(mirrorId: number): void;
 
   // Buffer intercept: route a surface's sampled texture
   // through a plugin-supplied view. The intercept broker drives this
@@ -733,7 +744,7 @@ export interface CompositorIntrospection {
     // size-from-intrinsic entries like subsurfaces).
     drawList: Array<{
       id: number;
-      kind: "backdrop" | "content" | "phantom" | "layer" | "cursor";
+      kind: "backdrop" | "content" | "phantom" | "mirror" | "layer" | "cursor";
       layer?: Layer;
       x: number; y: number; width: number; height: number;
       hasBuffer: boolean;
@@ -865,6 +876,9 @@ export interface CompositorState {
   // before the first frame composites. Absent or returns false when
   // no opening plugin is registered -- the map proceeds instantly.
   openingDriver?: import("./opening-driver.js").OpeningDriver;
+  // Mirror driver: mints mirror windows (compositor mirror entry + synthetic
+  // WM window) and tears them down with their source.
+  mirrorDriver?: import("./mirror-driver.js").MirrorDriver;
   // Cursor kinematic state machine. Pointer motion events in
   // wl_seat feed it; the cursor rule engine reads its snapshot per frame.
   // Absent in GPU-free harnesses that don't bring up cursor support.

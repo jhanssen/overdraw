@@ -187,6 +187,14 @@ sdk.windows.focus(id): Promise<void>            // explicit override
 // Geometry, set by layout-driver
 sdk.windows.setGeometry(id, { x, y, w, h }): Promise<void>
 
+// Mirrors: a compositor-owned window showing a live copy of `sourceId`'s
+// draw list (decoration, subsurfaces, popups). Laid out like any window;
+// maps with role "mirror" + mirrorOf (filtered from onMap -- the creator
+// places it in an island); never keyboard-focusable; a press on it emits
+// pointer.pressed with the mirror id. Dies with its source.
+sdk.windows.createMirror(sourceId): Promise<number>   // -> mirror id
+sdk.windows.destroyMirror(id): Promise<void>
+
 // Phantom-window lifetime is NOT an explicit API. It's implicit in the
 // `window.closing` event being await-on-decision — subscribers that want the
 // surface kept alive for a close animation `await` their work in the handler.

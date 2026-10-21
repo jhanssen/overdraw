@@ -1099,7 +1099,28 @@ live winner (replacement is a boot-time decision).
   `setOutputStack` + `focus(id)` + `requestFocusDecision` +
   per-surface render state (`setOpacity`/`setTransform`/`setMask`/
   `setOutputMargin`/`setTint`/`setColorMatrix`) +
-  `destroyPhantom`.
+  `destroyPhantom` + `createMirror`/`destroyMirror`.
+- **Mirror windows** (`sdk.windows.createMirror(sourceId)`): a
+  compositor-owned window showing a live copy of a client window's draw
+  list (decoration intercept output, subsurfaces, popups). The mirror is a
+  synthetic WM window: laid out like any window (a slot sized unlike the
+  source scales the copy), geometry applied immediately (no configure /
+  ack transaction), never a keyboard-focus candidate, and a pointer press
+  on it emits `pointer.pressed` with the mirror id (no wl_pointer
+  traffic). It maps with `role: "mirror"` + `mirrorOf`, which
+  `sdk.windows.onMap` filters out -- the creating plugin places it in an
+  island / output stack itself. Rendering: one offscreen composite per
+  mirror per frame in which a member damaged its region, run BEFORE the
+  on-screen passes (no frame of latency); member damage also damages the
+  mirror's on-screen rect so partial repaints include it. The texture
+  covers the union of the members' rects, so a popup hanging off the
+  source hangs off the mirror by the same (scaled) offset; uncovered
+  region is transparent. A mirror dies with its source. Not mirrorable:
+  mirrors themselves. GPU tests: `test/mirror.gpu.mjs` (source pixels +
+  recolor propagation -- fails with propagation disabled -- popup +
+  transparency via the mirror texture, press routing, teardown).
+  Scene compose (`sdk.compose.*`) now includes popups rooted at the listed
+  toplevels (`test/compose.gpu.mjs`).
 - `sdk.actions` (register/invoke/list).
 - `sdk.events` (typed bus + dynamic pattern subscribe + intercept
   with priority + per-handler timeout).

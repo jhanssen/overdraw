@@ -877,6 +877,26 @@ export interface LiveSceneHandle {
   release(): void;
 }
 
+interface MirrorEntry {
+  mirrorId: number;
+  sourceId: number;
+  getDrawList: () => number[];
+  scale: number;
+  // This frame's member list (drawable members only).
+  drawList: number[];
+  // World rect the texture covers: the union of the members' draw rects.
+  region: { x: number; y: number; w: number; h: number };
+  // The source's own draw rect (decorated outer), the part the slot maps to.
+  anchor: { x: number; y: number; w: number; h: number };
+  // WM-assigned rect for the mirror window; null until first laid out.
+  slot: { x: number; y: number; w: number; h: number } | null;
+  texture: GPUTexture | null;
+  view: GPUTextureView | null;
+  ctx: OutputCtx | null;
+  // A member damaged the region (or the region changed) since the last pass.
+  dirty: boolean;
+}
+
 // Active-transition state held by the compositor while a transition is
 // running on one output. setActiveTransition installs; clearActiveTransition
 // (or the install-er calling clear themselves on completion) tears down.
@@ -1097,6 +1117,24 @@ export class JsCompositor implements CompositorSink {
   // surface entry in this.surfaces sees the texture via the regular
   // bindGroup wiring (setSurfaceTexture installs it).
   private phantomTextures = new Map<number, GPUTexture>();
+
+  // Mirrors: compositor-owned surfaces showing a live copy of another
+  // window's draw list (toplevel + decoration + subsurfaces + popups). Each
+  // mirror owns an offscreen texture covering `region` -- the union of its
+  // members' draw rects in world space -- re-composited before the on-screen
+  // passes whenever a member damaged that region, so the on-screen sample of
+  // the mirror is never a frame behind its source. The WM places a mirror by
+  // its `slot`: where the source's outer rect (`anchor`) appears. The surface
+  // entry is derived from slot + region so a popup hanging outside the
+  // source's rect hangs outside the slot by the same offset, scaled by
+  // slot/anchor when the layout sized the slot differently.
+  private mirrors = new Map<number, MirrorEntry>();
+  // Re-entrancy guard for setSurfaceLayout: a mirror's derived placement is
+  // written through the same method the WM uses to set its slot.
+  private mirrorPlacing = false;
+  // Re-entrancy guard for addOutputDamage: damaging a mirror's on-screen rect
+  // must not itself be treated as source damage.
+  private mirrorDamaging = false;
 
   // Active transition state. Each entry in activeTransitions is keyed by
   // the outputId it runs on; on every renderFrame the per-output composite
@@ -1742,6 +1780,7 @@ export class JsCompositor implements CompositorSink {
           : (s.viewportDst?.height ?? s.viewportSrc?.height ?? s.height / bs)) : 0;
         const kind = backdrops.has(id) ? "backdrop"
           : phantoms.has(id) ? "phantom"
+          : this.mirrors.has(id) ? "mirror"
           : layerOf.has(id) ? "layer"
           : id === this.cursorTargetSurfaceId ? "cursor"
           : "content";
@@ -1768,6 +1807,12 @@ export class JsCompositor implements CompositorSink {
   }
 
   setSurfaceLayout(id: number, x: number, y: number, w: number, h: number): void {
+    const m = this.mirrors.get(id);
+    if (m && !this.mirrorPlacing) {
+      m.slot = { x, y, w, h };
+      this.placeMirror(m);
+      return;
+    }
     const s = this.surfaces.get(id);
     if (s) {
       // Unchanged placement is a no-op: applySubsurfaces re-emits every
@@ -3110,6 +3155,7 @@ export class JsCompositor implements CompositorSink {
   // screen regions (stack reorders, per-surface fx, output resize).
   private damageFull(): void {
     this.outputDamage.full();
+    for (const m of this.mirrors.values()) m.dirty = true;
   }
 
   // Mark every output fully damaged AND dirty so the next frame pass
@@ -3149,6 +3195,23 @@ export class JsCompositor implements CompositorSink {
     x: number, y: number, w: number, h: number, anchored = false,
   ): void {
     this.outputDamage.damageRect(x, y, w, h, anchored);
+    // World damage inside a mirror's region means its source changed: the
+    // mirror re-composites this frame, and its on-screen rect repaints on
+    // every output showing it (the scissor would otherwise exclude it).
+    if (anchored || this.mirrors.size === 0 || this.mirrorDamaging) return;
+    for (const m of this.mirrors.values()) {
+      const r = m.region;
+      if (x >= r.x + r.w || x + w <= r.x || y >= r.y + r.h || y + h <= r.y) continue;
+      m.dirty = true;
+      const ms = this.surfaces.get(m.mirrorId);
+      if (!ms || ms.layoutW <= 0 || ms.layoutH <= 0) continue;
+      this.mirrorDamaging = true;
+      try {
+        this.outputDamage.damageRect(ms.x, ms.y, ms.layoutW, ms.layoutH, false);
+      } finally {
+        this.mirrorDamaging = false;
+      }
+    }
   }
 
   // Damage a surface's current on-screen rect (placement). Content commits and
@@ -3994,6 +4057,9 @@ export class JsCompositor implements CompositorSink {
     // Derive each surface's shape-clip footprint from the current surface tree
     // + placements before any uniforms are written this frame.
     this.refreshShapeClips();
+    // Mirror regions follow their members' current rects; a change damages
+    // the mirror's on-screen rect, so this runs before the scissors are taken.
+    this.refreshMirrors();
 
     // One render target per output. Nested/KMS: acquire each output's scanout
     // texture (skip the ones whose ring has no free slot this frame). Headless:
@@ -4170,6 +4236,27 @@ export class JsCompositor implements CompositorSink {
       }
       const liveSceneLists = this.liveScenes.map((ls) => ls.getDrawList());
       for (const list of liveSceneLists) this.openImportBrackets(list, bracketed);
+      const dirtyMirrors = [...this.mirrors.values()]
+        .filter((m): m is MirrorEntry & { view: GPUTextureView; ctx: OutputCtx } =>
+          m.dirty && m.view !== null && m.ctx !== null);
+      for (const m of dirtyMirrors) this.openImportBrackets(m.drawList, bracketed);
+
+      // Mirror passes run BEFORE the on-screen passes so an output sampling a
+      // mirror this frame sees its source's current content. Each pass is its
+      // own submit (per-surface uniform writes; see below).
+      for (const m of dirtyMirrors) {
+        const enc = this.device.createCommandEncoder();
+        this.compositeScene({
+          encoder: enc, targetView: m.view, drawList: m.drawList,
+          outW: m.ctx.logicalWidth, outH: m.ctx.logicalHeight,
+          output: m.ctx,
+          // Members cover only part of the region (a popup hangs off the
+          // window); the rest must stay transparent, not black.
+          transparentClear: true,
+        });
+        this.device.queue.submit([enc.finish()]);
+        m.dirty = false;
+      }
 
       // On-screen pass: each output is either a transition pass or a normal
       // per-surface composite, decided per output. Each output is its OWN
@@ -4519,6 +4606,173 @@ export class JsCompositor implements CompositorSink {
 
   // For tests: enumerate active phantom surfaceIds in draw order.
   activePhantomIds(): number[] { return this.phantoms.slice(); }
+
+  // ----- Mirrors ------------------------------------------------------------
+
+  // Mint a mirror surface entry showing `sourceId`'s draw list. getDrawList
+  // is re-evaluated every frame (popups and subsurfaces come and go). The
+  // entry has no placement until the WM sets its slot via setSurfaceLayout.
+  // Returns false when the source is itself a mirror or the id is taken.
+  createMirror(args: {
+    mirrorId: number;
+    sourceId: number;
+    getDrawList: () => number[];
+    scale?: number;
+  }): boolean {
+    const { mirrorId, sourceId } = args;
+    if (this.mirrors.has(mirrorId) || this.mirrors.has(sourceId)) return false;
+    if (this.surfaces.has(mirrorId)) return false;
+    const scale = args.scale !== undefined && args.scale > 0 ? args.scale : 1;
+    const m: MirrorEntry = {
+      mirrorId, sourceId, getDrawList: args.getDrawList, scale,
+      drawList: [],
+      region: { x: 0, y: 0, w: 1, h: 1 },
+      anchor: { x: 0, y: 0, w: 1, h: 1 },
+      slot: null,
+      texture: null, view: null, ctx: null,
+      dirty: true,
+    };
+    this.mirrors.set(mirrorId, m);
+    this.refreshMirror(m);
+    return true;
+  }
+
+  destroyMirror(mirrorId: number): void {
+    const m = this.mirrors.get(mirrorId);
+    if (!m) return;
+    this.mirrors.delete(mirrorId);
+    this.removeSurface(mirrorId);
+    m.texture?.destroy();
+    m.texture = null;
+    m.view = null;
+  }
+
+  mirrorSourceOf(mirrorId: number): number | undefined {
+    return this.mirrors.get(mirrorId)?.sourceId;
+  }
+
+  // For tests: the mirror's current world region and derived surface rect.
+  mirrorGeometry(mirrorId: number): {
+    region: { x: number; y: number; w: number; h: number };
+    anchor: { x: number; y: number; w: number; h: number };
+    slot: { x: number; y: number; w: number; h: number } | null;
+    rect: { x: number; y: number; w: number; h: number } | null;
+  } | null {
+    const m = this.mirrors.get(mirrorId);
+    if (!m) return null;
+    const s = this.surfaces.get(mirrorId);
+    return {
+      region: { ...m.region }, anchor: { ...m.anchor },
+      slot: m.slot ? { ...m.slot } : null,
+      rect: s && s.layoutW > 0 ? { x: s.x, y: s.y, w: s.layoutW, h: s.layoutH } : null,
+    };
+  }
+
+  // For tests: the mirror's offscreen texture (region-sized, device px).
+  mirrorTexture(mirrorId: number): { texture: GPUTexture; outW: number; outH: number } | null {
+    const m = this.mirrors.get(mirrorId);
+    if (!m || !m.texture || !m.ctx) return null;
+    return { texture: m.texture, outW: m.ctx.deviceWidth, outH: m.ctx.deviceHeight };
+  }
+
+  private refreshMirrors(): void {
+    for (const m of this.mirrors.values()) this.refreshMirror(m);
+  }
+
+  // The rect a surface draws at, resolved the way updateUniforms does
+  // (intercept placement, else layout rect, else geometry / intrinsic size).
+  private drawRectOf(s: Surface): { x: number; y: number; w: number; h: number } | null {
+    const p = s.interceptPlacement;
+    if (p) return { x: p.x, y: p.y, w: p.w, h: p.h };
+    let w = s.layoutW, h = s.layoutH;
+    if (w <= 0 || h <= 0) {
+      const g = s.geometry ?? null;
+      if (g && g.width > 0 && g.height > 0) { w = g.width; h = g.height; }
+      else ({ w, h } = this.logicalSizeOf(s));
+    }
+    if (w <= 0 || h <= 0) return null;
+    return { x: s.x, y: s.y, w, h };
+  }
+
+  // Re-evaluate one mirror's members, region and anchor. A region size
+  // change reallocates the texture (and re-installs it on the mirror entry);
+  // an origin or anchor change re-derives the entry's placement.
+  private refreshMirror(m: MirrorEntry): void {
+    m.drawList = m.getDrawList().filter((id) => {
+      const s = this.surfaces.get(id);
+      return !!s && s.present && !!s.bindGroup;
+    });
+    const src = this.surfaces.get(m.sourceId);
+    const anchor = src ? this.drawRectOf(src) : null;
+    if (!anchor) return;  // source not drawable yet: keep the last state
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const id of m.drawList) {
+      const s = this.surfaces.get(id);
+      if (!s) continue;
+      const r = this.drawRectOf(s);
+      if (!r) continue;
+      if (r.x < x0) x0 = r.x;
+      if (r.y < y0) y0 = r.y;
+      if (r.x + r.w > x1) x1 = r.x + r.w;
+      if (r.y + r.h > y1) y1 = r.y + r.h;
+    }
+    if (!Number.isFinite(x0)) { x0 = anchor.x; y0 = anchor.y; x1 = anchor.x + anchor.w; y1 = anchor.y + anchor.h; }
+    const region = {
+      x: Math.floor(x0), y: Math.floor(y0),
+      w: Math.max(1, Math.ceil(x1) - Math.floor(x0)),
+      h: Math.max(1, Math.ceil(y1) - Math.floor(y0)),
+    };
+    const sizeChanged = !m.texture || region.w !== m.region.w || region.h !== m.region.h;
+    const moved = region.x !== m.region.x || region.y !== m.region.y
+      || anchor.x !== m.anchor.x || anchor.y !== m.anchor.y
+      || anchor.w !== m.anchor.w || anchor.h !== m.anchor.h;
+    m.region = region;
+    m.anchor = { ...anchor };
+    if (sizeChanged) {
+      const devW = Math.max(1, Math.round(region.w * m.scale));
+      const devH = Math.max(1, Math.round(region.h * m.scale));
+      const old = m.texture;
+      m.texture = this.allocComposeTexture(devW, devH);
+      m.view = m.texture.createView();
+      m.ctx = {
+        id: -1,
+        originX: region.x, originY: region.y, cameraX: 0, cameraY: 0, cameraZoom: 1,
+        scale: m.scale,
+        deviceWidth: devW, deviceHeight: devH,
+        logicalWidth: region.w, logicalHeight: region.h,
+      };
+      // setSurfaceTexture rebuilds the bind group and damages the mirror's
+      // rect (once it has one).
+      this.setSurfaceTexture(m.mirrorId, m.texture, devW, devH);
+      old?.destroy();
+      m.dirty = true;
+    } else if (m.ctx) {
+      m.ctx.originX = region.x;
+      m.ctx.originY = region.y;
+    }
+    if (sizeChanged || moved) {
+      m.dirty = true;
+      this.placeMirror(m);
+    }
+  }
+
+  // Derive the mirror entry's placement from its slot: the anchor maps onto
+  // the slot (scaled when the sizes differ) and the region follows.
+  private placeMirror(m: MirrorEntry): void {
+    if (!m.slot) return;
+    const sx = m.anchor.w > 0 ? m.slot.w / m.anchor.w : 1;
+    const sy = m.anchor.h > 0 ? m.slot.h / m.anchor.h : 1;
+    const x = m.slot.x + (m.region.x - m.anchor.x) * sx;
+    const y = m.slot.y + (m.region.y - m.anchor.y) * sy;
+    const w = Math.max(1, Math.round(m.region.w * sx));
+    const h = Math.max(1, Math.round(m.region.h * sy));
+    this.mirrorPlacing = true;
+    try {
+      this.setSurfaceLayout(m.mirrorId, Math.round(x), Math.round(y), w, h);
+    } finally {
+      this.mirrorPlacing = false;
+    }
+  }
 
   // ----- Buffer intercept -----------------------------------------------------
   //

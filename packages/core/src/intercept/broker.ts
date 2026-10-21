@@ -186,6 +186,9 @@ export class InterceptBroker {
       });
     });
     deps.bus.on(WINDOW_EVENT.map, (ev) => {
+      // A mirror has no client texture of its own; its source is what a
+      // matching intercept already renders.
+      if (ev.role === "mirror") return;
       this.onMapped({
         surfaceId: ev.surfaceId,
         appId: ev.appId,

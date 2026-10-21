@@ -342,7 +342,14 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     dbgCounters.absOut = 0;
   }
 
+  // The mirror window under the pointer at the last pick, if the pick
+  // resolved to one. A mirror has no client surface: the pointer gets no
+  // enter/motion there, but a press on it emits pointer.pressed with the
+  // mirror's id so its creator can act on the click.
+  let mirrorUnderPointer: number | null = null;
+
   function pick(x: number, y: number): SeatFocus | null {
+    mirrorUnderPointer = null;
     const over = pickLayer(x, y, ["overlay"]);
     if (over) return over;
     // The "top" layer (bars, panels) sits above ordinary content but
@@ -477,6 +484,9 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       // camera on another output can map into this output's arrangement
       // rect).
       if (w.stackTier === 1 && w.windowState.sizeMode === "fullscreen") return false;
+      // A mirror is hit by its rect alone (no surface tree, no input
+      // region) and blocks whatever is drawn beneath it.
+      if (w.mirrorOf !== undefined) return true;
       const root = ctx.state.surfaces.get(w.surfaceRec.resource);
       if (!root) return false;
       const hit = hitTestSurfaceTree(ctx.state, root, w.rect, x, y);
@@ -485,6 +495,10 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       bestRootId = root.id;
       return true;
     });
+    if (win && win.mirrorOf !== undefined) {
+      mirrorUnderPointer = win.surfaceId;
+      return null;
+    }
     if (!win || !bestHit) return null;
     return toFocus(bestHit, bestRootId, view);
   }
@@ -1021,7 +1035,12 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // grab's release callback gets to fire normally.
         if (seat.grab) return;
 
-        if (!seat.focus) return;
+        if (!seat.focus) {
+          if (ev.pressed && mirrorUnderPointer !== null) {
+            ctx.state.bus?.emit(POINTER_EVENT.pressed, { surfaceId: mirrorUnderPointer });
+          }
+          return;
+        }
         const serial = ctx.state.serial();
         const state = ev.pressed ? 1 : 0;
         for (const p of clientPointers(seat.focus.clientId)) {

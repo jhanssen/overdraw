@@ -106,6 +106,8 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     if (method === "windows.set-color-matrix") return handleSetColorMatrix(params);
     if (method === "windows.set-backdrop-effect") return handleSetBackdropEffect(params);
     if (method === "windows.destroy-phantom") return handleDestroyPhantom(params);
+    if (method === "windows.create-mirror") return handleCreateMirror(params);
+    if (method === "windows.destroy-mirror") return handleDestroyMirror(params);
     if (method === "windows.release-opening-gate") return handleReleaseOpeningGate(params);
     return NOT_HANDLED;
   };
@@ -124,6 +126,27 @@ export function createWindowsBroker(deps: WindowsBrokerDeps): WindowsBroker {
     // a no-op when the timer was already cancelled.
     closingDriver?.cancelBackstop(p.id);
     compositor.destroyClosingPhantom(p.id);
+    return null;
+  }
+
+  function handleCreateMirror(p: unknown): { id: number } {
+    if (!isCreateMirrorPayload(p)) {
+      throw new Error("windows.create-mirror: malformed payload");
+    }
+    const driver = state.mirrorDriver;
+    if (!driver) throw new Error("windows.create-mirror: mirrors not supported in this configuration");
+    const id = driver.create(p.sourceId);
+    if (id === null) {
+      throw new Error(`windows.create-mirror: surfaceId=${p.sourceId} is not a mirrorable window`);
+    }
+    return { id };
+  }
+
+  function handleDestroyMirror(p: unknown): null {
+    if (!isDestroyPhantomPayload(p)) {
+      throw new Error("windows.destroy-mirror: malformed payload");
+    }
+    state.mirrorDriver?.destroy(p.id);
     return null;
   }
 
@@ -845,6 +868,12 @@ function isDestroyPhantomPayload(d: unknown): d is { id: number } {
   if (typeof d !== "object" || d === null) return false;
   const o = d as { [k: string]: unknown };
   return typeof o.id === "number" && Number.isInteger(o.id) && o.id > 0;
+}
+
+function isCreateMirrorPayload(d: unknown): d is { sourceId: number } {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { [k: string]: unknown };
+  return typeof o.sourceId === "number" && Number.isInteger(o.sourceId) && o.sourceId > 0;
 }
 
 function isReleaseOpeningGatePayload(d: unknown): d is { id: number } {

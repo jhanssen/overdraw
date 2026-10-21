@@ -131,6 +131,11 @@ export interface Window {
   //       stays in the tiled tier; the active peer's tie-break draws
   //       above it.
   stackTier?: -1 | 0 | 1;
+  // Set on a mirror window: the client window it shows a live copy of. A
+  // mirror has no client, so geometry applies immediately (no configure /
+  // ack transaction), it never takes keyboard focus, and the open and
+  // close drivers skip it.
+  mirrorOf?: number;
   // True while this window is its output's active window. Breaks z ties
   // within a tier (the tiled tier shares one z), so the active tiled
   // window draws above an overlapping maximized tile member. Stamped by
@@ -326,7 +331,7 @@ export interface Wm {
   addWindow(
     surfaceId: number,
     surfaceRec: SurfaceHandle,
-    opts?: { deferInitialCommit?: boolean },
+    opts?: { deferInitialCommit?: boolean; mirrorOf?: number },
   ): Rect;
   // Mark the initial-commit phase complete for a deferred window: emit
   // window.proposed with the accumulated state as the candidate so a
@@ -498,6 +503,8 @@ export interface WindowSnapshot {
   contentGated: boolean;
   windowState: WindowState;
   state: { [key: string]: unknown };
+  // Present on a mirror window: the client window it shows.
+  mirrorOf?: number;
 }
 
 // The content rect = the outer tile shrunk by the insets (subtractive): origin
@@ -1404,7 +1411,7 @@ export function createWm(
     win.awaitingMapAck = false;
     const t = mapAckBackstops.get(win.surfaceId);
     if (t) { clearTimeout(t); mapAckBackstops.delete(win.surfaceId); }
-    beforeMap?.(win.surfaceId);
+    if (win.mirrorOf === undefined) beforeMap?.(win.surfaceId);
     win.contentGateOwners?.delete("opening-ack");
     win.contentGateOwners?.delete("opening-pending-layout");
     pushStack();
@@ -1434,7 +1441,8 @@ export function createWm(
     // animation there's nothing to protect, so the window maps immediately --
     // gating on beforeMap (the always-wired hook) instead would wrongly hold
     // every window. xwayland (no serial) also maps immediately.
-    if (beforeMap && hasOpeningAnimation?.() && wantSerial !== undefined && acked < wantSerial) {
+    if (beforeMap && hasOpeningAnimation?.() && wantSerial !== undefined && acked < wantSerial
+        && win.mirrorOf === undefined) {
       if (!win.contentGateOwners) win.contentGateOwners = new Set();
       win.contentGateOwners.add("opening-ack");
       win.awaitingMapAck = true;
@@ -1591,7 +1599,8 @@ export function createWm(
       // immediate path so the window gets its first real rect.
       const hadPriorTile = prevOuter.width > 0 && prevOuter.height > 0;
 
-      if (useTx && win.hasContent && !win.pendingInitialCommit && hadPriorTile) {
+      if (useTx && win.hasContent && !win.pendingInitialCommit && hadPriorTile
+          && win.mirrorOf === undefined) {
         // Transaction path: hold the new geometry; (re)configure on a size that
         // differs from what the client was last asked for. The window keeps its
         // current drawn rect until the broker applies the tx batch.
@@ -1883,6 +1892,7 @@ export function createWm(
         state: new Map<string, unknown>(),
       };
       if (opts?.deferInitialCommit) win.pendingInitialCommit = true;
+      if (opts?.mirrorOf !== undefined) win.mirrorOf = opts.mirrorOf;
       windows.unshift(win);
       driver.schedule("mapped");
       return win.rect;
@@ -2767,7 +2777,7 @@ export function createWm(
           for (const id of ids) {
             const win = windows.find((w) => w.surfaceId === id);
             if (!win) continue;
-            if (win.hasContent && win.windowState.visible) {
+            if (win.hasContent && win.windowState.visible && win.mirrorOf === undefined) {
               out.push(win.surfaceId);
             }
           }
@@ -2775,7 +2785,7 @@ export function createWm(
         return out;
       }
       for (const w of windows) {
-        if (w.hasContent && w.windowState.visible) {
+        if (w.hasContent && w.windowState.visible && w.mirrorOf === undefined) {
           out.push(w.surfaceId);
         }
       }
@@ -2871,5 +2881,6 @@ function snapshotOf(win: Window): WindowSnapshot {
     state,
   };
   if (win.insets) snap.insets = { ...win.insets };
+  if (win.mirrorOf !== undefined) snap.mirrorOf = win.mirrorOf;
   return snap;
 }

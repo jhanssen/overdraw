@@ -18,7 +18,8 @@ import { createWm } from "../wm/index.js";
 import { createSurfaceTransactionBroker } from "../surface-transaction.js";
 import type { LayoutDriver, LayoutSnapshot, LayoutApplyTarget } from "../wm/layout-driver.js";
 import { queryState } from "../query.js";
-import { applySubsurfaces } from "../subsurfaces.js";
+import { applySubsurfaces, makeComposeFlatteners } from "../subsurfaces.js";
+import { createMirrorDriver } from "./mirror-driver.js";
 import { unmapAndTeardownSurface } from "./wl_surface.js";
 import { rebuildStackWithPopups, maybeDismissGrabbedPopup, flushDeferredOutputStacks } from "./xdg_popup.js";
 import { configureToplevel } from "./xdg_surface.js";
@@ -476,6 +477,9 @@ export async function installProtocols(
     // follow-pointer keyboard focus and client hover state land on the
     // window actually under the cursor, after the stack flush above.
     state.seat?.repickPointer();
+  });
+  state.mirrorDriver = createMirrorDriver({
+    state, flattenWindows: makeComposeFlatteners(state).flattenWindows,
   });
   state.wm = createWm(
     state.compositor,

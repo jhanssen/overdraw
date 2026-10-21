@@ -874,6 +874,9 @@ export async function setupCompositor(opts = {}) {
     spawnClient, waitFor, frameReadback, teardown, jsCompositor,
     coreDevice, dawn,
     runtime, pluginBus, focusDriver,
+    // The windows broker, so a test can drive sdk.windows.* requests
+    // without a plugin fixture: windowsBroker("test", method, params).
+    windowsBroker,
   };
 }
 

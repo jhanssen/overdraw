@@ -68,6 +68,8 @@ export interface WindowSnapshotLike {
     [k: string]: unknown;
   };
   state: { [key: string]: unknown };
+  // Present on a mirror window: the client window it shows a live copy of.
+  mirrorOf?: number;
 }
 
 export interface InsetsLike {

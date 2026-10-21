@@ -383,6 +383,21 @@ int main(int argc, char** argv) {
                         wl_display_flush(display);
                         printf("[harness-client] renamed app_id=%s\n", id);
                         fflush(stdout);
+                    } else if (strncmp(inbuf, "recolor ", 8) == 0) {
+                        uint32_t nc = (uint32_t)strtoul(inbuf + 8, NULL, 16);
+                        struct wl_buffer* nb = m > 0
+                            ? make_shadow_buffer(g_w, g_h, m, nc)
+                            : make_solid_buffer(cur_w, cur_h, nc);
+                        if (nb) {
+                            color = nc;
+                            g_buffer = nb;
+                            wl_surface_attach(surface, nb, 0, 0);
+                            wl_surface_damage(surface, 0, 0, g_w, g_h);
+                            wl_surface_commit(surface);
+                            wl_display_flush(display);
+                            printf("[harness-client] recolored %08x\n", nc);
+                            fflush(stdout);
+                        }
                     } else if (strncmp(inbuf, "unfullscreen", 12) == 0) {
                         xdg_toplevel_unset_fullscreen(toplevel);
                         wl_display_flush(display);

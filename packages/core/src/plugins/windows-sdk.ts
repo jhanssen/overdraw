@@ -91,6 +91,8 @@ export interface WindowSnapshot {
   contentGated: boolean;
   windowState: WindowState;
   state: { [key: string]: unknown };
+  // Present on a mirror window: the client window it shows a live copy of.
+  mirrorOf?: number;
 }
 
 // The sdk.windows surface. The observer (onMap/onUnmap/onChange) is included
@@ -281,6 +283,16 @@ export interface PluginWindows extends PluginWindowObserver {
   // (effectively) a no-op -- the compositor's destroyClosingPhantom
   // refuses non-phantom ids.
   destroyPhantom(id: number): Promise<void>;
+
+  // Create a mirror of `sourceId`: a compositor-owned window showing a live
+  // copy of the source (decoration, subsurfaces and popups included). The
+  // mirror is a WM window -- it maps with role "mirror" (excluded from
+  // onMap; subscribe to 'window.map' and read `mirrorOf` for it), is laid
+  // out like any window (the layout's rect scales the copy), takes no
+  // keyboard focus, and a pointer press on it emits pointer.pressed with the
+  // mirror's id. Destroyed with its source. Resolves to the mirror's id.
+  createMirror(sourceId: number): Promise<number>;
+  destroyMirror(id: number): Promise<void>;
 
   // Release the content gate engaged at window.opening for `id`. The
   // window then enters the compositor's draw stack and the next
@@ -639,6 +651,24 @@ export function createPluginWindows(
       // kind + flat numeric params, Json-safe.
       // eslint-disable-next-line no-restricted-syntax
       await endpoint.request("windows.set-backdrop-effect", { id, e: e as unknown as Json });
+    },
+
+    async createMirror(sourceId): Promise<number> {
+      if (typeof sourceId !== "number" || !Number.isInteger(sourceId) || sourceId <= 0) {
+        throw new TypeError("createMirror sourceId must be a positive integer");
+      }
+      const r = await endpoint.request("windows.create-mirror", { sourceId });
+      if (typeof r !== "object" || r === null || typeof (r as { id?: unknown }).id !== "number") {
+        throw new Error("windows.create-mirror: malformed reply");
+      }
+      return (r as { id: number }).id;
+    },
+
+    async destroyMirror(id): Promise<void> {
+      if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
+        throw new TypeError("destroyMirror id must be a positive integer");
+      }
+      await endpoint.request("windows.destroy-mirror", { id });
     },
 
     async destroyPhantom(id): Promise<void> {
