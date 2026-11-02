@@ -144,6 +144,25 @@ function promoteSyncobjForCommit(
   // the same bufferId fires -- the same atomic point as wl_buffer.release.
 }
 
+// A synchronized-subsurface commit that attaches a buffer replaces the buffer
+// an earlier commit left in the cache. The replaced buffer is never applied,
+// so neither the GPU release path nor the shm upload path will ever free it:
+// signal its explicit-sync release point and send wl_buffer.release here, or
+// a client cycling a fixed swapchain (NVIDIA EGL waits on the release points)
+// blocks forever once the parent stops committing.
+function releaseSupersededCachedBuffer(ctx: Ctx, s: SurfaceRecord): void {
+  const c = s.cached;
+  if (!c?.bufferFresh) return;
+  const rel = c.syncobjRelease;
+  c.syncobjAcquire = undefined;
+  c.syncobjRelease = undefined;
+  if (rel) ctx.addon.syncobjTimelineSignal(rel.handle, rel.pointHi, rel.pointLo);
+  const old = c.buffer;
+  if (old && !old.destroyed && old !== s.committed.buffer) {
+    ctx.events.wl_buffer.send_release(old);
+  }
+}
+
 // Apply one surface's committed buffer to the GPU (upload/import). Sets
 // hasContent. Releases shm buffers (copied at upload). dmabuf import is async.
 function uploadBuffer(ctx: Ctx, s: SurfaceRecord, buffer: Resource | null): void {
@@ -401,7 +420,12 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): bo
         if (childRec.cached.bufferDamage) {
           (childRec.committed.bufferDamage ??= []).push(...childRec.cached.bufferDamage);
         }
+        const cachedAcq = childRec.cached.syncobjAcquire;
+        const cachedRel = childRec.cached.syncobjRelease;
         childRec.cached = undefined;
+        if (cachedAcq || cachedRel) {
+          promoteSyncobjForCommit(childRec, cachedAcq, cachedRel, ctx);
+        }
         if (applySurfaceState(ctx, childRec, childBufferFresh)) needsStackRebuild = true;
       }
     }
@@ -573,6 +597,7 @@ function commitNow(ctx: Ctx, s: SurfaceRecord): void {
     // Synchronized subsurface: CACHE this commit; do not apply. The cache is
     // applied when the parent commits (via applySurfaceState's cascade).
     s.cached ??= {};
+    if (attachedThisCommit) releaseSupersededCachedBuffer(ctx, s);
     s.cached.buffer = s.committed.buffer;
     // Sticky: the cached buffer is fresh if ANY commit in this cache cycle
     // attached one, so the parent's cascade applies (and releases) it once.

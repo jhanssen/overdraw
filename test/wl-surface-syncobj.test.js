@@ -10,6 +10,10 @@
 //     (spec's no_buffer).
 //   - points do not persist across commits (one-shot per spec).
 //
+//   - synchronized subsurfaces: cached points ride the parent-commit cascade,
+//     and a cached commit superseded before the parent commits has its
+//     release point signaled and its wl_buffer released.
+//
 // All addon syncobj calls + the compositor sink are stubs.
 
 import { test } from 'node:test';
@@ -21,6 +25,8 @@ function makeCtx() {
   const events = [];
   const released = [];
   const exported = [];
+  const signaled = [];
+  const wlReleased = [];
   const fakeFd = (raw) => ({
     fd: raw, closed: false,
     close() { this.closed = true; },
@@ -36,7 +42,10 @@ function makeCtx() {
       exported.push({ handle, hi, lo });
       return fakeFd(123 + exported.length);  // stable, distinguishable
     },
-    syncobjTimelineSignal: () => true,
+    syncobjTimelineSignal(handle, hi, lo) {
+      signaled.push({ handle, hi, lo });
+      return true;
+    },
   };
   const surfaces = new Map();
   const buffers = new Map();
@@ -65,9 +74,9 @@ function makeCtx() {
       },
     },
     addon,
-    events: { wl_buffer: { send_release: () => {} } },
+    events: { wl_buffer: { send_release: (b) => wlReleased.push(b) } },
   };
-  return { ctx, events, released, exported, fakeFd };
+  return { ctx, events, released, exported, signaled, wlReleased, fakeFd };
 }
 
 function addSurface(state, resource, id) {
@@ -202,4 +211,113 @@ test('points are one-shot: a follow-up dmabuf commit with no new points does not
   assert.equal(events.length, 2);
   assert.notEqual(events[0].acquireFenceFd, null);
   assert.equal(events[1].acquireFenceFd, null);
+});
+
+// Parent (main surface) + one subsurface child in sync mode.
+function setupSyncTree(state) {
+  const parentRes = { id: 10 };
+  const childRes = { id: 11 };
+  addSurface(state, parentRes, 70);
+  const child = addSurface(state, childRes, 71);
+  state.subsurfaces.set({ id: 12 }, {
+    surface: childRes, parent: parentRes,
+    sync: true, x: 0, y: 0, pendingX: 0, pendingY: 0,
+  });
+  return { parentRes, childRes, child };
+}
+
+function setPoints(rec, acqLo, relLo) {
+  rec.pending.syncobjAcquire = {
+    timelineResource: { id: 3 }, handle: 100, pointHi: 0, pointLo: acqLo,
+  };
+  rec.pending.syncobjRelease = {
+    timelineResource: { id: 3 }, handle: 200, pointHi: 0, pointLo: relLo,
+  };
+}
+
+test('sync subsurface: cached points are promoted by the parent-commit cascade', () => {
+  const { ctx, events, released, exported, signaled } = makeCtx();
+  const h = makeSurface(ctx);
+  const { parentRes, childRes, child } = setupSyncTree(ctx.state);
+  const buf = { id: 20, destroyed: false };
+  setDmabufBuffer(ctx.state, child, buf);
+  setPoints(child, 1, 1);
+  h.commit(childRes);
+  assert.deepEqual(events, [], 'sync child commit is cached, not applied');
+  assert.deepEqual(released, []);
+
+  h.commit(parentRes);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].id, 71);
+  assert.notEqual(events[0].acquireFenceFd, null, 'acquire fence carried');
+  assert.deepEqual(exported, [{ handle: 100, hi: 0, lo: 1 }]);
+  assert.equal(released.length, 1);
+  assert.equal(released[0].bufferId, events[0].bufferId);
+  assert.equal(released[0].handle, 200);
+  assert.equal(released[0].lo, 1);
+  assert.deepEqual(signaled, [], 'applied buffer is released by the GPU path, not here');
+});
+
+test('sync subsurface: a superseded cached commit releases its buffer and point', () => {
+  const { ctx, events, released, signaled, wlReleased } = makeCtx();
+  const h = makeSurface(ctx);
+  const { parentRes, childRes, child } = setupSyncTree(ctx.state);
+  const bufs = [1, 2, 3].map((i) => ({ id: 20 + i, destroyed: false }));
+  bufs.forEach((b, i) => {
+    setDmabufBuffer(ctx.state, child, b);
+    setPoints(child, i + 1, i + 1);
+    h.commit(childRes);
+  });
+  assert.deepEqual(events, [], 'parent has not committed');
+  assert.deepEqual(signaled, [
+    { handle: 200, hi: 0, lo: 1 },
+    { handle: 200, hi: 0, lo: 2 },
+  ]);
+  assert.deepEqual(wlReleased, [bufs[0], bufs[1]]);
+
+  h.commit(parentRes);
+  assert.equal(events.length, 1, 'only the latest cached buffer is applied');
+  assert.equal(released.length, 1);
+  assert.equal(released[0].lo, 3);
+});
+
+test('sync subsurface: re-attaching the cached buffer signals the old point but keeps the buffer', () => {
+  const { ctx, signaled, wlReleased } = makeCtx();
+  const h = makeSurface(ctx);
+  const { childRes, child } = setupSyncTree(ctx.state);
+  const buf = { id: 30, destroyed: false };
+  setDmabufBuffer(ctx.state, child, buf);
+  setPoints(child, 1, 1);
+  h.commit(childRes);
+  child.pending.buffer = buf;
+  setPoints(child, 2, 2);
+  h.commit(childRes);
+  assert.deepEqual(signaled, [{ handle: 200, hi: 0, lo: 1 }]);
+  assert.deepEqual(wlReleased, []);
+});
+
+test('sync subsurface: a superseded cached shm buffer is released', () => {
+  const { ctx, signaled, wlReleased } = makeCtx();
+  const h = makeSurface(ctx);
+  const { childRes, child } = setupSyncTree(ctx.state);
+  const shm1 = { id: 40, destroyed: false };
+  const shm2 = { id: 41, destroyed: false };
+  setShmBuffer(ctx.state, child, shm1);
+  h.commit(childRes);
+  setShmBuffer(ctx.state, child, shm2);
+  h.commit(childRes);
+  assert.deepEqual(wlReleased, [shm1]);
+  assert.deepEqual(signaled, []);
+});
+
+test('sync subsurface: a commit without an attach leaves the cached buffer alone', () => {
+  const { ctx, signaled, wlReleased } = makeCtx();
+  const h = makeSurface(ctx);
+  const { childRes, child } = setupSyncTree(ctx.state);
+  setDmabufBuffer(ctx.state, child, { id: 50, destroyed: false });
+  setPoints(child, 1, 1);
+  h.commit(childRes);
+  h.commit(childRes);
+  assert.deepEqual(signaled, []);
+  assert.deepEqual(wlReleased, []);
 });
