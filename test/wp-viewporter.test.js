@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 
 import makeSurface from '../packages/core/dist/protocols/wl_surface.js';
 import makeViewporter, { makeViewport } from '../packages/core/dist/protocols/wp_viewporter.js';
+import makeSubcompositor, { makeSubsurface } from '../packages/core/dist/protocols/wl_subcompositor.js';
 
 function makeCtx() {
   const vpCalls = [];
@@ -96,6 +97,46 @@ test('set_source: validation + unset', () => {
   // destination -1,-1 -> unset
   vh.set_destination(vp, -1, -1);
   assert.equal(rec.pending.viewportDst, null);
+});
+
+// Subsurface teardown drops the compositor-side Surface entry while the
+// wl_surface (and its latched wp_viewport destination) survives for reuse.
+// The next commit must re-push the destination into the recreated blank
+// entry even though the client never resends set_destination -- otherwise
+// the reused surface renders at raw buffer size while hit-testing stays at
+// the logical size (the oversized-popup-with-offset-hitboxes bug).
+test('subsurface destroy: latched viewport destination re-pushed on next commit', () => {
+  const { ctx, vpCalls, surfaces } = makeCtx();
+  const removed = [];
+  ctx.state.compositor.removeSurface = (id) => removed.push(id);
+  const sh = makeSurface(ctx);
+  const mgr = makeViewporter(ctx);
+  const vh = makeViewport(ctx);
+  const subMgr = makeSubcompositor(ctx);
+  const subH = makeSubsurface(ctx);
+
+  const parentSurf = { id: 10 };
+  addSurface(surfaces, parentSurf, 6);
+  const surf = { id: 1 };
+  const rec = addSurface(surfaces, surf, 5);
+  const vp = { id: 2 };
+  mgr.get_viewport(null, vp, surf);
+  vh.set_destination(vp, 200, 300);
+  sh.commit(surf);
+  assert.deepEqual(vpCalls.at(-1), [5, { width: 200, height: 300 }, null]);
+
+  const subRes = { id: 3 };
+  subMgr.get_subsurface(null, subRes, surf, parentSurf);
+  subH.destroy(subRes);
+  assert.deepEqual(removed, [5], 'subsurface destroy drops the compositor entry');
+  assert.equal(rec.needsCompositorResync, true);
+
+  // Reuse: the client commits again without resending set_destination.
+  const n = vpCalls.length;
+  sh.commit(surf);
+  assert.equal(vpCalls.length, n + 1, 'commit after teardown re-pushes viewport state');
+  assert.deepEqual(vpCalls.at(-1), [5, { width: 200, height: 300 }, null]);
+  assert.equal(rec.needsCompositorResync, false, 'resync flag consumed by the commit');
 });
 
 test('destroy clears viewport on next commit', () => {

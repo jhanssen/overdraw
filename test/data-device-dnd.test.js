@@ -105,4 +105,10 @@ test("drag icon is output-anchored so the camera leaves it on the cursor", () =>
     // which is only correct because the surface is anchored above.
     ["layout", 7, 495, 397],
   ]);
+
+  // Drag end tears down the icon's compositor entry; the wl_surface survives
+  // for reuse, so its record must be flagged for a full state re-push on the
+  // next commit (viewport, tearing -- the change-detect path skips them).
+  grab.onButton(false);
+  assert.equal(ctx.state.surfaces.get(iconRes).needsCompositorResync, true);
 });

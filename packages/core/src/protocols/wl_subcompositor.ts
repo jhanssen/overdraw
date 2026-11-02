@@ -67,7 +67,13 @@ export function makeSubsurface(ctx: Ctx): WlSubsurfaceHandler {
           if (order.length === 0) ctx.state.subsurfaceOrder?.delete(s.parent);
         }
         const c = ctx.state.surfaces.get(s.surface);
-        if (c) ctx.state.compositor.removeSurface(c.id);
+        if (c) {
+          ctx.state.compositor.removeSurface(c.id);
+          // The wl_surface survives for reuse; re-push its latched state
+          // (viewport, tearing) into the recreated compositor entry on the
+          // next commit.
+          c.needsCompositorResync = true;
+        }
       }
       applySubsurfaces(ctx.state);
     },

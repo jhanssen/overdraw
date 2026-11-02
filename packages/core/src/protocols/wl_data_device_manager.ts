@@ -216,7 +216,13 @@ function hideDragIcon(d: DragSession): void {
   }
   if (!d.icon) return;
   const rec = d.ctx.state.surfaces.get(d.icon);
-  if (rec) d.ctx.state.compositor.removeSurface(rec.id);
+  if (rec) {
+    d.ctx.state.compositor.removeSurface(rec.id);
+    // The wl_surface survives for reuse; re-push its latched state
+    // (viewport, tearing) into the recreated compositor entry on the
+    // next commit.
+    rec.needsCompositorResync = true;
+  }
 }
 
 // Per-frame disconnect sweep (wired in installProtocols alongside the
