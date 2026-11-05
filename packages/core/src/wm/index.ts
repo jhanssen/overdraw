@@ -2521,23 +2521,23 @@ export function createWm(
         if (changed.some((f) => GEOMETRY_FIELDS.includes(f))) {
           driver.schedule("state-changed");
         }
-        // Stacking-axis change (parent or modal): recompute the
-        // window's z and renormalize the chain. Skip if the window
-        // hasn't reached first content yet (assignZForMap will run
-        // from windowHasContent for that case).
-        if (win.hasContent && changed.some((f) => STACKING_FIELDS.includes(f))) {
+        // Stacking-axis change (parent, modal, or lane): recompute the
+        // window's z and renormalize the chain. A window entering the
+        // floating lane takes a z above the tile stack; one leaving it
+        // rejoins tiledZ. Skip if the window hasn't reached first content
+        // yet (assignZForMap will run from windowHasContent for that case).
+        if (win.hasContent
+            && (changed.includes("tiling")
+                || changed.some((f) => STACKING_FIELDS.includes(f)))) {
           assignZForMap(win);
           pushStack();
         } else if (win.hasContent
-                   && (changed.includes("sizeMode") || changed.includes("visible")
-                       || changed.includes("tiling"))) {
-          // sizeMode, visible, and tiling are all tier INPUTS
-          // (updateStackTiers / effectiveStackZ): a transition changes
-          // the window's stacking tier without touching win.z, so the
-          // draw stack must be re-pushed even though no z was
-          // reassigned -- a minimizing fullscreen window must drop its
-          // top tier, an unfloating maximized window becomes a tile
-          // member.
+                   && (changed.includes("sizeMode") || changed.includes("visible"))) {
+          // sizeMode and visible are tier INPUTS (updateStackTiers /
+          // effectiveStackZ): a transition changes the window's stacking
+          // tier without touching win.z, so the draw stack must be
+          // re-pushed even though no z was reassigned -- a minimizing
+          // fullscreen window must drop its top tier.
           pushStack();
         }
         // Modal transitions: tether or untether focus.

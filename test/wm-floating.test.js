@@ -335,6 +335,42 @@ test('raiseAllFloating: preserves relative order of multiple floating windows', 
   assert.ok(stack.indexOf(3) > stack.indexOf(2), 'floating 3 stays above floating 2');
 });
 
+// --- in-place lane transitions: z follows the lane ----------------------
+
+test('managed -> floating: the window lands above the tiles that retile into its slot', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+  });
+  await addMapped(wm, 1);
+  await addMapped(wm, 2);
+  // The focused tile wins z ties, so a float left at the tiled z sinks under it.
+  wm.setKeyboardFocus(2);
+  await wm.propose(1, { tiling: 'floating' }, 'user-input');
+  await wm.settled();
+
+  const stack = stackOf(wm);
+  assert.ok(stack.indexOf(1) > stack.indexOf(2),
+    'newly floating window draws above the tile now covering its old rect');
+});
+
+test('floating -> managed: the window rejoins the tile stack below floating peers', async () => {
+  const wm = createWm(mockSink(), [{ id: 0, rect: { x: 0, y: 0, width: 1000, height: 600 }, scale: 1 }], {
+    layoutDriverFactory: inlineMasterStackDriverFactory,
+  });
+  await addMapped(wm, 1);
+  await addMapped(wm, 2);
+  await addMapped(wm, 3);
+  await wm.propose(3, { tiling: 'floating' }, 'user-input');
+  await wm.propose(2, { tiling: 'floating' }, 'user-input');
+  await wm.propose(2, { tiling: 'managed' }, 'user-input');
+  await wm.settled();
+
+  const stack = stackOf(wm);
+  assert.ok(stack.indexOf(3) > stack.indexOf(2),
+    'tiled again: drawn below the remaining floating window');
+  assert.ok(stack.indexOf(3) > stack.indexOf(1), 'floating window above the other tile');
+});
+
 // --- map-time float placement -------------------------------------------
 
 // A window that maps already floating (fixed-size here; also dialogs and
