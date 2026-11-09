@@ -996,7 +996,10 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // its toggle press, so the menu won't reopen. wlroots' popup
         // grab follows the same model: the press is sent, the client
         // dismisses the popup itself in response.
-        if (ev.pressed) ctx.state.dismissGrabbedPopup?.(lastX, lastY);
+        if (ev.pressed && ctx.state.grabbedPopup
+            && !pickPopup(lastX, lastY, contentViewAt(lastX, lastY))) {
+          ctx.state.dismissGrabbedPopup?.();
+        }
         const button = ev.button ?? 0;
 
         // Consult the binding chain. Press: dispatchPress (with the

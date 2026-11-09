@@ -964,11 +964,10 @@ export interface CompositorState {
   popups?: Map<Resource, PopupRecord>;
   // The xdg_popup that currently holds an input grab (dismiss on click-outside).
   grabbedPopup?: Resource;
-  // On a pointer button press, the seat calls this with the output-space point;
-  // if a grabbing popup exists and the press is outside it, the popup is dismissed
-  // (popup_done) and this returns true so the seat swallows the click. Set by
+  // The seat calls this on a button press outside every popup; a grabbing
+  // popup is dismissed (popup_done) and this returns true. Set by
   // installProtocols.
-  dismissGrabbedPopup?: (x: number, y: number) => boolean;
+  dismissGrabbedPopup?: () => boolean;
   dmabufParams?: Map<Resource, DmabufParams>;
   subsurfaces?: Map<Resource, SubsurfaceRecord>;
   // Per-parent child order: wl_surface (parent) -> ordered list of

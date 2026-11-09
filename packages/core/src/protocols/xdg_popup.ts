@@ -178,28 +178,14 @@ export default function makeXdgPopup(ctx: Ctx): XdgPopupHandler {
   };
 }
 
-// Is the output-space point inside the popup's on-screen rect?
-function pointInPopup(ctx: Pick<Ctx, "state">, pr: PopupRecord, x: number, y: number): boolean {
-  const origin = popupOutputOrigin(ctx.state, pr);
-  if (!origin) return false;
-  const px = origin.x + pr.rect.x, py = origin.y + pr.rect.y;
-  return x >= px && x < px + pr.rect.width && y >= py && y < py + pr.rect.height;
-}
-
-// Called on pointer button press: if a popup holds a grab and the press is
-// OUTSIDE the popup (and its ancestor popups), dismiss the popup chain
-// (popup_done), innermost first. Returns true if a popup was dismissed (so the
-// seat can swallow the click). This is the standard menu "click-away" behavior.
-export function maybeDismissGrabbedPopup(ctx: Ctx, x: number, y: number): boolean {
+// Menu click-away: the seat calls this on a button press that landed outside
+// every popup (decided by its own popup pick, so the camera transform and
+// input regions match pointer focus). Sends popup_done to the grabbing popup;
+// the client tears the chain down. Returns true if a popup was dismissed.
+export function maybeDismissGrabbedPopup(ctx: Ctx): boolean {
   const grabRes = ctx.state.grabbedPopup;
   if (!grabRes) return false;
-  const grabbed = ctx.state.popups?.get(grabRes);
-  if (!grabbed) { ctx.state.grabbedPopup = undefined; return false; }
-  // Inside the grabbed popup (or any still-mapped popup) -> keep it.
-  for (const pr of ctx.state.popups?.values() ?? []) {
-    if (pr.mapped && pointInPopup(ctx, pr, x, y)) return false;
-  }
-  // Outside all popups: dismiss the grabbed popup (client destroys it on done).
+  if (!ctx.state.popups?.get(grabRes)) { ctx.state.grabbedPopup = undefined; return false; }
   ctx.events.xdg_popup.send_popup_done(grabRes);
   ctx.state.grabbedPopup = undefined;
   return true;

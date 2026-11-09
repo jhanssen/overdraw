@@ -945,7 +945,7 @@ export async function installProtocols(
   };
 
   // Popup click-away dismissal: the seat calls this on a button press.
-  state.dismissGrabbedPopup = (x, y) => maybeDismissGrabbedPopup(ctx, x, y);
+  state.dismissGrabbedPopup = () => maybeDismissGrabbedPopup(ctx);
 
   // wp_presentation per-output feedback dispatch. Mirror shape of
   // dispatchFrameCallbacksForOutput: addon fires this on each KMS
