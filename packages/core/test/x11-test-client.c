@@ -22,6 +22,11 @@
 //                    for compositor readback tests).
 //   --fullscreen     Set _NET_WM_STATE=_NET_WM_STATE_FULLSCREEN before
 //                    mapping (how fullscreen games declare themselves).
+//   --or-clear-before-map  Create the window with override-redirect SET,
+//                    then clear the attribute before mapping. The attribute
+//                    has no change event, so the WM must re-read it from
+//                    MapNotify to classify this window correctly.
+//   --or-set-before-map    The reverse: create non-OR, set OR pre-map.
 //   --fullscreen-after-ms <n>  After <n> ms of the event loop, request
 //                    fullscreen via the EWMH _NET_WM_STATE ClientMessage to
 //                    the root (action ADD) -- the post-map path a windowed
@@ -76,6 +81,12 @@ int main(int argc, char** argv) {
     int x = 0, y = 0, w = 200, h = 150;
     const char* fillColor = NULL;
     int stdinFills = 0;
+    // override-redirect attribute flips between create and map (the
+    // attribute is mutable and has no change event; WMs must re-read it
+    // from MapNotify). --or-clear-before-map creates with OR set then
+    // clears it pre-map; --or-set-before-map is the reverse.
+    int orClearBeforeMap = 0;
+    int orSetBeforeMap = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--title") && i + 1 < argc) { title = argv[++i]; }
         else if (!strcmp(argv[i], "--app-id") && i + 1 < argc) { appId = argv[++i]; }
@@ -87,6 +98,8 @@ int main(int argc, char** argv) {
             timeoutMs = atoi(argv[++i]);
         }
         else if (!strcmp(argv[i], "--override-redirect")) { overrideRedirect = 1; }
+        else if (!strcmp(argv[i], "--or-clear-before-map")) { orClearBeforeMap = 1; }
+        else if (!strcmp(argv[i], "--or-set-before-map")) { orSetBeforeMap = 1; }
         else if (!strcmp(argv[i], "--x") && i + 1 < argc) { x = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--y") && i + 1 < argc) { y = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--w") && i + 1 < argc) { w = atoi(argv[++i]); }
@@ -124,7 +137,7 @@ int main(int argc, char** argv) {
     uint32_t values[3];
     int vi = 0;
     values[vi++] = screen->white_pixel;
-    if (overrideRedirect) {
+    if (overrideRedirect || orClearBeforeMap) {
         valuesMask |= XCB_CW_OVERRIDE_REDIRECT;
         values[vi++] = 1;
     }
@@ -198,6 +211,11 @@ int main(int argc, char** argv) {
         const xcb_atom_t NET_WM_STATE_FULLSCREEN = intern(c, "_NET_WM_STATE_FULLSCREEN");
         xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, NET_WM_STATE, 4 /*ATOM*/, 32,
                             1, &NET_WM_STATE_FULLSCREEN);
+    }
+
+    if (orClearBeforeMap || orSetBeforeMap) {
+        const uint32_t orVal = orSetBeforeMap ? 1 : 0;
+        xcb_change_window_attributes(c, win, XCB_CW_OVERRIDE_REDIRECT, &orVal);
     }
 
     xcb_map_window(c, win);

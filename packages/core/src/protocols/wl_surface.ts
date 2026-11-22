@@ -30,6 +30,7 @@ import {
   teardownLayerSurface,
 } from "./zwlr_layer_shell_v1.js";
 import { dropSerialsForSurface } from "../xwayland/surface.js";
+import { rebuildStackWithPopups } from "./xdg_popup.js";
 
 // Assign a stable per-wl_buffer id used to track the dmabuf release lifecycle
 // across the JS<->native boundary. Native reports freed bufferIds (once its GPU
@@ -1006,6 +1007,11 @@ export function unmapAndTeardownSurface(state: CompositorState, addon: Addon, s:
   state.compositor.releaseShmSource?.(s.id);
   dropSerialsForSurface(state, s.id);
   state.surfacesById?.delete(s.id);
+  // An xwayland override-redirect overlay's stack entry is keyed by this
+  // surface id; drop it or the draw list keeps a dead entry (the XWM's
+  // unmap-side removal can lose the race when the wayland-side destroy
+  // lands first).
+  if (state.overrideRedirects?.delete(s.id)) rebuildStackWithPopups(state);
   // Invalidate seat focus NOW, not at the next per-frame sweep: a focus
   // change landing in that window would send wl_keyboard/wl_pointer.leave
   // referencing the destroyed surface.

@@ -6,7 +6,25 @@ test counts, and historical rationale live in `status-detailed.md`. This
 file is the short read; consult the detailed doc when investigating a
 specific subsystem.
 
-Last updated: 2026-07-22. Recent landings: an ACTIVE fullscreen window
+Last updated: 2026-07-23. Recent landings: the XWM re-syncs the mutable
+override-redirect attribute from MapNotify / real ConfigureNotify /
+ReparentNotify (X has no attribute-change event; the create-time snapshot
+can be stale by map -- Wine-style clients create with OR set and clear it
+pre-map, which previously classified a fullscreen game as an unmanaged
+overlay: no manage, no focus, no fullscreen). A flip reclassifies live
+(overlay <-> WM candidate, with the identity-read gate re-armed from
+in-flight reads so window rules still see real app_id/title).
+Override-redirect overlays now take pointer input (picked above popups /
+toplevels, matching draw order); an OR overlay covering a whole output is
+re-placed through the current camera on settled camera changes (a
+fullscreen takeover stays glued to the glass instead of stranding on a
+pan) while menu-sized ORs stay world-pinned to the content they opened
+over. The overlay store no longer leaks dead entries: a remap that
+arrives before the fresh wl_surface association skips the previous
+mapping's dead surface id, association changes retire the old id, and
+wayland-side surface teardown sweeps the store. Reparent events are
+forwarded (a window reparented away from the root unmanages; back to the
+root re-enters). Prior: an ACTIVE fullscreen window
 covers the layer-shell "top" layer -- the output's draw order drops the
 "above" layer while one is present (WM pushes setOutputFullscreenActive
 from the tier refresh) and the seat's pick skips "top" at covered points,

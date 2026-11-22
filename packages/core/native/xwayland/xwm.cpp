@@ -432,6 +432,24 @@ bool xwmProcess(XwmConn* x, const std::function<void(const XwmEvent&)>& cb) {
                 o.y = e->y;
                 o.width = e->width;
                 o.height = e->height;
+                // override-redirect is a mutable attribute with no change
+                // event; ConfigureNotify carries the current value so the WM
+                // can re-sync. Synthetics fabricate it -- flag them.
+                o.overrideRedirect = e->override_redirect;
+                o.synthetic = (ev->response_type & 0x80) != 0;
+                cb(o);
+                break;
+            }
+            case XCB_REPARENT_NOTIFY: {
+                auto* e = reinterpret_cast<xcb_reparent_notify_event_t*>(ev);
+                if (e->window == x->bookkeeper) break;
+                XwmEvent o;
+                o.type = XwmEvent::ReparentNotify;
+                o.window = e->window;
+                o.parent = e->parent;
+                o.x = e->x;
+                o.y = e->y;
+                o.overrideRedirect = e->override_redirect;
                 cb(o);
                 break;
             }

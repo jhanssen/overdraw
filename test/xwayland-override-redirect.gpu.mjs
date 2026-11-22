@@ -12,7 +12,7 @@ import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { setupCompositor, canRunGpu, waitFor, nextXDisplay } from "./harness.mjs";
+import { setupCompositor, canRunGpu, waitFor, nextXDisplay, pointerMotion } from "./harness.mjs";
 import { startXwayland } from "../packages/core/dist/xwayland/index.js";
 import { startXwm } from "../packages/core/dist/xwayland/xwm.js";
 
@@ -230,6 +230,100 @@ test("destroying an OR window cleans up state.overrideRedirects",
         };
         tick();
       });
+    } finally {
+      if (child && child.exitCode === null) child.kill("SIGKILL");
+      if (xwm) xwm.stop();
+      if (handle) c.addon.xwaylandStop(handle.pid);
+      await c.teardown();
+    }
+  });
+
+test("window created OR but cleared before map is MANAGED (fullscreen honored)",
+  { skip, timeout: 30000 }, async () => {
+    const c = await setupCompositor();
+    let handle;
+    let xwm;
+    let child;
+    try {
+      handle = await startXwayland(c.addon, {
+        waylandDisplay: c.sock, enableWm: true, displayNumber: nextXDisplay(),
+      });
+      xwm = startXwm(c.state, c.addon, handle.wmFd);
+
+      // The attribute flip games/Wine perform: create with OR set, clear it
+      // before mapping. MapNotify carries the cleared value; the WM must
+      // classify by that, not the create-time snapshot.
+      child = execFile(X11_CLIENT, [
+        "--or-clear-before-map",
+        "--fullscreen",
+        "--title", "or-flip-game",
+        "--w", "640", "--h", "480",
+        "--fill", "3060a0",
+        "--timeout-ms", "20000",
+      ], { env: { ...process.env, DISPLAY: handle.display } });
+
+      const snap = await waitFor(c.query,
+        (s) => s.windows.length === 1,
+        { timeoutMs: 8000, what: "or-flipped window managed" });
+      assert.equal(snap.windows[0].title, "or-flip-game");
+      const winId = snap.windows[0].surfaceId;
+      const sizeMode = () =>
+        c.state.wm.state.windows.find((w) => w.surfaceId === winId)
+          ?.windowState.sizeMode;
+      await waitFor(() => ({ sizeMode: sizeMode() }),
+        (s) => s.sizeMode === "fullscreen",
+        { timeoutMs: 5000, what: "fullscreen applied" });
+
+      // And it must NOT sit in the overlay store.
+      assert.equal((c.state.overrideRedirects ?? new Map()).size, 0,
+        "no overlay placement for a window that mapped non-OR");
+    } finally {
+      if (child && child.exitCode === null) child.kill("SIGKILL");
+      if (xwm) xwm.stop();
+      if (handle) c.addon.xwaylandStop(handle.pid);
+      await c.teardown();
+    }
+  });
+
+test("an OR overlay takes pointer input (picked above content)",
+  { skip, timeout: 30000 }, async () => {
+    const c = await setupCompositor();
+    let handle;
+    let xwm;
+    let child;
+    try {
+      handle = await startXwayland(c.addon, {
+        waylandDisplay: c.sock, enableWm: true, displayNumber: nextXDisplay(),
+      });
+      xwm = startXwm(c.state, c.addon, handle.wmFd);
+
+      child = execFile(X11_CLIENT, [
+        "--override-redirect",
+        "--x", "120", "--y", "90", "--w", "200", "--h", "100",
+        "--fill", "a03060",
+        "--title", "or-menu-input",
+        "--timeout-ms", "20000",
+      ], { env: { ...process.env, DISPLAY: handle.display } });
+
+      const ors = () => c.state.overrideRedirects ?? new Map();
+      await waitFor(() => ({ n: ors().size }), (s) => s.n >= 1,
+        { timeoutMs: 8000, what: "OR overlay placed" });
+      const [orSurfaceId] = [...ors().keys()];
+
+      // Move the pointer into the overlay's rect (identity camera: world
+      // == glass). Pointer focus must land on the OR surface, not fall
+      // through to whatever is beneath.
+      pointerMotion(c.addon, 220, 140);
+      const snap = await waitFor(c.query,
+        (s) => s.pointerFocus === orSurfaceId,
+        { timeoutMs: 5000, what: "pointer focus on the OR overlay" });
+      assert.equal(snap.pointerFocus, orSurfaceId);
+
+      // Off-overlay motion releases it.
+      pointerMotion(c.addon, 500, 400);
+      await waitFor(c.query,
+        (s) => s.pointerFocus !== orSurfaceId,
+        { timeoutMs: 5000, what: "pointer focus left the OR overlay" });
     } finally {
       if (child && child.exitCode === null) child.kill("SIGKILL");
       if (xwm) xwm.stop();

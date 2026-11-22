@@ -254,6 +254,7 @@ void deliverXwmEvent(const XwmEvent& e) {
         case XwmEvent::UnmapNotify: typeStr = "unmap"; break;
         case XwmEvent::ConfigureRequest: typeStr = "configure-request"; break;
         case XwmEvent::ConfigureNotify: typeStr = "configure-notify"; break;
+        case XwmEvent::ReparentNotify: typeStr = "reparent"; break;
         case XwmEvent::SurfaceSerial: typeStr = "surface-serial"; break;
         case XwmEvent::NetWmState: typeStr = "net-wm-state"; break;
         case XwmEvent::PropertyNotify: typeStr = "property-notify"; break;
@@ -298,6 +299,16 @@ void deliverXwmEvent(const XwmEvent& e) {
 
     if (e.type == XwmEvent::FocusIn) {
         setU32("eventSequence", e.eventSequence);
+    }
+
+    if (e.type == XwmEvent::ReparentNotify) {
+        setU32("parent", e.parent);
+    }
+
+    if (e.type == XwmEvent::ConfigureNotify) {
+        napi_value synthV;
+        napi_get_boolean(env, e.synthetic, &synthV);
+        napi_set_named_property(env, obj, "synthetic", synthV);
     }
 
     if (e.type == XwmEvent::NetWmState) {

@@ -368,6 +368,11 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     // the render side's cameraExempt gating -- the two must agree or
     // clicks land beside pixels.
     const view = contentViewAt(x, y);
+    // Xwayland override-redirect overlays draw above popups and toplevels
+    // in the content stack (xdg_popup.ts:appendOverrideRedirects), so they
+    // take pointer input first among content.
+    const or = pickOverrideRedirect(x, y, view);
+    if (or) return or;
     const popup = pickPopup(x, y, view);
     if (popup) return popup;
     // An ACTIVE fullscreen toplevel is glass-anchored (it covers its
@@ -501,6 +506,31 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     }
     if (!win || !bestHit) return null;
     return toFocus(bestHit, bestRootId, view);
+  }
+
+  // Topmost xwayland override-redirect overlay under the point. Their
+  // rects live in world coordinates (state.overrideRedirects, placed by
+  // the XWM), so the point maps through the content view like toplevels.
+  // The store iterates in insertion order = back-to-front draw order;
+  // walk it in reverse so the topmost overlay wins.
+  function pickOverrideRedirect(
+    x: number, y: number, view: SeatViewTransform,
+  ): SeatFocus | null {
+    const ors = ctx.state.overrideRedirects;
+    if (!ors || ors.size === 0) return null;
+    const wx = seatViewToWorldX(view, x);
+    const wy = seatViewToWorldY(view, y);
+    const entries = [...ors.entries()];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const [surfaceId, rect] = entries[i];
+      const rec = ctx.state.surfacesById?.get(surfaceId);
+      if (!rec || rec.resource.destroyed) continue;
+      const root = ctx.state.surfaces.get(rec.resource);
+      if (!root) continue;
+      const hit = hitTestSurfaceTree(ctx.state, root, rect, wx, wy);
+      if (hit) return toFocus(hit, root.id, view);
+    }
+    return null;
   }
 
   // Topmost mapped popup under the point, walking each popup's full

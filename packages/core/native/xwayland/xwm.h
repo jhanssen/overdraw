@@ -86,6 +86,7 @@ struct XwmEvent {
         UnmapNotify,
         ConfigureRequest,
         ConfigureNotify,  // X-side geometry changed (root's substructure-notify)
+        ReparentNotify,   // window changed parent (left / rejoined the root's child set)
         SurfaceSerial,    // WL_SURFACE_SERIAL client-message (the association join)
         NetWmState,       // _NET_WM_STATE client-message (post-map state change)
         PropertyNotify,   // a watched property on a managed window changed
@@ -99,6 +100,11 @@ struct XwmEvent {
     uint32_t window = 0;
     int32_t x = 0, y = 0, width = 0, height = 0;
     bool overrideRedirect = false;
+    // ConfigureNotify only: true when the event is a send_event synthetic
+    // (top bit of response_type). Synthetics carry a fabricated
+    // override_redirect, so the WM must not adopt the attribute from them.
+    bool synthetic = false;
+    uint32_t parent = 0;       // ReparentNotify only: the new parent window
     uint64_t serial = 0;       // SurfaceSerial only
     // NetWmState only: action (0 = remove, 1 = add, 2 = toggle) and the one
     // or two state atoms the client wants changed (0 = unused slot).
