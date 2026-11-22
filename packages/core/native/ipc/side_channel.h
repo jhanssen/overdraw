@@ -1215,25 +1215,35 @@ static_assert(ScanoutClientFlipPayload::kSize == 28,
 
 // ScanoutClientRejectPayload (gpu -> core; FrameKind::ScanoutClientReject):
 // AddFB2 / atomic TEST refused this buffer on this output; the core
-// composites instead and vetoes the pair.
+// composites instead and vetoes the pair. kFlagCursor: the kernel refused
+// the hw cursor plane over this buffer, not the buffer itself; the core
+// holds scanout off on the output while the cursor is shown there instead
+// of vetoing. kFlagLatched: the buffer is still on the plane (a cursor-
+// only commit was refused over it); the core must not release it -- the
+// composite frame's ScanoutClientFlip retires it.
 struct ScanoutClientRejectPayload {
+    static constexpr uint32_t kFlagLatched = 1u << 0;
+    static constexpr uint32_t kFlagCursor  = 1u << 1;
     uint32_t outputId;
     uint32_t bufferId;
-    static constexpr size_t kSize = 2 * 4;  // 8
+    uint32_t flags;
+    static constexpr size_t kSize = 3 * 4;  // 12
     void encode(uint8_t* out) const {
         ByteWriter w(out);
         w.u32(outputId);
         w.u32(bufferId);
+        w.u32(flags);
     }
     static ScanoutClientRejectPayload decode(const uint8_t* p) {
         ByteReader rd(p);
         ScanoutClientRejectPayload r{};
         r.outputId = rd.u32();
         r.bufferId = rd.u32();
+        r.flags    = rd.u32();
         return r;
     }
 };
-static_assert(ScanoutClientRejectPayload::kSize == 8,
+static_assert(ScanoutClientRejectPayload::kSize == 12,
               "ScanoutClientRejectPayload kSize does not match its encoded layout");
 
 // ScanoutFormatsPayload (gpu -> core; FrameKind::ScanoutFormats): the

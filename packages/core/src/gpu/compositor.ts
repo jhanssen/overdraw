@@ -1433,6 +1433,9 @@ export class JsCompositor implements CompositorSink {
     // process tore the plane down with the connector). A surviving output
     // whose scale changed needs its cursor image re-shipped at the new
     // device size.
+    for (const id of [...this.scanoutCursorBlocked]) {
+      if (!this.outputsGeom.has(id)) this.scanoutCursorBlocked.delete(id);
+    }
     for (const id of [...this.hwCursorCaps.keys()]) {
       if (!this.outputsGeom.has(id)) {
         this.hwCursorCaps.delete(id);
@@ -1799,6 +1802,7 @@ export class JsCompositor implements CompositorSink {
           latchedBufferId: this.scanoutActive.get(o.id) ?? null,
           flipPending: this.scanoutFlipPending.has(o.id),
           vetoedBufferIds: [...(this.scanoutVeto.get(o.id) ?? [])],
+          cursorBlocked: this.scanoutCursorBlocked.has(o.id),
         },
         hwCursor: this.hwCursorActive.has(o.id),
       });
@@ -5208,22 +5212,13 @@ export class JsCompositor implements CompositorSink {
     }
     const send = this.addon.sendCursorState;
     if (!send) return;
-    const sid = this.cursorTargetSurfaceId;
-    const s = sid !== null ? this.surfaces.get(sid) : undefined;
     for (const outputId of this.hwCursorActive) {
       const o = this.outputsGeom.get(outputId);
       if (!o) continue;
       const hot = this.hwCursorHotspotDev.get(outputId) ?? { x: 0, y: 0 };
-      const lw = Math.round(o.deviceWidth / o.scale);
-      const lh = Math.round(o.deviceHeight / o.scale);
-      // Visible on this output iff the cursor rect (logical) overlaps it.
       // Fully-offscreen plane positions are avoided rather than trusted to
       // driver clipping.
-      const cx = this.cursorPointerX - this.cursorHotspotX;
-      const cy = this.cursorPointerY - this.cursorHotspotY;
-      const overlaps = !!s && this.cursorVisible
-        && cx < o.logicalX + lw && cx + s.layoutW > o.logicalX
-        && cy < o.logicalY + lh && cy + s.layoutH > o.logicalY;
+      const overlaps = this.cursorShownOn(o);
       const x = Math.round((this.cursorPointerX - o.logicalX) * o.scale) - hot.x;
       const y = Math.round((this.cursorPointerY - o.logicalY) * o.scale) - hot.y;
       const last = this.hwCursorLastSent.get(outputId);
@@ -5232,6 +5227,19 @@ export class JsCompositor implements CompositorSink {
       this.hwCursorLastSent.set(outputId, { x, y, visible: overlaps });
     }
     this.hwCursorStateStale = false;
+  }
+
+  // The cursor is visible and its rect (logical) overlaps the output.
+  private cursorShownOn(o: OutputGeom): boolean {
+    const sid = this.cursorTargetSurfaceId;
+    const s = sid !== null ? this.surfaces.get(sid) : undefined;
+    if (!s || !this.cursorVisible) return false;
+    const lw = Math.round(o.deviceWidth / o.scale);
+    const lh = Math.round(o.deviceHeight / o.scale);
+    const cx = this.cursorPointerX - this.cursorHotspotX;
+    const cy = this.cursorPointerY - this.cursorHotspotY;
+    return cx < o.logicalX + lw && cx + s.layoutW > o.logicalX
+      && cy < o.logicalY + lh && cy + s.layoutH > o.logicalY;
   }
 
   // Test/introspection accessor for the hardware-cursor state.
@@ -5258,6 +5266,9 @@ export class JsCompositor implements CompositorSink {
   // received. Gates renderFrame to one client present in flight per output.
   private scanoutFlipPending = new Set<number>();
   private scanoutVeto = new Map<number, Set<number>>();  // GPU-process-refused pairs
+  // Outputs where the kernel refused the hw cursor over a scanout buffer:
+  // scanout is held off while the cursor is shown there.
+  private scanoutCursorBlocked = new Set<number>();
 
   setDirectScanoutEnabled(on: boolean): void {
     this.directScanoutEnabled = on;
@@ -5348,6 +5359,12 @@ export class JsCompositor implements CompositorSink {
     if (this.scanoutVeto.get(o.id)?.has(bufferId)) {
       return fail("buffer vetoed by an earlier kernel rejection");
     }
+    if (this.scanoutCursorBlocked.has(o.id)) {
+      if (this.cursorShownOn(o)) {
+        return fail("kernel refused the hw cursor over scanout; held off while it is shown");
+      }
+      this.scanoutCursorBlocked.delete(o.id);
+    }
     this.noteScanoutIneligible(o.id, null);
     return { bufferId, importId: imp.importId, tearing: s.tearingAsync === true };
   }
@@ -5423,15 +5440,30 @@ export class JsCompositor implements CompositorSink {
 
   // ScanoutClientReject: the kernel refused the buffer (AddFB2 or atomic
   // TEST). Veto the pair, drop the never-latched hold, and repaint through
-  // the composite path.
-  handleScanoutClientReject(outputId: number, bufferId: number): void {
-    let set = this.scanoutVeto.get(outputId);
-    if (!set) { set = new Set(); this.scanoutVeto.set(outputId, set); }
-    set.add(bufferId);
-    while (set.size > 32) {
-      const oldest = set.values().next().value;
-      if (oldest === undefined) break;
-      set.delete(oldest);
+  // the composite path. `cursor`: the refusal is the hw cursor over the
+  // buffer -- no veto; scanout is held off on the output while the cursor
+  // is shown there. `latched`: the buffer is on the plane (a cursor commit
+  // was refused over it); repaint only -- the composite frame's
+  // ScanoutClientFlip retires and releases it, and any present in flight
+  // keeps its gate.
+  handleScanoutClientReject(outputId: number, bufferId: number,
+                            opts: { latched?: boolean; cursor?: boolean } = {}): void {
+    if (opts.cursor) {
+      this.scanoutCursorBlocked.add(outputId);
+    } else {
+      let set = this.scanoutVeto.get(outputId);
+      if (!set) { set = new Set(); this.scanoutVeto.set(outputId, set); }
+      set.add(bufferId);
+      while (set.size > 32) {
+        const oldest = set.values().next().value;
+        if (oldest === undefined) break;
+        set.delete(oldest);
+      }
+    }
+    if (opts.latched) {
+      this.outputDamage.fullOutput(outputId);
+      this.addon.wake();
+      return;
     }
     this.scanoutActive.delete(outputId);
     // The rejected present will never flip; without this the in-flight

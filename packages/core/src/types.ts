@@ -514,7 +514,7 @@ export interface Addon {
     outputId: number; latchedBufferId: number; retiredBufferId: number;
   }) => void) | null): void;
   setOnScanoutClientReject?(cb: ((msg: {
-    outputId: number; bufferId: number;
+    outputId: number; bufferId: number; latched: boolean; cursor: boolean;
   }) => void) | null): void;
   scanoutFormatIndices?(outputId: number): number[];
   // Register a callback fired when libseat re-enables the seat (VT switch

@@ -24,7 +24,14 @@ arrives before the fresh wl_surface association skips the previous
 mapping's dead surface id, association changes retire the old id, and
 wayland-side surface teardown sweeps the store. Reparent events are
 forwarded (a window reparented away from the root unmanages; back to the
-root re-enters). Prior: an ACTIVE fullscreen window
+root re-enters). Direct scanout yields to the hw cursor when the kernel
+won't combine them (e.g. a scaled primary plane): a refused client TEST
+is re-TESTed without the cursor plane, and a cursor-only commit refused
+over a latched client buffer ends scanout; both reject with
+`kFlagCursor`, which holds scanout off on that output only while the
+cursor is shown there instead of vetoing the buffers, so scanout resumes
+when the cursor hides. A stashed client present refused on replay is now
+reported (it wedged the output's in-flight gate). Prior: an ACTIVE fullscreen window
 covers the layer-shell "top" layer -- the output's draw order drops the
 "above" layer while one is present (WM pushes setOutputFullscreenActive
 from the tier refresh) and the seat's pick skips "top" at covered points,
@@ -767,7 +774,10 @@ stashed and issued from that flip's event). Per-output software
 fallback (`CursorPlaneStatus` ok=0) covers: no plane, image larger
 than the cursor FB (`DRM_CAP_CURSOR_WIDTH/HEIGHT`), dmabuf/GPU-texture
 cursor images (no CPU bytes to ship), nested mode, and runtime commit
-rejection (the frame retries without the plane and demotes). Cursor
+rejection of a ring frame or of a cursor-only commit over a ring frame
+(the frame retries without the plane and demotes). A cursor refused
+over a direct-scanout client buffer ends scanout instead, held off
+while the cursor is shown (`scanout-design.md` "Rejection + retry"). Cursor
 FBs are linear ARGB8888 dumb buffers, ping-ponged per image change;
 hotspot is baked into the plane position core-side. Theme cursors
 install by RESOLVER (`setCursorShape`): the software slot uploads the

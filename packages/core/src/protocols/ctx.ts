@@ -723,7 +723,8 @@ export interface CompositorSink {
   // GPU process, and the config gate. See scanout-design.md.
   handleScanoutClientFlip?(outputId: number, latchedBufferId: number,
                            retiredBufferId: number): void;
-  handleScanoutClientReject?(outputId: number, bufferId: number): void;
+  handleScanoutClientReject?(outputId: number, bufferId: number,
+                             opts?: { latched?: boolean; cursor?: boolean }): void;
   setDirectScanoutEnabled?(on: boolean): void;
   // Read-only diagnostic snapshot of the render state: per-output draw
   // order (bottom to top, each entry labeled with its stack segment) and
@@ -756,6 +757,9 @@ export interface CompositorIntrospection {
       flipPending: boolean;
       // Buffer ids the GPU process refused (AddFB2 / atomic TEST).
       vetoedBufferIds: number[];
+      // Scanout held off while the cursor is shown (kernel refused the hw
+      // cursor over a scanout buffer).
+      cursorBlocked: boolean;
     };
     // The KMS cursor plane carries the cursor on this output.
     hwCursor: boolean;

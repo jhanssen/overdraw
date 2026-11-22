@@ -151,6 +151,24 @@ the hw cursor or a hidden one, so demoting to software cursor would
 permanently defeat scanout while also costing composited frames the hw
 cursor. The client present is simply rejected and the ring present --
 known-good with the cursor plane -- carries the frame.
+A refused client TEST with the hw cursor plane attached is re-TESTed
+with the cursor plane off. If that passes, the cursor -- not the
+buffer -- is what the kernel won't combine with this primary plane
+(e.g. a scaled plane): the reject carries `kFlagCursor`, the core
+vetoes nothing and instead holds scanout off on that output while the
+cursor is shown there (visible and overlapping the output). The hold
+lifts at the next eligibility check with the cursor hidden or off the
+output, so the same buffers scan out again then.
+A cursor-only commit refused while a client buffer is latched is the
+same cursor conflict: the GPU process emits `ScanoutClientReject` with
+`kFlagLatched | kFlagCursor` and holds further cursor-only commits on
+that output. The core does not release the buffer (the plane still
+reads it); the composite flip retires it through `ScanoutClientFlip`,
+and that ring frame carries the cursor state. A refusal there is a
+genuine cursor-plane problem and demotes.
+A stashed client present that is refused on replay (from a flip
+event) is reported through the same reject path; the core's
+one-in-flight gate would otherwise wedge the output.
 The veto is per-BUFFER: the next buffer the client commits retries
 (after the scanout feedback tranche lands, well-behaved clients
 re-allocate with scannable modifiers, which is exactly the retry that

@@ -227,7 +227,11 @@ Compositor::Compositor(int wireFd, int ctrlFd, pid_t gpuPid,
                 return;
             }
             auto p = ipc::ScanoutClientRejectPayload::decode(frame.data());
-            pendingScanoutRejects_.push_back({ p.outputId, p.bufferId });
+            pendingScanoutRejects_.push_back({
+                p.outputId, p.bufferId,
+                (p.flags & ipc::ScanoutClientRejectPayload::kFlagLatched) != 0,
+                (p.flags & ipc::ScanoutClientRejectPayload::kFlagCursor) != 0,
+            });
             return;
         }
         if (kind == ipc::FrameKind::ScanoutFormats) {

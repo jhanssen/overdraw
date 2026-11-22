@@ -150,7 +150,7 @@ struct Addon {
                                              // maxHeight}) for hw-cursor availability
     napi_ref onScanoutClientFlip = nullptr;   // optional JS callback({outputId,
                                               // latchedBufferId, retiredBufferId})
-    napi_ref onScanoutClientReject = nullptr; // optional JS callback({outputId, bufferId})
+    napi_ref onScanoutClientReject = nullptr; // optional JS callback({outputId, bufferId, latched, cursor})
     napi_ref onSeatEnabled = nullptr;  // optional JS callback() on libseat enable_seat
 
     // Host-side reader for the GPU process's log socket. Started after
@@ -1674,6 +1674,10 @@ void fireScanoutClientEvents(napi_env env) {
                 napi_set_named_property(env, obj, "outputId", v);
                 napi_create_uint32(env, r.bufferId, &v);
                 napi_set_named_property(env, obj, "bufferId", v);
+                napi_get_boolean(env, r.latched, &v);
+                napi_set_named_property(env, obj, "latched", v);
+                napi_get_boolean(env, r.cursor, &v);
+                napi_set_named_property(env, obj, "cursor", v);
                 napi_call_function(env, undefined, cb, 1, &obj, nullptr);
                 logJsException(env, "onScanoutClientReject");
             }
@@ -2768,8 +2772,10 @@ napi_value SetOnScanoutClientFlip(napi_env env, napi_callback_info info) {
 
 // setOnScanoutClientReject(cb) -> undefined
 // Register a JS callback fired when the GPU process refuses to scan out a
-// buffer ({ outputId, bufferId }): the core repaints through the composite
-// path and vetoes the pair. Pass null/omit to clear.
+// buffer ({ outputId, bufferId, latched, cursor }): the core repaints
+// through the composite path and vetoes the pair (cursor: holds scanout off
+// while the cursor is shown instead). latched = the buffer is still on the
+// plane and is released by its retire, not here. Pass null/omit to clear.
 napi_value SetOnScanoutClientReject(napi_env env, napi_callback_info info) {
     replaceCallbackRef(env, info, g_addon.onScanoutClientReject);
     napi_value u; napi_get_undefined(env, &u); return u;

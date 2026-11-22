@@ -170,14 +170,19 @@ class KmsOutputBackend : public OutputBackend {
                             uint32_t fourcc, uint64_t modifier,
                             uint32_t offset, uint32_t stride);
 
-    // Put a client FB on outputId's primary plane. Returns false when the
-    // atomic TEST rejects it (caller emits ScanoutClientReject and the
-    // core composites; nothing was committed). bufferId is the core-side
-    // buffer key echoed through the flip listener. `tearing` requests an
-    // immediate (async) page flip, best-effort.
-    bool presentClientFbAt(uint32_t outputId, uint32_t fbId,
-                           uint32_t width, uint32_t height,
-                           uint32_t bufferId, int inFenceFd, bool tearing);
+    // Ok: committed or stashed. Failed: refused, nothing committed.
+    // CursorRefused (client presents only): refused with the hw cursor
+    // plane attached but accepted without it -- the cursor, not the
+    // buffer, is what the kernel can't combine with this primary plane.
+    enum class PresentResult { Ok, Failed, CursorRefused };
+
+    // Put a client FB on outputId's primary plane. On a refusal the caller
+    // emits ScanoutClientReject and the core composites. bufferId is the
+    // core-side buffer key echoed through the flip listener. `tearing`
+    // requests an immediate (async) page flip, best-effort.
+    PresentResult presentClientFbAt(uint32_t outputId, uint32_t fbId,
+                                    uint32_t width, uint32_t height,
+                                    uint32_t bufferId, int inFenceFd, bool tearing);
 
     // Mark a client FB for destruction. RmFB on a latched FB force-
     // disables the plane, so condemned FBs are destroyed only once no
@@ -198,6 +203,21 @@ class KmsOutputBackend : public OutputBackend {
     };
     using ClientFlipCb = std::function<void(const ClientFlipInfo&)>;
     void setClientFlipListener(ClientFlipCb cb) { clientFlipListener_ = std::move(cb); }
+
+    // A client buffer refused by the backend outside presentClientFbAt's
+    // return: a replayed stashed present, or a cursor-only commit refused
+    // while the buffer is latched (latched = still on the plane until the
+    // composite frame retires it). cursor = the refusal is the cursor
+    // plane over this buffer, not the buffer itself. Scanout yields; the
+    // hw cursor is never demoted for a client buffer.
+    struct ClientRejectInfo {
+        uint32_t outputId = 0;
+        uint32_t bufferId = 0;
+        bool latched = false;
+        bool cursor = false;
+    };
+    using ClientRejectCb = std::function<void(const ClientRejectInfo&)>;
+    void setClientRejectListener(ClientRejectCb cb) { clientRejectListener_ = std::move(cb); }
 
     // The (format, modifier) set the output's PRIMARY plane advertises
     // (IN_FORMATS). Used to build the dmabuf-feedback scanout tranche.
@@ -308,6 +328,9 @@ class KmsOutputBackend : public OutputBackend {
         uint32_t pendingClientFbId  = 0;
         uint32_t pendingClientBufId = 0;
         bool clientFlipPending = false;
+        // Latched client buffer rejected for the cursor (0 = none); cursor-
+        // only commits wait for the composite frame that replaces it.
+        uint32_t evictedClientBufId = 0;
 
         // One-shot log guards for wp_tearing_control presents (whether the
         // first async-requested flip actually went async or fell back).
@@ -351,10 +374,10 @@ class KmsOutputBackend : public OutputBackend {
     // SRC_W/H) and the core-side bufferId for flip reporting. `tearing`
     // (client presents only) asks for an immediate (async) flip; the
     // commit falls back to vsync when the kernel refuses.
-    bool presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd,
-                           uint32_t clientFbId = 0, uint32_t clientBufId = 0,
-                           uint32_t clientW = 0, uint32_t clientH = 0,
-                           bool tearing = false);
+    PresentResult presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd,
+                                    uint32_t clientFbId = 0, uint32_t clientBufId = 0,
+                                    uint32_t clientW = 0, uint32_t clientH = 0,
+                                    bool tearing = false);
 
     // Stash a present that cannot commit now (another flip in flight);
     // replayed from that flip's completion event.
@@ -372,9 +395,14 @@ class KmsOutputBackend : public OutputBackend {
     void sweepCondemnedFbs();
 
     // Add the cursor plane's desired state to `req`: full props when
-    // visible with a valid image, else FB_ID=0 + CRTC_ID=0 (plane off).
-    // No-op when the output has no cursor plane.
-    void addCursorPlaneState(drmModeAtomicReq* req, PerOutput& o) const;
+    // visible with a valid image (and not forceOff), else FB_ID=0 +
+    // CRTC_ID=0 (plane off). No-op when the output has no cursor plane.
+    void addCursorPlaneState(drmModeAtomicReq* req, PerOutput& o,
+                             bool forceOff = false) const;
+    bool cursorPlaneAttached(const PerOutput& o) const {
+        return o.topo.cursorPlaneId && !o.cursorDemoted
+            && o.cursorVisible && o.cursorImageValid;
+    }
 
     // Issue a cursor-only atomic commit (PAGE_FLIP_EVENT | NONBLOCK)
     // carrying the desired cursor state. Preconditions checked inside:
@@ -448,6 +476,7 @@ class KmsOutputBackend : public OutputBackend {
     FlipCompleteCb flipCompleteListener_;
     CursorFallbackCb cursorFallbackListener_;
     ClientFlipCb clientFlipListener_;
+    ClientRejectCb clientRejectListener_;
     // Client FBs waiting for a safe RmFB (not latched/pending anywhere).
     std::vector<uint32_t> condemnedClientFbs_;
 };

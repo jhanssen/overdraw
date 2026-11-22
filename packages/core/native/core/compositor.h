@@ -455,6 +455,8 @@ class Compositor {
     struct ScanoutClientRejectMsg {
         uint32_t outputId = 0;
         uint32_t bufferId = 0;
+        bool latched = false;  // still on the plane; released by its retire
+        bool cursor = false;   // refused for the hw cursor over it, not itself
     };
     std::vector<ScanoutClientRejectMsg> takeScanoutClientRejects() {
         std::vector<ScanoutClientRejectMsg> out;

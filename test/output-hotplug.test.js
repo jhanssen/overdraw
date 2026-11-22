@@ -562,6 +562,7 @@ test('JsCompositor.setOutputs([]) clears outputsGeom', () => {
   c.hwCursorActive = new Map();
   c.hwCursorLastSent = new Map();
   c.hwCursorHotspotDev = new Map();
+  c.scanoutCursorBlocked = new Set();
   c.cursorShapeResolver = undefined;
   c.cursorTargetSurfaceId = null;
   c.internalCursorSurfaceId = null;

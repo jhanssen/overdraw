@@ -59,7 +59,7 @@ test("introspect reports labeled draw order, rects, and scanout state", { skip: 
     assert.equal(o.outputId, 0);
     assert.equal(o.hwCursor, false);
     assert.deepEqual(o.scanout,
-      { latchedBufferId: null, flipPending: false, vetoedBufferIds: [] });
+      { latchedBufferId: null, flipPending: false, vetoedBufferIds: [], cursorBlocked: false });
 
     assert.equal(o.drawList.length, 4);
     const [a, b, c, d] = o.drawList;

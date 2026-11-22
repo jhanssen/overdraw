@@ -291,8 +291,11 @@ addon.setOnScanoutClientFlip?.((m) => {
   compositor.handleScanoutClientFlip?.(m.outputId, m.latchedBufferId, m.retiredBufferId);
 });
 addon.setOnScanoutClientReject?.((m) => {
-  log.info("core", `scanout: output ${m.outputId} rejected buffer ${m.bufferId}; compositing`);
-  compositor.handleScanoutClientReject?.(m.outputId, m.bufferId);
+  log.info("core", `scanout: output ${m.outputId} rejected buffer ${m.bufferId}`
+    + `${m.cursor ? " (hw cursor refused over it)" : ""}`
+    + `${m.latched ? " (latched)" : ""}; compositing`);
+  compositor.handleScanoutClientReject?.(m.outputId, m.bufferId,
+    { latched: m.latched, cursor: m.cursor });
 });
 
 // Seat re-enable (VT switch back, KMS only): the display shows console

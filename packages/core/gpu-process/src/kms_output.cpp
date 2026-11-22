@@ -327,9 +327,16 @@ void KmsOutputBackend::replayStashedPresent(PerOutput& o) {
     if (!o.stashed.valid) return;
     const auto st = o.stashed;
     o.stashed = {};
-    presentOutputImpl(o, st.slotIdx, st.fence, st.clientFbId, st.clientBufId,
-                      st.clientW, st.clientH, st.tearing);
+    const PresentResult r =
+        presentOutputImpl(o, st.slotIdx, st.fence, st.clientFbId, st.clientBufId,
+                          st.clientW, st.clientH, st.tearing);
     if (st.fence >= 0) ::close(st.fence);
+    // The core holds a client present in flight until it flips or is
+    // rejected; a refused replay must be reported or that output wedges.
+    if (r != PresentResult::Ok && st.clientBufId != 0 && clientRejectListener_) {
+        clientRejectListener_({ o.outputId, st.clientBufId, false,
+                                r == PresentResult::CursorRefused });
+    }
 }
 
 void KmsOutputBackend::noteLatch(PerOutput& o, uint32_t latchedFb, uint32_t latchedBuf,
@@ -339,6 +346,7 @@ void KmsOutputBackend::noteLatch(PerOutput& o, uint32_t latchedFb, uint32_t latc
             ? o.latchedClientBufId : 0;
     o.latchedClientFbId = latchedFb;
     o.latchedClientBufId = latchedBuf;
+    if (o.evictedClientBufId != latchedBuf) o.evictedClientBufId = 0;
     if ((latchedBuf != 0 || retired != 0) && clientFlipListener_) {
         clientFlipListener_({ o.outputId, latchedBuf, retired, tvSec, tvNsec, seq });
     }
@@ -400,12 +408,13 @@ uint32_t KmsOutputBackend::importClientFb(int dmabufFd, uint32_t width, uint32_t
     return fbId;
 }
 
-bool KmsOutputBackend::presentClientFbAt(uint32_t outputId, uint32_t fbId,
-                                         uint32_t width, uint32_t height,
-                                         uint32_t bufferId, int inFenceFd,
-                                         bool tearing) {
+KmsOutputBackend::PresentResult
+KmsOutputBackend::presentClientFbAt(uint32_t outputId, uint32_t fbId,
+                                    uint32_t width, uint32_t height,
+                                    uint32_t bufferId, int inFenceFd,
+                                    bool tearing) {
     PerOutput* o = find(outputId);
-    if (!o || fbId == 0) return false;
+    if (!o || fbId == 0) return PresentResult::Failed;
     return presentOutputImpl(*o, -1, inFenceFd, fbId, bufferId, width, height, tearing);
 }
 
@@ -475,14 +484,15 @@ void KmsOutputBackend::setCursorState(uint32_t outputId, int32_t x, int32_t y,
     maybeCursorCommit(*o);
 }
 
-void KmsOutputBackend::addCursorPlaneState(drmModeAtomicReq* req, PerOutput& o) const {
+void KmsOutputBackend::addCursorPlaneState(drmModeAtomicReq* req, PerOutput& o,
+                                           bool forceOff) const {
     const uint32_t plane = o.topo.cursorPlaneId;
     if (!plane) return;
     const auto& cp = o.topo.cursorPlaneProps;
     auto add = [&](uint32_t prop, uint64_t v) {
         if (prop) drmModeAtomicAddProperty(req, plane, prop, v);
     };
-    if (o.cursorVisible && o.cursorImageValid && !o.cursorDemoted) {
+    if (!forceOff && cursorPlaneAttached(o)) {
         const CursorBo& b = o.cursorBos[o.cursorFrontBo];
         add(cp.fb_id,   b.fbId);
         add(cp.crtc_id, o.topo.crtcId);
@@ -511,6 +521,7 @@ void KmsOutputBackend::maybeCursorCommit(PerOutput& o) {
     // path) or re-checked from that flip's completion event.
     if (o.pendingFlipSlot != -1 || o.cursorFlipPending || o.clientFlipPending) return;
     if (!o.topo.cursorPlaneId || o.cursorDemoted) return;
+    if (o.evictedClientBufId != 0) return;
     drmModeAtomicReq* req = drmModeAtomicAlloc();
     if (!req) return;
     addCursorPlaneState(req, o);
@@ -521,6 +532,18 @@ void KmsOutputBackend::maybeCursorCommit(PerOutput& o) {
                                  this);
     }
     drmModeAtomicFree(req);
+    if (rc != 0 && o.latchedClientBufId != 0 && clientRejectListener_) {
+        // Only the cursor plane changed, so the kernel refuses the cursor
+        // over this client buffer (e.g. a scaled primary plane). Scanout
+        // yields; the cursor stays.
+        LOG_WARN(Gpu,
+            "[kms] cursor-only commit failed ({}) over client buffer {}; "
+            "ending scanout on output {}",
+            std::strerror(errno), o.latchedClientBufId, o.outputId);
+        o.evictedClientBufId = o.latchedClientBufId;
+        clientRejectListener_({ o.outputId, o.latchedClientBufId, true, true });
+        return;
+    }
     if (rc != 0) {
         LOG_WARN(Gpu,
             "[kms] cursor-only commit failed ({}); software cursor for output {}",
@@ -877,19 +900,20 @@ void KmsOutputBackend::resume() {
     LOG_INFO(Gpu, "[kms] resumed (next present will re-run modeset)");
 }
 
-bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd,
-                                         uint32_t clientFbId, uint32_t clientBufId,
-                                         uint32_t clientW, uint32_t clientH,
-                                         bool tearing) {
+KmsOutputBackend::PresentResult
+KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceFd,
+                                    uint32_t clientFbId, uint32_t clientBufId,
+                                    uint32_t clientW, uint32_t clientH,
+                                    bool tearing) {
     if (paused_) {
         // The seat is disabled; the kernel has revoked DRM master and any
         // commit would EACCES. Swallow the present and discard the fence
         // fd (caller already closed its copy via the SCM_RIGHTS receive).
         (void)inFenceFd;
-        return true;
+        return PresentResult::Ok;
     }
     const bool isClient = clientFbId != 0;
-    if ((!isClient && slotIdx < 0) || drmFd_ < 0) return false;
+    if ((!isClient && slotIdx < 0) || drmFd_ < 0) return PresentResult::Failed;
     // One commit in flight per CRTC, across all three commit kinds (ring
     // present, client-scanout present, cursor-only). A present arriving
     // while another flip is pending is stashed and issued from that
@@ -899,7 +923,7 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         || (isClient && o.pendingFlipSlot != -1)) {
         stashPresent(o, slotIdx, clientFbId, clientBufId, clientW, clientH,
                      inFenceFd, tearing);
-        return true;
+        return PresentResult::Ok;
     }
     const uint32_t fbId = isClient ? clientFbId : o.ring.slot(slotIdx).fbId;
     const uint32_t srcW = isClient ? clientW : o.ring.width();
@@ -936,7 +960,7 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     if (!o.didInitialCommit) {
         if (o.modeBlobId == 0) {
             o.modeBlobId = createModeBlob(drmFd_, topo.mode.raw);
-            if (o.modeBlobId == 0) return false;
+            if (o.modeBlobId == 0) return PresentResult::Failed;
         }
         flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
     } else {
@@ -944,9 +968,10 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         if (wantAsync) flags |= DRM_MODE_PAGE_FLIP_ASYNC;
     }
 
-    // Built as a lambda so the cursor-demotion path below can rebuild the
-    // request (identical but for the cursor plane now emitting its
-    // plane-off props) without duplicating this block.
+    // Built as a lambda so the refusal paths below can rebuild the request
+    // with the cursor plane emitting plane-off props (cursor demotion, or
+    // cursorOff for the client re-TEST) without duplicating this block.
+    bool cursorOff = false;
     auto buildReq = [&]() -> drmModeAtomicReq* {
         drmModeAtomicReq* req = drmModeAtomicAlloc();
         if (!req) {
@@ -981,7 +1006,7 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
 
         // Cursor plane rides every commit: position/visibility changes are
         // free on a commit that was happening anyway.
-        addCursorPlaneState(req, o);
+        addCursorPlaneState(req, o, cursorOff);
 
         if (!o.didInitialCommit) {
             // First commit also sets up CRTC + connector + mode.
@@ -1016,7 +1041,7 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     uint32_t testFlags = (flags & ~DRM_MODE_PAGE_FLIP_EVENT & ~DRM_MODE_ATOMIC_NONBLOCK)
                         | DRM_MODE_ATOMIC_TEST_ONLY;
     drmModeAtomicReq* req = buildReq();
-    if (!req) return false;
+    if (!req) return PresentResult::Failed;
     int testRc = drmModeAtomicCommit(drmFd_, req, testFlags, this);
     if (testRc != 0 && (flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
         // The async refusal must not cascade into cursor demotion below --
@@ -1028,16 +1053,34 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     if (testRc != 0 && isClient) {
         // A refused client-scanout TEST (e.g. the driver rejecting a scaled
         // primary plane) is answered by rejecting the client present: the
-        // core vetoes the buffer and composites through the ring, which is
-        // known-good with the cursor plane. Never demote the hw cursor to
-        // salvage a client present -- scanout eligibility requires the hw
-        // cursor (or none), so demotion would permanently defeat the very
-        // path it tried to save, and cost every composited frame the hw
-        // cursor besides.
+        // core composites through the ring, which is known-good with the
+        // cursor plane. Never demote the hw cursor to salvage a client
+        // present -- scanout eligibility requires the hw cursor (or none),
+        // so demotion would permanently defeat the very path it tried to
+        // save, and cost every composited frame the hw cursor besides.
+        // A re-TEST with the cursor plane off tells a buffer the plane
+        // can't take (the core vetoes it) from a cursor the kernel won't
+        // combine with it (the core holds scanout off while the cursor
+        // is shown).
+        const int testErrno = errno;
         drmModeAtomicFree(req);
+        PresentResult result = PresentResult::Failed;
+        if (cursorPlaneAttached(o)) {
+            cursorOff = true;
+            req = buildReq();
+            cursorOff = false;
+            if (req) {
+                if (drmModeAtomicCommit(drmFd_, req, testFlags, this) == 0) {
+                    result = PresentResult::CursorRefused;
+                }
+                drmModeAtomicFree(req);
+            }
+        }
         LOG_ERR(Gpu, "[kms] atomic TEST refused client present: {} "
-                "(output {})", std::strerror(errno), o.outputId);
-        return false;
+                "(output {}{})", std::strerror(testErrno), o.outputId,
+                result == PresentResult::CursorRefused
+                    ? "; accepted without the hw cursor" : "");
+        return result;
     }
     if (testRc != 0 && o.topo.cursorPlaneId && !o.cursorDemoted
         && o.cursorVisible && o.cursorImageValid) {
@@ -1051,14 +1094,14 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         demoteCursor(o, /*issueDisableCommit=*/false);
         drmModeAtomicFree(req);
         req = buildReq();  // now emits the cursor plane-off props
-        if (!req) return false;
+        if (!req) return PresentResult::Failed;
         testRc = drmModeAtomicCommit(drmFd_, req, testFlags, this);
     }
     if (testRc != 0) {
         LOG_ERR(Gpu, "[kms] atomic TEST failed: {} (flags=0x{:x})",
                 std::strerror(errno), testFlags);
         drmModeAtomicFree(req);
-        return false;
+        return PresentResult::Failed;
     }
     int rc = drmModeAtomicCommit(drmFd_, req, flags, this);
     if (rc != 0 && (flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
@@ -1071,7 +1114,7 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
     if (rc != 0) {
         LOG_ERR(Gpu, "[kms] atomic commit failed: {} (flags=0x{:x})",
                 std::strerror(errno), flags);
-        return false;
+        return PresentResult::Failed;
     }
     if (wantAsync) {
         // One-shot per-output logs so a bare-metal run can tell whether
@@ -1109,7 +1152,7 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
                       static_cast<uint64_t>(ts.tv_sec),
                       static_cast<uint32_t>(ts.tv_nsec), 0);
         }
-        return true;
+        return PresentResult::Ok;
     }
     o.ring.markPendingFlip(slotIdx);
     o.pendingFlipSlot = slotIdx;
@@ -1138,7 +1181,7 @@ bool KmsOutputBackend::presentOutputImpl(PerOutput& o, int slotIdx, int inFenceF
         noteLatch(o, 0, 0, static_cast<uint64_t>(ts.tv_sec),
                   static_cast<uint32_t>(ts.tv_nsec), 0);
     }
-    return true;
+    return PresentResult::Ok;
 }
 
 bool KmsOutputBackend::presentScanoutAt(uint32_t outputId, int slotIdx, int inFenceFd) {
@@ -1152,7 +1195,7 @@ bool KmsOutputBackend::presentScanoutAt(uint32_t outputId, int slotIdx, int inFe
         // switch or hotplug cycle rebuilds the ring.
         return true;
     }
-    return presentOutputImpl(*o, slotIdx, inFenceFd);
+    return presentOutputImpl(*o, slotIdx, inFenceFd) == PresentResult::Ok;
 }
 
 void KmsOutputBackend::pageFlipTrampoline(int /*fd*/, unsigned int sequence,

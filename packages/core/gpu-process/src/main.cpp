@@ -2269,10 +2269,11 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 std::abort();
             }
             auto p = ipc::ScanoutClientPresentPayload::decode(frame.data());
-            auto reject = [&]() {
+            auto reject = [&](uint32_t flags = 0) {
                 ipc::ScanoutClientRejectPayload rj{};
                 rj.outputId = p.outputId;
                 rj.bufferId = p.bufferId;
+                rj.flags    = flags;
                 uint8_t rb[ipc::ScanoutClientRejectPayload::kSize];
                 rj.encode(rb);
                 serializer.appendFrame(ipc::FrameKind::ScanoutClientReject,
@@ -2298,10 +2299,14 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
                 }
                 const bool tearing =
                     (p.flags & ipc::ScanoutClientPresentPayload::kFlagTearing) != 0;
-                if (ct.kmsFbRejected
-                    || !kms->presentClientFbAt(p.outputId, ct.kmsFbId,
-                                               ct.width, ct.height,
-                                               p.bufferId, fenceFd, tearing)) {
+                using PR = gpu::KmsOutputBackend::PresentResult;
+                const PR result = ct.kmsFbRejected ? PR::Failed
+                    : kms->presentClientFbAt(p.outputId, ct.kmsFbId,
+                                             ct.width, ct.height,
+                                             p.bufferId, fenceFd, tearing);
+                if (result == PR::CursorRefused) {
+                    reject(ipc::ScanoutClientRejectPayload::kFlagCursor);
+                } else if (result == PR::Failed) {
                     // Classify the refusal for the log: a modifier missing
                     // from the primary plane's IN_FORMATS is an allocation
                     // problem (the feedback tranche should steer the client);
@@ -3093,6 +3098,16 @@ int run(int wireFd, int ctrlFd, int inputFd, bool headless,
             uint8_t buf[ipc::ScanoutClientFlipPayload::kSize];
             p.encode(buf);
             serializer.appendFrame(ipc::FrameKind::ScanoutClientFlip, buf, sizeof(buf));
+        });
+        kms->setClientRejectListener([&](const gpu::KmsOutputBackend::ClientRejectInfo& r) {
+            ipc::ScanoutClientRejectPayload rj{};
+            rj.outputId = r.outputId;
+            rj.bufferId = r.bufferId;
+            rj.flags    = (r.latched ? ipc::ScanoutClientRejectPayload::kFlagLatched : 0u)
+                        | (r.cursor ? ipc::ScanoutClientRejectPayload::kFlagCursor : 0u);
+            uint8_t rb[ipc::ScanoutClientRejectPayload::kSize];
+            rj.encode(rb);
+            serializer.appendFrame(ipc::FrameKind::ScanoutClientReject, rb, sizeof(rb));
         });
     }
 
