@@ -509,6 +509,13 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
     return toFocus(bestHit, bestRootId, view);
   }
 
+  // Xwayland override-redirect overlays (menus, tooltips) take pointer input
+  // but never keyboard focus from pointer motion or clicks: moving the focus
+  // off the owning window makes X clients (e.g. Steam) dismiss the menu.
+  function isOverrideRedirect(surfaceId: number | undefined): boolean {
+    return surfaceId !== undefined && (ctx.state.overrideRedirects?.has(surfaceId) ?? false);
+  }
+
   // Topmost xwayland override-redirect overlay under the point. Their
   // rects live in world coordinates (state.overrideRedirects, placed by
   // the XWM), so the point maps through the content view like toplevels.
@@ -996,7 +1003,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
         // Focus dispatch only on surface change (coarse event), not per
         // motion within the same surface. Keyboard focus / activation
         // target the root toplevel, not the (possibly subsurface) hit.
-        if (prevPointerSurface !== hit.surfaceId) {
+        if (prevPointerSurface !== hit.surfaceId && !isOverrideRedirect(hit.rootSurfaceId)) {
           dispatchFocus("pointer-enter", hit.rootSurfaceId, hit.rootSurfaceId);
         }
         break;
@@ -1090,7 +1097,7 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
           // edge -- consumers that react to clicks (e.g. the canvas strip
           // centering on the clicked column) need this signal.
           ctx.state.bus?.emit(POINTER_EVENT.pressed, { surfaceId: rootId });
-          dispatchFocus("pointer-button", rootId, rootId);
+          if (!isOverrideRedirect(rootId)) dispatchFocus("pointer-button", rootId, rootId);
           // Click-to-raise: a press on a toplevel's content surface
           // raises it (and its modal subtree, redirecting up the
           // chain if the press landed on a modal dialog). Focus and
@@ -1328,7 +1335,8 @@ export default function makeSeat(ctx: Ctx, driver: FocusDriver): SeatHandler {
       }
     }
     notifyPointerFocus(ctx, hit.surfaceId);
-    if (prevPointerSurface !== hit.surfaceId && dispatch) {
+    if (prevPointerSurface !== hit.surfaceId && dispatch
+      && !isOverrideRedirect(hit.rootSurfaceId)) {
       dispatchFocus("pointer-repick", hit.rootSurfaceId, hit.rootSurfaceId);
     }
   }

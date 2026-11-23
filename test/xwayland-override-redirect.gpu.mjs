@@ -331,3 +331,55 @@ test("an OR overlay takes pointer input (picked above content)",
       await c.teardown();
     }
   });
+
+test("pointer onto an OR overlay keeps keyboard focus on the window beneath",
+  { skip, timeout: 30000 }, async () => {
+    const c = await setupCompositor();
+    let handle;
+    let xwm;
+    const children = [];
+    try {
+      handle = await startXwayland(c.addon, {
+        waylandDisplay: c.sock, enableWm: true, displayNumber: nextXDisplay(),
+      });
+      xwm = startXwm(c.state, c.addon, handle.wmFd);
+      const env = { env: { ...process.env, DISPLAY: handle.display } };
+
+      children.push(execFile(X11_CLIENT, [
+        "--title", "or-owner", "--fill", "3060a0", "--timeout-ms", "20000",
+      ], env));
+      const snap = await waitFor(c.query,
+        (s) => s.windows.some((w) => w.title === "or-owner" && w.rect.width > 0),
+        { timeoutMs: 8000, what: "owner window laid out" });
+      const owner = snap.windows.find((w) => w.title === "or-owner");
+      // Follow-pointer: hovering the owner focuses it.
+      pointerMotion(c.addon, owner.rect.x + 20, owner.rect.y + 20);
+      await waitFor(c.query, (s) => s.keyboardFocus === owner.surfaceId,
+        { timeoutMs: 5000, what: "owner focused" });
+
+      // A menu-like OR overlay over the owner's interior.
+      const mx = owner.rect.x + 100, my = owner.rect.y + 80;
+      children.push(execFile(X11_CLIENT, [
+        "--override-redirect",
+        "--x", String(mx), "--y", String(my), "--w", "200", "--h", "100",
+        "--fill", "a03060", "--title", "or-menu-focus", "--timeout-ms", "20000",
+      ], env));
+      const ors = () => c.state.overrideRedirects ?? new Map();
+      await waitFor(() => ({ n: ors().size }), (s) => s.n >= 1,
+        { timeoutMs: 8000, what: "OR overlay placed" });
+      const [orSurfaceId] = [...ors().keys()];
+
+      pointerMotion(c.addon, mx + 50, my + 50);
+      await waitFor(c.query, (s) => s.pointerFocus === orSurfaceId,
+        { timeoutMs: 5000, what: "pointer focus on the OR overlay" });
+      await c.focusDriver?.settled?.();
+      const after = await c.query();
+      assert.equal(after.keyboardFocus, owner.surfaceId,
+        "keyboard focus stays on the owner while the pointer is over its menu");
+    } finally {
+      for (const ch of children) if (ch.exitCode === null) ch.kill("SIGKILL");
+      if (xwm) xwm.stop();
+      if (handle) c.addon.xwaylandStop(handle.pid);
+      await c.teardown();
+    }
+  });
