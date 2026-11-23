@@ -21,6 +21,7 @@ import {
 import { computeGrabRect } from "../input/grab-math.js";
 import type { Resource, InputEvent } from "../types.js";
 import { KEYBOARD_EVENT, POINTER_EVENT } from "../events/window-bus.js";
+import { isXwaylandResource } from "../xwayland/scale.js";
 import { markWindowChanged } from "./window-changes.js";
 import type { FocusDriver } from "./focus-driver.js";
 import { hitTestSurfaceTree, type SurfaceHit } from "../surface-hit-test.js";
@@ -1520,10 +1521,23 @@ export function makePointer(ctx: Ctx): WlPointerHandler {
         sRec.role = "cursor";
       }
 
+      // Xwayland's cursor image and hotspot are in X pixels, oversized by
+      // the global X scale (wl_surface.commit stamps the matching
+      // bufferScale); the hotspot is surface-local, so it scales down too.
+      // The buffer scale is pushed now as well: the cursor buffer may have
+      // been committed before the surface took the cursor role.
+      let xn = 1;
+      if (isXwaylandResource(ctx.state, ctx.addon, resource)) {
+        xn = ctx.state.xwaylandScale ?? 1;
+        if (sRec && xn !== 1) {
+          sRec.committed.bufferScale = xn;
+          ctx.state.compositor.setSurfaceBufferScale?.(sRec.id, xn);
+        }
+      }
       seat.cursor.setClientCursor(clientId, {
         surfaceResource: surface,
-        hotspotX: hx,
-        hotspotY: hy,
+        hotspotX: hx / xn,
+        hotspotY: hy / xn,
         hidden: false,
       });
     },

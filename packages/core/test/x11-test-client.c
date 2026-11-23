@@ -38,6 +38,8 @@
 //                    the flush. Drives partial-damage tests: each fill is an
 //                    in-place update of part of the window, the pattern a
 //                    real app's incremental repaint produces.
+//   --cursor <n> <hx> <hy>  Define an opaque n x n core cursor with hotspot
+//                    (hx, hy) on the window (X pixels).
 //
 // Prints "[x11] mapped 0x<window>" on map and "[x11] deleted" on
 // WM_DELETE_WINDOW receipt.
@@ -86,6 +88,7 @@ int main(int argc, char** argv) {
     // from MapNotify). --or-clear-before-map creates with OR set then
     // clears it pre-map; --or-set-before-map is the reverse.
     int orClearBeforeMap = 0;
+    int cursorSize = 0, cursorHx = 0, cursorHy = 0;
     int orSetBeforeMap = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--title") && i + 1 < argc) { title = argv[++i]; }
@@ -99,6 +102,11 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--override-redirect")) { overrideRedirect = 1; }
         else if (!strcmp(argv[i], "--or-clear-before-map")) { orClearBeforeMap = 1; }
+        else if (!strcmp(argv[i], "--cursor") && i + 3 < argc) {
+            cursorSize = atoi(argv[++i]);
+            cursorHx = atoi(argv[++i]);
+            cursorHy = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--or-set-before-map")) { orSetBeforeMap = 1; }
         else if (!strcmp(argv[i], "--x") && i + 1 < argc) { x = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--y") && i + 1 < argc) { y = atoi(argv[++i]); }
@@ -216,6 +224,23 @@ int main(int argc, char** argv) {
     if (orClearBeforeMap || orSetBeforeMap) {
         const uint32_t orVal = orSetBeforeMap ? 1 : 0;
         xcb_change_window_attributes(c, win, XCB_CW_OVERRIDE_REDIRECT, &orVal);
+    }
+
+    if (cursorSize > 0) {
+        // Source and mask both all-ones: every pixel opaque foreground.
+        xcb_pixmap_t pm = xcb_generate_id(c);
+        xcb_create_pixmap(c, 1, pm, win, cursorSize, cursorSize);
+        xcb_gcontext_t gc = xcb_generate_id(c);
+        uint32_t fg = 1;
+        xcb_create_gc(c, gc, pm, XCB_GC_FOREGROUND, &fg);
+        xcb_rectangle_t r = { 0, 0, (uint16_t)cursorSize, (uint16_t)cursorSize };
+        xcb_poly_fill_rectangle(c, pm, gc, 1, &r);
+        xcb_cursor_t cur = xcb_generate_id(c);
+        xcb_create_cursor(c, cur, pm, pm, 0xffff, 0xffff, 0xffff, 0, 0, 0,
+                          (uint16_t)cursorHx, (uint16_t)cursorHy);
+        xcb_change_window_attributes(c, win, XCB_CW_CURSOR, &cur);
+        xcb_free_gc(c, gc);
+        xcb_free_pixmap(c, pm);
     }
 
     xcb_map_window(c, win);

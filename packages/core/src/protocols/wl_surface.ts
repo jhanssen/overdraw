@@ -31,6 +31,7 @@ import {
 } from "./zwlr_layer_shell_v1.js";
 import { dropSerialsForSurface } from "../xwayland/surface.js";
 import { rebuildStackWithPopups } from "./xdg_popup.js";
+import { isXwaylandResource } from "../xwayland/scale.js";
 
 // Assign a stable per-wl_buffer id used to track the dmabuf release lifecycle
 // across the JS<->native boundary. Native reports freed bufferIds (once its GPU
@@ -299,8 +300,10 @@ function applySurfaceState(ctx: Ctx, s: SurfaceRecord, bufferFresh: boolean): bo
   // that factor. Stamp it as bufferScale=N so the composite path divides
   // back down to the right logical intrinsic size. Also propagate to
   // s.committed.bufferScale so the surface-damage scaling path
-  // (currentScaledDamage) sees the same value.
-  if (s.role === "xwayland") {
+  // (currentScaledDamage) sees the same value. Xwayland's cursor surface
+  // carries the same oversized X pixels.
+  if (s.role === "xwayland"
+    || (s.role === "cursor" && isXwaylandResource(ctx.state, ctx.addon, s.resource))) {
     const n = ctx.state.xwaylandScale ?? 1;
     if (n !== 1) s.committed.bufferScale = n;
   }

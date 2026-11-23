@@ -11,6 +11,7 @@
 // (tellXRect, xdg_output); internal logical<->X conversions stay float.
 
 import type { CompositorState, OutputRecord } from "../protocols/ctx.js";
+import type { Addon, Resource } from "../types.js";
 
 // Clamp to the [1,3] band. Anything outside the band is capped (we don't
 // refuse it -- the higher levels validate the config knob; this is the
@@ -47,6 +48,18 @@ export function resolveXwaylandScale(state: CompositorState, configScale: number
 export function xwaylandScaleOf(state: CompositorState): number {
   const n = state.xwaylandScale;
   return typeof n === "number" && n >= 1 ? n : 1;
+}
+
+// The resource's connection is X-backed: the Xwayland server connection
+// itself, matched by peer pid (available from its very first bind), or any
+// connection that has associated an X surface via xwayland_shell_v1.
+export function isXwaylandResource(
+  state: CompositorState, addon: Addon, resource: Resource,
+): boolean {
+  if (state.xwaylandClientIds?.has(addon.clientId(resource))) return true;
+  return state.xwaylandPid !== undefined
+    && typeof addon.clientPid === "function"
+    && addon.clientPid(resource) === state.xwaylandPid;
 }
 
 type Size = { width: number; height: number };

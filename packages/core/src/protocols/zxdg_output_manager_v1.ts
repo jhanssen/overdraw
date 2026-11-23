@@ -22,6 +22,7 @@ import type { ZxdgOutputV1Handler } from "#protocols-gen/zxdg_output_v1.js";
 import type { Ctx, CompositorState, OutputRecord } from "./ctx.js";
 import type { Addon, Resource } from "../types.js";
 import { resolveWlOutputToId, primaryOutputId } from "./output-resolve.js";
+import { isXwaylandResource } from "../xwayland/scale.js";
 
 void outputSig;
 
@@ -55,16 +56,9 @@ function emitTo(
   // and size by the global X scale so the X client's "device coords" match
   // what we send it for window configures / pointer events. See
   // docs/xwayland-design.md "HiDPI".
-  // Two ways to recognize an X-backed binding: the Xwayland server
-  // connection itself, matched by peer pid (available from its very first
-  // bind -- Xwayland builds its RandR screen from the logical size seen at
-  // startup, before any X window exists), and any connection that has
-  // associated an X surface via xwayland_shell_v1.
-  const cid = ctx.addon.clientId(resource);
-  const isX = (ctx.state.xwaylandClientIds?.has(cid) ?? false)
-    || (ctx.state.xwaylandPid !== undefined
-        && typeof ctx.addon.clientPid === "function"
-        && ctx.addon.clientPid(resource) === ctx.state.xwaylandPid);
+  // The pid match matters here: Xwayland builds its RandR screen from the
+  // logical size seen at startup, before any X window exists.
+  const isX = isXwaylandResource(ctx.state, ctx.addon, resource);
   // Rounded: the X scale may be fractional and the protocol carries int32.
   const xn = isX ? (ctx.state.xwaylandScale ?? 1) : 1;
   events.zxdg_output_v1.send_logical_position(
