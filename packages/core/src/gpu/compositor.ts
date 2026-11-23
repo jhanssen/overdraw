@@ -2800,9 +2800,16 @@ export class JsCompositor implements CompositorSink {
         // unreachable import (leaking its native importId for the lifetime
         // of the run).
         this.dispatch(this.lifecycle.step({ kind: "importCompleted", bufferId }));
-        // Bind to every surface that was waiting for this import.
+        // Bind to every surface still waiting for this import. The flush
+        // above may have released it (its surface was removed or the buffer
+        // destroyed mid-import); binding then would resurrect the removed
+        // surface sampling freed texture memory, failing every submit.
         if (p) {
-          for (const sid of p.pendingInstalls) this.bindImportToSurface(sid, bufferId, imp);
+          if (this.dmabufImports.get(bufferId) === imp) {
+            for (const sid of p.pendingInstalls) {
+              if (this.surfaces.has(sid)) this.bindImportToSurface(sid, bufferId, imp);
+            }
+          }
           this.dmabufPending.delete(bufferId);
         }
       });
